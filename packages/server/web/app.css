@@ -177,6 +177,12 @@ pre.log { max-height: 520px; background: var(--sunken); }
 .l-add { color: var(--ok); } .l-chg { color: var(--warn); } .l-del { color: var(--bad); }
 .banner { padding: 10px 16px; border-left: 4px solid var(--bad); background: var(--bad-bg); border-radius: 0 8px 8px 0; }
 .banner.note { border-left-color: var(--accent); background: var(--accent-soft); }
+.pill.live { display: inline-flex; align-items: center; gap: 6px; }
+.pill.live .dot { width: 7px; height: 7px; border-radius: 50%; background: currentColor; animation: live-pulse 1.4s ease-in-out infinite; }
+@keyframes live-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+@media (prefers-reduced-motion: reduce) { .pill.live .dot { animation: none; } }
+.follow { display: inline-flex; align-items: center; gap: 4px; color: var(--muted); }
+#live-log { max-height: 70vh; overflow: auto; }
 .banner.warn { border-left-color: var(--warn); background: var(--warn-bg); }
 .banner + .banner, .banner + .card, .card + .banner { margin-top: 12px; }
 .facts.pad { display: grid; grid-template-columns: auto 1fr; gap: 8px 16px; padding: 14px 16px; align-items: baseline; }

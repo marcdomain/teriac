@@ -2,7 +2,7 @@
 // button, and cleanup when a PR closes.
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { rmSync, mkdirSync, readFileSync, existsSync } from 'node:fs';
+import { rmSync, mkdirSync, readFileSync, existsSync, realpathSync } from 'node:fs';
 import type { ServerConfig, RepoPolicy, Action } from './config.ts';
 import type { VcsAdapter, VcsEvent, Repo, PullRequestState, Comparison, Annotation, CloneAuth } from './vcs/types.ts';
 import { Store, type Run, type Grant } from './store.ts';
@@ -29,6 +29,8 @@ import { changeFingerprint, countApprovals, staleFor, staleText } from './safety
 import { stricterMode, DEFAULT_SIZE_LIMITS, type StaleBaseMode, type SecretScanMode, type RiskConfig, type FreezeConfig, type ProtectedConfig, type SecretPattern } from './safety-config.ts';
 import { locate } from './blame.ts';
 import { notifyText } from './notify.ts';
+import { LiveLogs, type LiveWriter } from './live.ts';
+import { sensitiveValues } from './sensitive.ts';
 import type { PlanSummary } from './render.ts';
 
 export const MARKER = '<!-- teriac:summary -->';
@@ -161,7 +163,29 @@ export interface AppDeps {
   resolver: ToolResolver;
   checkout?: typeof gitCheckout;
   env?: NodeJS.ProcessEnv;
+  live?: LiveLogs;                // live output for the dashboard
 }
+
+// A -var-file (after `--`) must be a file inside the checkout, following symlinks: Terraform
+// quotes lines of a file it can't parse, so one outside could leak (a mounted key, say).
+export const varFileEscape = (root: string, project: Project, args: string[]): string | null => {
+  const files: string[] = [];
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i].replace(/^--/, '-');
+    if (a === '-var-file') files.push(args[++i] ?? '');
+    else if (a.startsWith('-var-file=')) files.push(a.slice('-var-file='.length));
+  }
+  if (!files.length) return null;
+  let top: string;
+  try { top = realpathSync(root); } catch { return 'the checkout is missing'; }
+  const cwd = project.dir === '.' ? root : join(root, project.dir);
+  for (const f of files) {
+    let real: string;
+    try { real = realpathSync(join(cwd, f)); } catch { return `\`-var-file\` ${f} doesn't exist in the repo`; }
+    if (real !== top && !real.startsWith(`${top}/`)) return `\`-var-file\` ${f} points outside the repo`;
+  }
+  return null;
+};
 
 interface PrContext {
   adapter: VcsAdapter;
@@ -234,11 +258,13 @@ export class App {
   private sched: FairScheduler;
   private deps: AppDeps;
   private checkout: typeof gitCheckout;
+  readonly live: LiveLogs;
 
   constructor(deps: AppDeps) {
     this.deps = deps;
     this.sched = new FairScheduler(deps.config.parallelism, deps.config.prParallelism ?? Math.max(1, deps.config.parallelism - 1));
     this.checkout = deps.checkout ?? gitCheckout;
+    this.live = deps.live ?? new LiveLogs();
     // Terraform refuses to use a plugin cache dir that doesn't exist.
     mkdirSync(join(deps.config.dataDir, 'plugin-cache'), { recursive: true });
   }
@@ -417,7 +443,7 @@ export class App {
       staleBase: stricterMode(p.stale_base ?? 'warn', rc?.stale_base, 'warn'),
       verifyPlan: p.verify_plan !== false,
       secretMode: stricterMode(config.secretScan?.mode ?? 'redact', p.secret_scan, 'redact'),
-      secretPatterns: config.secretScan?.patterns ?? [],
+      secretPatterns: [...(config.secretScan?.patterns ?? []), ...(p.secret_patterns ?? [])],
       risk: p.risk || config.risk ? {
         production: p.risk?.production ?? config.risk?.production,
         extra_approval: { ...config.risk?.extra_approval, ...p.risk?.extra_approval },
@@ -483,6 +509,22 @@ export class App {
   }
 
   // Hides possible secrets in tool output; "fail" mode also refuses to keep the run.
+  // Live output of one run, cleaned with the repo's secret scan settings.
+  private liveFor(ctx: PrContext, project: Project, runId: number): LiveWriter {
+    const s = this.safety(ctx);
+    return this.live.start(runId, `${ctx.repoKey}#${ctx.pr.number}|${project.name}`, { mode: s.secretMode, patterns: s.secretPatterns });
+  }
+
+  // Saved plans (the plan file and its JSON) and live output are dropped when a lock is
+  // released or the PR closes: they were made under that lock.
+  private forgetPlans(repoKey: string, pr: number, project?: string) {
+    for (const path of this.deps.store.discardPlans(repoKey, pr, project)) {
+      rmSync(path, { force: true });
+      rmSync(`${path}.json`, { force: true });
+    }
+    this.live.dropPr(`${repoKey}#${pr}`, project);
+  }
+
   private scan(ctx: PrContext, text: string): { text: string; found: string[]; fail: boolean } {
     const s = this.safety(ctx);
     if (s.secretMode === 'off') return { text, found: [], fail: false };
@@ -524,7 +566,7 @@ export class App {
   private async closed(repo: Repo, number: number) {
     const released = this.deps.store.releasePrLocks(this.repoKey(repo), number);
     this.deps.store.forgetPrComments(this.repoKey(repo), number);
-    this.deps.store.discardPlans(this.repoKey(repo), number);
+    this.forgetPlans(this.repoKey(repo), number);
     rmSync(this.workDir(repo, number), { recursive: true, force: true });
     rmSync(this.planDir(repo, number), { recursive: true, force: true });
     log.info('PR closed; cleaned up', { repo: repo.fullName, pr: number, released });
@@ -761,15 +803,22 @@ export class App {
     const checkName = `teriac: ${project.name}`;
     const started = Date.now();
     const runId = store.startRun({ repo: ctx.repoKey, pr: ctx.pr.number, project: project.name, workspace: project.workspace, kind: 'plan', headSha: ctx.pr.headSha, user, targets: opts.targets, prAuthor: ctx.pr.author, dir: project.dir });
-    await this.check(ctx, { name: checkName, headSha: ctx.pr.headSha, externalId: project.name, status: 'in_progress', title: 'Planning…', summary: `Planning \`${project.name}\`` });
+    // Live output exists from the moment the run does, so a viewer never finds it missing.
+    const live = this.liveFor(ctx, project, runId);
+    // The check's "Details" link opens the live output while it runs.
+    const liveUrl = this.commentLinks(ctx).run!(runId);
+    await this.check(ctx, { name: checkName, headSha: ctx.pr.headSha, externalId: project.name, status: 'in_progress', title: 'Planning…', summary: `Planning \`${project.name}\`\n\n▶ [Watch the live output](${liveUrl})`, detailsUrl: liveUrl });
 
     let engine = '';
     try {
       const tools = await this.tools(ctx, project);
       engine = engineLabel(tools);
       const planPath = this.planPath(ctx, project);
+      const escape = varFileEscape(ctx.root, project, opts.extraArgs ?? []);
+      if (escape) throw new Error(escape);
       const r = await runPlan({
         root: ctx.root, project, tools, planPath, env: this.env(ctx, project, user), timeoutMs: config.runTimeoutMs,
+        onOutput: live.write, onSensitive: live.sensitive,
       }, opts);
       const destroys = r.summary ? r.summary.destroy + r.summary.replace : 0;
       let policy: PolicyResult | null = null;
@@ -816,6 +865,8 @@ export class App {
       if (policy?.findings.length) store.saveFindings(store.getRun(runId)!, policy.mode, policy.findings);
     } catch (err) {
       store.finishRun(runId, { status: 'failed', engine, output: `teriac could not run this project: ${(err as Error).message}` });
+    } finally {
+      live.end();
     }
     metrics.observeRun('plan', store.getRun(runId)!.status, Date.now() - started);
     await this.publishCheck(ctx, project, store.getRun(runId)!);
@@ -1155,7 +1206,9 @@ export class App {
     const { store, config } = this.deps;
     const started = Date.now();
     const runId = store.startRun({ repo: ctx.repoKey, pr: ctx.pr.number, project: project.name, workspace: project.workspace, kind: 'apply', headSha: ctx.pr.headSha, user, prAuthor: ctx.pr.author, dir: project.dir });
-    await this.check(ctx, { name: `teriac: ${project.name}`, headSha: ctx.pr.headSha, externalId: project.name, status: 'in_progress', title: 'Applying…', summary: `Applying \`${project.name}\` for @${user}` });
+    const live = this.liveFor(ctx, project, runId);
+    const liveUrl = this.commentLinks(ctx).run!(runId);
+    await this.check(ctx, { name: `teriac: ${project.name}`, headSha: ctx.pr.headSha, externalId: project.name, status: 'in_progress', title: 'Applying…', summary: `Applying \`${project.name}\` for @${user}\n\n▶ [Watch the live output](${liveUrl})`, detailsUrl: liveUrl });
     let engine = plan.engine;
     try {
       // Apply exactly what was reviewed: the plan file must be the one saved at plan time.
@@ -1164,6 +1217,7 @@ export class App {
         if (now !== plan.planSha) {
           store.audit({ repo: ctx.repoKey, pr: ctx.pr.number, user, action: 'apply', project: project.name, allowed: false, reason: `plan file ${now ? 'changed' : 'missing'} since it was reviewed (run ${plan.id})` });
           store.finishRun(runId, { status: 'failed', engine, output: `teriac refused to apply: the saved plan file ${now ? 'changed' : 'is missing'} since it was reviewed. Plan again (\`${config.commandNames[0]} plan -p ${project.name}\`), review it, then apply.` });
+          live.end();
           metrics.observeRun('apply', 'failed', Date.now() - started);
           await this.publishCheck(ctx, project, store.getRun(runId)!);
           return;
@@ -1171,7 +1225,11 @@ export class App {
       }
       const tools = await this.tools(ctx, project);
       engine = engineLabel(tools);
-      const r = await runApply({ root: ctx.root, project, tools, planPath: plan.planPath!, env: this.env(ctx, project, user), timeoutMs: config.runTimeoutMs });
+      // The reviewed plan knows which values are sensitive: hide them from the first line.
+      let sensitive: string[] = [];
+      try { sensitive = sensitiveValues(JSON.parse(readFileSync(`${plan.planPath}.json`, 'utf-8'))); } catch { /* no saved plan JSON */ }
+      live.sensitive(sensitive);
+      const r = await runApply({ root: ctx.root, project, tools, planPath: plan.planPath!, env: this.env(ctx, project, user), timeoutMs: config.runTimeoutMs, onOutput: live.write, onSensitive: live.sensitive, sensitive });
       // The apply already happened, so "fail" mode can only hide the output here.
       const scanned = this.scan(ctx, r.output);
       this.auditSecrets(ctx, user, project, scanned.found, 'apply');
@@ -1179,6 +1237,8 @@ export class App {
       store.finishRun(runId, { status: r.ok ? 'success' : 'failed', engine, output: scanned.text, summary: plan.summary, usage: r.usage ?? null, applied: parseApplyResult(r.output), secrets: scanned.found });
     } catch (err) {
       store.finishRun(runId, { status: 'failed', engine, output: `teriac could not apply this project: ${(err as Error).message}` });
+    } finally {
+      live.end();
     }
     metrics.observeRun('apply', store.getRun(runId)!.status, Date.now() - started);
     await this.publishCheck(ctx, project, store.getRun(runId)!);
@@ -1198,9 +1258,10 @@ export class App {
       const ok = isAuthor || (await this.allowed(ctx, 'plan', user, project)).allowed;
       if (!ok) continue;
       store.releaseLock(l.repo, l.project, l.workspace);
+      this.forgetPlans(ctx.repoKey, ctx.pr.number, l.project);
       released.push(l.project);
     }
-    if (!cmd.project) store.discardPlans(ctx.repoKey, ctx.pr.number);
+    if (!cmd.project) this.forgetPlans(ctx.repoKey, ctx.pr.number);
     reply.say(released.length
       ? `🔓 Unlocked ${released.map(p => `\`${p}\``).join(', ')} and discarded the plans. Run \`teriac plan\` to plan again.`
       : 'This PR holds no locks you can release.');
@@ -1209,7 +1270,7 @@ export class App {
   // A lock released from the dashboard: drop that project's plan (it was made under the
   // lock) and tell the PR, so its people know why they must plan again.
   async dashboardUnlock(adapter: VcsAdapter | undefined, lock: { repo: string; pr: number; project: string; workspace: string; user: string }, by: { name: string; via: string }): Promise<boolean> {
-    this.deps.store.discardPlans(lock.repo, lock.pr, lock.project);
+    this.forgetPlans(lock.repo, lock.pr, lock.project);
     if (!adapter) return false;
     const [host, owner, ...rest] = lock.repo.split('/');
     const name = rest.join('/');
@@ -1234,7 +1295,7 @@ export class App {
 
   private async check(ctx: PrContext, check: Parameters<VcsAdapter['setCheck']>[1]) {
     if (!ctx.adapter.supportsChecks) return;
-    const url = await ctx.adapter.setCheck(ctx.repo, { ...check, detailsUrl: `${this.deps.config.publicUrl}/` })
+    const url = await ctx.adapter.setCheck(ctx.repo, { ...check, detailsUrl: check.detailsUrl ?? `${this.deps.config.publicUrl}/` })
       .catch(err => { log.warn('check update failed', { err }); return null; });
     if (url && check.externalId) this.checkUrls.set(`${ctx.repoKey}#${ctx.pr.number}#${check.externalId}`, url);
   }
@@ -1248,6 +1309,7 @@ export class App {
     const out = renderCheck(project.name, run, blockers);
     const canApply = run.kind === 'plan' && run.status === 'success' && run.hasChanges;
     await this.check(ctx, {
+      detailsUrl: this.commentLinks(ctx).run!(run.id),
       name: `teriac: ${project.name}`, headSha: run.headSha, externalId: project.name, status: 'completed',
       conclusion: run.status === 'success' ? (canApply ? 'neutral' : 'success') : 'failure',
       title: out.title, summary: out.summary, text: out.text,
@@ -1294,7 +1356,8 @@ export class App {
       avatar: login => (!avatarSource(ctx.repo.platform, ctx.repo.host, login) ? null
         : this.deps.config.spinnerUrl ? `${this.deps.config.publicUrl}${roundAvatarPath(ctx.repo.host, login)}`
         : `https://${ctx.repo.host}/${encodeURIComponent(login)}.png?size=36`),
-      run: id => `${this.deps.config.publicUrl}/#runs/${id}`,
+      // The run's page, with its repo and PR in the address: #runs/<owner>/<repo>/pull/<pr>/<run>.
+      run: id => `${this.deps.config.publicUrl}/#runs/${ctx.repo.owner}/${ctx.repo.name}/pull/${ctx.pr.number}/${id}`,
     };
   }
 

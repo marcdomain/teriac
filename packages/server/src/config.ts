@@ -13,7 +13,7 @@ import {
   validateSecretScan, validateRisk, validateFreezes, validateProtected, validateBreakGlass, validateSummary,
   validateStaleBase, validateBool,
   type SecretScanConfig, type SecretScanMode, type RiskConfig, type FreezeConfig, type ProtectedConfig,
-  type BreakGlassConfig, type SummaryConfig, type StaleBaseMode,
+  type BreakGlassConfig, type SummaryConfig, type StaleBaseMode, type SecretPattern,
 } from './safety-config.ts';
 
 export type Requirement = 'approved' | 'mergeable' | 'undiverged';
@@ -66,6 +66,7 @@ export interface RepoPolicy {
   stale_base?: StaleBaseMode;                 // default warn: base changed files this project uses
   verify_plan?: boolean;                      // default true: apply only the exact plan file reviewed
   secret_scan?: SecretScanMode;               // stricter than the server's mode, never looser
+  secret_patterns?: SecretPattern[];          // from `secret_scan: { patterns }`: added to the server's
   risk?: RiskConfig;
   freezes?: FreezeConfig;
   protected?: ProtectedConfig;
@@ -304,7 +305,12 @@ export const parseReposYaml = (text: string): RepoPolicy[] => {
     validateBool(repo.keep_approval_on_rebase, `${at}.keep_approval_on_rebase`);
     validateBool(repo.verify_plan, `${at}.verify_plan`);
     validateStaleBase(repo.stale_base, `${at}.stale_base`);
-    if (repo.secret_scan !== undefined) repo.secret_scan = validateSecretScan(repo.secret_scan, `${at}.secret_scan`)?.mode;
+    if (repo.secret_scan !== undefined) {
+      // `secret_scan: fail`, or `{ mode, patterns }`: the repo's patterns add to the server's.
+      const scan = validateSecretScan(repo.secret_scan, `${at}.secret_scan`);
+      repo.secret_scan = scan?.mode;
+      repo.secret_patterns = scan?.patterns ?? [];
+    }
     validateRisk(repo.risk, `${at}.risk`);
     validateFreezes(repo.freezes, `${at}.freezes`);
     validateProtected(repo.protected, `${at}.protected`);

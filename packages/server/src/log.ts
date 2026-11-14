@@ -8,7 +8,13 @@ const MIN_SECRET = 6;
 const SECRET_NAME = /TOKEN|SECRET|PASSWORD|PASSWD|PRIVATE|CREDENTIAL|API_?KEY|ACCESS_?KEY/i;
 
 export const addSecret = (value: string | undefined | null): void => {
-  if (value && value.length >= MIN_SECRET) secrets.add(value);
+  if (!value || value.length < MIN_SECRET) return;
+  secrets.add(value);
+  // A multi-line secret (a private key) can be printed one line at a time, e.g. quoted in
+  // an error: hide each of its lines too.
+  if (value.includes('\n')) {
+    for (const line of value.split('\n')) if (line.trim().length >= 16) secrets.add(line.trim());
+  }
 };
 
 // Registers every env value whose name looks secret (AWS_SECRET_ACCESS_KEY, ...).

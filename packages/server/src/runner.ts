@@ -8,6 +8,7 @@ import type { Provider } from './teriac.ts';
 import { teriac } from './teriac.ts';
 import { redact } from './log.ts';
 import { summarizePlan, type PlanSummary } from './render.ts';
+import { sensitiveValues, hideValues } from './sensitive.ts';
 
 export interface Tool { provider: Provider; version: string; binary: string }
 export interface ToolSet { tool: Tool; terragrunt?: Tool }
@@ -81,7 +82,8 @@ export const exec = (
     if (isStdout && opts.captureStdout) { stdout += text; return; }
     output += text;
     if (output.length > MAX_OUTPUT) output = output.slice(output.length - MAX_OUTPUT);
-    opts.onOutput?.(redact(text));
+    // Raw: the live log splits output into whole lines and cleans each one.
+    opts.onOutput?.(text);
   };
   child.stdout.on('data', c => add(c, true));
   child.stderr.on('data', c => add(c, false));
@@ -109,7 +111,8 @@ export const gitAuthEnv = (base: NodeJS.ProcessEnv, auth: { url: string; extraHe
 // secrets (anything TERIAC_*), plus automation flags and PR context.
 export const toolEnv = (base: NodeJS.ProcessEnv, extra: Record<string, string>): NodeJS.ProcessEnv => {
   const env: NodeJS.ProcessEnv = {};
-  for (const [k, v] of Object.entries(base)) if (!k.startsWith('TERIAC_')) env[k] = v;
+  // TF_LOG* (debug logs) print credentials and sensitive values: never passed on.
+  for (const [k, v] of Object.entries(base)) if (!k.startsWith('TERIAC_') && !/^TF_LOG/.test(k)) env[k] = v;
   return {
     ...env,
     TF_IN_AUTOMATION: '1',
@@ -130,7 +133,9 @@ export interface RunContext {
   planPath: string;
   env: NodeJS.ProcessEnv;
   timeoutMs: number;
-  onOutput?: (chunk: string) => void;
+  onOutput?: (chunk: string) => void;       // live output, raw (whole lines, paths tidied)
+  onSensitive?: (values: string[]) => void; // sensitive values found while running
+  sensitive?: string[];                     // values to hide from the start (apply: from its plan)
 }
 
 export interface PlanResult {
@@ -141,6 +146,7 @@ export interface PlanResult {
   plan?: Record<string, any>;  // full `show -json` output
   planJsonPath?: string;       // the same, written next to the plan file
   usage?: Usage | null;        // CPU and memory of the whole run
+  sensitive?: string[];        // values Terraform marks sensitive (state and plan), hidden above
 }
 
 const steps = (ctx: RunContext) => {
@@ -153,13 +159,39 @@ const steps = (ctx: RunContext) => {
   // Server paths mean nothing to PR readers: show the plan as "tfplan", the checkout as ".".
   const tidy = (text: string) => text.split(ctx.planPath).join('tfplan').split(ctx.root).join('.');
   let usage: Usage | null = null;
-  const run = async (args: string[], log: string[], captureStdout = false) => {
-    log.push(tidy(`$ ${tools.terragrunt ? 'terragrunt' : tools.tool.provider === 'opentofu' ? 'tofu' : 'terraform'} ${args.join(' ')}`));
-    const r = await exec(bin, args, cwd, env, { timeoutMs: ctx.timeoutMs, captureStdout, onOutput: ctx.onOutput, measure: true });
+  // Live output in whole lines, with server paths tidied (a path is never split across chunks).
+  let partial = '';
+  const live = (chunk: string) => {
+    if (!ctx.onOutput) return;
+    const parts = (partial + chunk).split('\n');
+    partial = parts.pop() ?? '';
+    if (parts.length) ctx.onOutput(parts.map(tidy).join('\n') + '\n');
+  };
+  const flush = () => { if (partial && ctx.onOutput) ctx.onOutput(`${tidy(partial)}\n`); partial = ''; };
+  const hidden = new Set<string>(ctx.sensitive ?? []);
+  const learn = (values: string[]) => {
+    const fresh = values.filter(v => !hidden.has(v));
+    if (!fresh.length) return;
+    for (const v of fresh) hidden.add(v);
+    ctx.onSensitive?.(fresh);
+  };
+  const run = async (args: string[], log: string[], captureStdout = false, quiet = false) => {
+    const line = tidy(`$ ${tools.terragrunt ? 'terragrunt' : tools.tool.provider === 'opentofu' ? 'tofu' : 'terraform'} ${args.join(' ')}`);
+    log.push(line);
+    if (!quiet) live(`${line}\n`);
+    const r = await exec(bin, args, cwd, env, { timeoutMs: ctx.timeoutMs, captureStdout, onOutput: quiet ? undefined : live, measure: true });
+    if (!quiet) flush();
     usage = combineUsage(usage, r.usage ?? null);
     if (r.output.trim()) log.push(tidy(r.output.trimEnd()));
     return r;
   };
+  // The state's sensitive values, before anything prints it. Best effort: a project with no
+  // state yet, or a backend that can't be read here, just has none.
+  const learnState = async () => {
+    const r = await run(['show', '-json'], [], true, true);
+    try { learn(sensitiveValues(JSON.parse(r.stdout.slice(r.stdout.indexOf('{'))))); } catch { /* no state */ }
+  };
+  const hide = (text: string) => hideValues(text, [...hidden].sort((a, b) => b.length - a.length));
   const prepare = async (log: string[]) => {
     // Terragrunt runs init itself.
     if (!tools.terragrunt) {
@@ -172,16 +204,33 @@ const steps = (ctx: RunContext) => {
     }
     return true;
   };
-  return { run, prepare, usage: () => usage };
+  return { run, prepare, usage: () => usage, learn, learnState, hide };
+};
+
+// `terraform output` prints a sensitive output in plain text when it's asked for by name,
+// so outputs are read as JSON and shown here, sensitive ones as "(sensitive value)".
+export const renderOutputs = (json: string, name?: string): { ok: boolean; text: string } => {
+  let all: Record<string, { sensitive?: boolean; value?: unknown; type?: unknown }>;
+  try { all = JSON.parse(json.slice(json.indexOf('{'))); } catch { return { ok: false, text: 'Could not read the outputs.' }; }
+  const show = (n: string, o: { sensitive?: boolean; value?: unknown }) =>
+    `${n} = ${o.sensitive ? '(sensitive value)' : typeof o.value === 'string' ? JSON.stringify(o.value) : JSON.stringify(o.value, null, 2)}`;
+  if (name) {
+    const o = all[name];
+    if (!o) return { ok: false, text: `No output named "${name}".` };
+    return { ok: true, text: show(name, o) };
+  }
+  return { ok: true, text: Object.entries(all).sort(([a], [b]) => a.localeCompare(b)).map(([n, o]) => show(n, o)).join('\n') };
 };
 
 export const plan = async (ctx: RunContext, opts: { destroy?: boolean; targets?: string[]; extraArgs?: string[]; refreshOnly?: boolean; replace?: string[]; noLock?: boolean } = {}): Promise<PlanResult> => {
   const log: string[] = [];
-  const { run, prepare, usage } = steps(ctx);
+  const { run, prepare, usage, learn, learnState, hide } = steps(ctx);
   mkdirSync(dirname(ctx.planPath), { recursive: true });
   if (existsSync(ctx.planPath)) rmSync(ctx.planPath);
+  for (const f of [`${ctx.planPath}.json`]) if (existsSync(f)) rmSync(f);
 
-  if (!(await prepare(log))) return { ok: false, output: log.join('\n'), summary: null, hasChanges: false, usage: usage() };
+  if (!(await prepare(log))) return { ok: false, output: hide(log.join('\n')), summary: null, hasChanges: false, usage: usage() };
+  await learnState();
 
   const args = ['plan', '-input=false', '-no-color', '-detailed-exitcode', `-out=${ctx.planPath}`];
   if (opts.destroy) args.push('-destroy');
@@ -194,9 +243,9 @@ export const plan = async (ctx: RunContext, opts: { destroy?: boolean; targets?:
   args.push(...(opts.extraArgs ?? []));
   const p = await run(args, log);
   // -detailed-exitcode: 0 no changes, 2 changes, anything else failed.
-  if (p.code !== 0 && p.code !== 2) return { ok: false, output: log.join('\n'), summary: null, hasChanges: false, usage: usage() };
+  if (p.code !== 0 && p.code !== 2) return { ok: false, output: hide(log.join('\n')), summary: null, hasChanges: false, usage: usage() };
 
-  const show = await run(['show', '-json', ctx.planPath], [], true);
+  const show = await run(['show', '-json', ctx.planPath], [], true, true);
   let summary: PlanSummary | null = null;
   let parsed: Record<string, any> | undefined;
   let planJsonPath: string | undefined;
@@ -204,6 +253,7 @@ export const plan = async (ctx: RunContext, opts: { destroy?: boolean; targets?:
     // Terragrunt may print log lines before the JSON.
     const json = show.stdout.slice(show.stdout.indexOf('{'));
     parsed = JSON.parse(json);
+    learn(sensitiveValues(parsed));
     summary = summarizePlan(parsed!);
     planJsonPath = `${ctx.planPath}.json`;
     writeFileSync(planJsonPath, json);
@@ -211,16 +261,16 @@ export const plan = async (ctx: RunContext, opts: { destroy?: boolean; targets?:
     log.push('[teriac] could not read the plan as JSON; showing raw output only');
   }
   const hasChanges = summary ? !summary.noChanges : p.code === 2;
-  return { ok: true, output: log.join('\n'), summary, hasChanges, plan: parsed, planJsonPath, usage: usage() };
+  return { ok: true, output: hide(log.join('\n')), summary, hasChanges, plan: parsed, planJsonPath, usage: usage(), sensitive: parsed ? sensitiveValues(parsed) : [] };
 };
 
 export const apply = async (ctx: RunContext): Promise<{ ok: boolean; output: string; usage?: Usage | null }> => {
   const log: string[] = [];
-  const { run, prepare, usage } = steps(ctx);
+  const { run, prepare, usage, hide } = steps(ctx);
   if (!existsSync(ctx.planPath)) return { ok: false, output: 'The saved plan is gone; run plan again.' };
-  if (!(await prepare(log))) return { ok: false, output: log.join('\n'), usage: usage() };
+  if (!(await prepare(log))) return { ok: false, output: hide(log.join('\n')), usage: usage() };
   const r = await run(['apply', '-input=false', '-no-color', ctx.planPath], log);
-  return { ok: r.code === 0, output: log.join('\n'), usage: usage() };
+  return { ok: r.code === 0, output: hide(log.join('\n')), usage: usage() };
 };
 
 // One Terraform command in a prepared project (init and workspace done first):
@@ -229,11 +279,21 @@ export const apply = async (ctx: RunContext): Promise<{ ok: boolean; output: str
 export const runTool = async (ctx: RunContext, args: string[]): Promise<{ ok: boolean; code: number; output: string }> => {
   const prep: string[] = [];
   const log: string[] = [];
-  const { run, prepare } = steps(ctx);
-  if (!(await prepare(prep))) return { ok: false, code: 1, output: prep.join('\n') };
+  const { run, prepare, learnState, hide } = steps(ctx);
+  if (!(await prepare(prep))) return { ok: false, code: 1, output: hide(prep.join('\n')) };
+  // `output`: read as JSON, so sensitive outputs stay hidden even when asked for by name.
+  if (args[0] === 'output') {
+    const name = args.slice(1).find(a => !a.startsWith('-'));
+    const r = await run(['output', '-json'], log, true);
+    if (r.code !== 0) return { ok: false, code: r.code, output: hide(log.join('\n')) };
+    const o = renderOutputs(r.stdout, name);
+    return { ok: o.ok, code: o.ok ? 0 : 1, output: hide([log[0], o.text].join('\n')) };
+  }
+  // Values the state marks sensitive are hidden wherever `state show` or `show` prints them.
+  await learnState();
   const r = await run(args, log);
   // Commands print colour even without a terminal; PR comments can't show it.
-  const output = log.join('\n').replace(/\x1b\[[0-9;]*m/g, '');
+  const output = hide(log.join('\n').replace(/\x1b\[[0-9;]*m/g, ''));
   return { ok: r.code === 0, code: r.code, output };
 };
 

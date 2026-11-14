@@ -378,6 +378,36 @@ export const createHttpServer = (deps: HttpDeps): Server => {
         return;
       }
 
+      // Live output of a running plan or apply (server-sent events): the lines so far, then
+      // each new batch, then "done". Lines are cleaned of secrets before they get here.
+      const liveRun = /^\/api\/runs\/(\d+)\/live$/.exec(url.pathname);
+      if (req.method === 'GET' && liveRun) {
+        const id = Number(liveRun[1]);
+        const run = deps.store.getRun(id);
+        if (!run) return send(res, 404, { error: 'no such run' });
+        res.writeHead(200, { 'Content-Type': 'text/event-stream', 'Cache-Control': 'no-store', 'X-Accel-Buffering': 'no', 'X-Content-Type-Options': 'nosniff' });
+        const event = (name: string, data: unknown) => res.write(`event: ${name}\ndata: ${JSON.stringify(data)}\n\n`);
+        let ping: NodeJS.Timeout | undefined;
+        let closed = false;
+        req.on('close', () => { closed = true; });
+        // A run that's still starting may not have live output yet: wait a little for it.
+        if (!deps.app.live?.has(id) && (run.status === 'running' || run.status === 'queued')) {
+          for (let i = 0; i < 40 && !deps.app.live?.has(id) && !closed; i++) await new Promise(r => setTimeout(r, 250));
+        }
+        const finish = () => { clearInterval(ping); if (!res.writableEnded) { event('done', {}); res.end(); } };
+        const sub = deps.app.live?.subscribe(id, (lines, done) => {
+          if (lines.length && !res.writableEnded) event('lines', lines);
+          if (done) finish();
+        });
+        if (!sub) { event('done', { saved: true }); return res.end(); }
+        if (sub.dropped) event('dropped', sub.dropped);
+        if (sub.backlog.length) event('lines', sub.backlog);
+        if (sub.done) return finish();
+        ping = setInterval(() => res.write(': ping\n\n'), 15_000);
+        req.on('close', () => { clearInterval(ping); sub.stop(); });
+        return;
+      }
+
       if (req.method === 'GET') {
         if (url.pathname === '/api/locks') return send(res, 200, deps.store.allLocks().map(show.lock));
         if (url.pathname === '/api/runs') {

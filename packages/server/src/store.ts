@@ -380,12 +380,13 @@ export class Store {
   }
 
   // Plans are discarded on unlock; runs stay for history.
-  discardPlans(repo: string, pr: number, project?: string): void {
-    if (project) {
-      this.db.prepare(`UPDATE runs SET plan_path = NULL WHERE repo = ? AND pr = ? AND kind = 'plan' AND project = ?`).run(repo, pr, project);
-      return;
-    }
-    this.db.prepare(`UPDATE runs SET plan_path = NULL WHERE repo = ? AND pr = ? AND kind = 'plan'`).run(repo, pr);
+  // Forgets a PR's saved plans (or one project's) and returns their files, for deleting.
+  discardPlans(repo: string, pr: number, project?: string): string[] {
+    const where = `repo = ? AND pr = ? AND kind = 'plan' AND plan_path IS NOT NULL${project ? ' AND project = ?' : ''}`;
+    const args: (string | number)[] = project ? [repo, pr, project] : [repo, pr];
+    const paths = (this.db.prepare(`SELECT DISTINCT plan_path FROM runs WHERE ${where}`).all(...args) as { plan_path: string }[]).map(r => r.plan_path);
+    this.db.prepare(`UPDATE runs SET plan_path = NULL WHERE ${where}`).run(...args);
+    return paths;
   }
 
   // Everything the Metrics page shows, for runs started at or after `from`.

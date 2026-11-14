@@ -40,6 +40,7 @@ if (cmd === 'state' && rest[0] === 'list') { console.log('terraform_data.app\\nt
 if (cmd === 'state' && rest[0] === 'show') { console.log('# ' + rest[1] + ':\\nresource "terraform_data" "app" {}'); process.exit(0); }
 if (cmd === 'state' && rest[0] === 'rm') { console.log('Removed ' + rest[1] + '\\nSuccessfully removed 1 resource instance(s).'); process.exit(0); }
 if (cmd === 'import') { console.log('ARGS ' + rest.join(' ') + '\\nImport successful!'); process.exit(0); }
+if (cmd === 'output' && rest.includes('-json')) { console.log(JSON.stringify({ app: { sensitive: false, value: 'demo' }, db_password: { sensitive: true, value: 'hunter2-SUPERSECRET' } })); process.exit(0); }
 if (cmd === 'output') { console.log('\\u001b[1mapp\\u001b[0m = "demo"'); process.exit(0); }
 if (cmd === 'fmt') { console.log('main.tf\\n--- old/main.tf\\n+++ new/main.tf'); process.exit(3); }
 if (cmd === 'show' && rest.length === 1) { console.log('# terraform_data.app:'); process.exit(0); }
@@ -164,7 +165,7 @@ test('1. push → autoplan both projects, sticky comment + checks with Apply but
   assert.match(body, /\| <img src="https:\/\/teriac\.example\.com\/avatars\/round\/github\.com\/bob\.svg" width="18" height="18" align="center" alt=""> \[bob\]\(https:\/\/github\.com\/bob\) \|/);
   assert.doesNotMatch(body, /@bob/);
   assert.doesNotMatch(body, /- 🔒 \*\*`envs/, 'blockers are only in the table');
-  assert.match(body, /\[Open in the teriac dashboard\]\(https:\/\/teriac\.example\.com\/#runs\/\d+\)/);
+  assert.match(body, /\[Open in the teriac dashboard\]\(https:\/\/teriac\.example\.com\/#runs\/acme\/infra\/pull\/1\/\d+\)/, 'the run page address has the repo and PR');
   const check = gh.checks.get('teriac: envs/prod')!;
   assert.equal(check.conclusion, 'neutral');
   assert.equal(check.actions?.[0].identifier, 'apply');
@@ -443,6 +444,11 @@ test('Terraform commands: read ones for planners; state changes need permission,
   assert.match(last(), /✅ `teriac state list -p envs\/dev`[\s\S]*```\n\$ terraform state list\nterraform_data\.app\nterraform_data\.cache\n```/);
   await comment(1, 'bob', 'teriac output -p envs/dev');
   assert.match(last(), /app = "demo"/);
+  assert.match(last(), /db_password = \(sensitive value\)/, 'sensitive outputs stay hidden');
+  assert.doesNotMatch(last(), /hunter2/);
+  await comment(1, 'bob', 'teriac output -p envs/dev db_password');
+  assert.match(last(), /db_password = \(sensitive value\)/, 'even when asked for by name');
+  assert.doesNotMatch(last(), /hunter2/);
   assert.doesNotMatch(last(), /\u001b/, 'colour codes are removed');
   await comment(1, 'bob', 'teriac fmt -p envs/dev');
   assert.match(last(), /📝 `teriac fmt -p envs\/dev`\n\nSome files need `terraform fmt`/);

@@ -1,0 +1,30 @@
+terraform_data.db: Refreshing state... [id=57c85558-f359-c539-f023-6a459ce2b4e3]
+
+Terraform used the selected providers to generate the following execution
+plan. Resource actions are indicated with the following symbols:
+  ~ update in-place
+
+Terraform will perform the following actions:
+
+  # terraform_data.db will be updated in-place
+  ~ resource "terraform_data" "db" {
+        id     = "57c85558-f359-c539-f023-6a459ce2b4e3"
+      ~ input  = {
+          ~ replicas = 2 -> 3
+            # (2 unchanged attributes hidden)
+        }
+      ~ output = {
+          - password = "hunter2-SUPERSECRET"
+          - replicas = 2
+          - user     = "admin"
+        } -> (known after apply)
+    }
+
+Plan: 0 to add, 1 to change, 0 to destroy.
+
+─────────────────────────────────────────────────────────────────────────────
+
+Saved the plan to: /tmp/plan.bin
+
+To perform exactly these actions, run the following command to apply:
+    terraform apply "/tmp/plan.bin"
