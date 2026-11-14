@@ -126,6 +126,14 @@ export const toolEnv = (base: NodeJS.ProcessEnv, extra: Record<string, string>):
   };
 };
 
+// Terragrunt's own log lines, and Terraform's when a Terragrunt version ignores
+// TG_TF_FORWARD_STDOUT: "12:00:00.000 STDOUT 1.9.8: text", "12:00:00.000 INFO   [../vpc] terraform: text".
+// The time, the level (kept for WARN and ERROR) and the Terraform binary's name go.
+export const terragruntPrefix = (tfBinary: string): RegExp => {
+  const name = tfBinary.split(/[\\/]/).pop()!.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`^\\d{2}:\\d{2}:\\d{2}(?:\\.\\d+)?\\s+(STDOUT|STDERR|TRACE|DEBUG|INFO|WARN|ERROR)\\s+(?:\\[[^\\]]*\\]\\s+)?(?:(?:${name}|terraform|tofu):\\s)?`);
+};
+
 export interface RunContext {
   root: string;               // checkout dir
   project: Project;
@@ -152,12 +160,18 @@ export interface PlanResult {
 const steps = (ctx: RunContext) => {
   const { tools, project } = ctx;
   const cwd = project.dir === '.' ? ctx.root : join(ctx.root, project.dir);
+  // Terragrunt: pass Terraform's output through as it is (no "12:00:00.000 STDOUT terraform:"
+  // prefix on every line), so it reads, and is coloured, like plain Terraform output.
   const env = tools.terragrunt
-    ? { ...ctx.env, TG_TF_PATH: tools.tool.binary, TERRAGRUNT_TFPATH: tools.tool.binary }
+    ? { ...ctx.env, TG_TF_PATH: tools.tool.binary, TERRAGRUNT_TFPATH: tools.tool.binary, TG_TF_FORWARD_STDOUT: 'true', TERRAGRUNT_FORWARD_TF_STDOUT: 'true' }
     : ctx.env;
   const bin = tools.terragrunt?.binary ?? tools.tool.binary;
+  const tgPrefix = tools.terragrunt ? terragruntPrefix(tools.tool.binary) : null;
   // Server paths mean nothing to PR readers: show the plan as "tfplan", the checkout as ".".
-  const tidy = (text: string) => text.split(ctx.planPath).join('tfplan').split(ctx.root).join('.');
+  const tidy = (text: string) => {
+    const t = text.split(ctx.planPath).join('tfplan').split(ctx.root).join('.');
+    return tgPrefix ? t.split('\n').map(l => l.replace(tgPrefix, (_m, level: string) => (/WARN|ERROR/.test(level) ? `${level} ` : ''))).join('\n') : t;
+  };
   let usage: Usage | null = null;
   // Live output in whole lines, with server paths tidied (a path is never split across chunks).
   let partial = '';

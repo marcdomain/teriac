@@ -212,3 +212,28 @@ test('live endpoint: a viewer who connects before output starts still gets it', 
   srv.close();
   store.close();
 });
+
+test('Terragrunt output reads (and is coloured) like Terraform: no time, level or binary prefix', async () => {
+  const { terragruntPrefix } = await import('../src/runner.ts');
+  const { colorize } = await import('../src/render.ts');
+  const re = terragruntPrefix('/data/teriac/store/terraform/1.9.8');
+  const clean = (l: string) => l.replace(re, (_m, level: string) => (/WARN|ERROR/.test(level) ? `${level} ` : ''));
+  const raw = [
+    '22:51:44.390 STDOUT 1.9.8:   # terraform_data.db will be created',
+    '22:51:44.390 STDOUT 1.9.8:   + resource "terraform_data" "db" {',
+    '22:51:44.390 STDOUT 1.9.8:       ~ input = "a" -> "b"',
+    '22:51:44.390 STDOUT 1.9.8:   - resource "terraform_data" "old" {',
+    '22:54:09.518 INFO   1.9.8: Initializing the backend...',
+    '12:00:00.000 WARN   [../vpc] Config ../vpc/terragrunt.hcl is a dependency of . that has no outputs, but mock outputs provided',
+    '12:00:00.000 ERROR  tofu: Error: Invalid value',
+  ].map(clean);
+  assert.deepEqual(raw, [
+    '  # terraform_data.db will be created', '  + resource "terraform_data" "db" {', '      ~ input = "a" -> "b"', '  - resource "terraform_data" "old" {',
+    'Initializing the backend...',
+    'WARN Config ../vpc/terragrunt.hcl is a dependency of . that has no outputs, but mock outputs provided',
+    'ERROR Error: Invalid value',
+  ]);
+  // The PR comment's diff colouring keys on the leading +, - and ~.
+  const colored = colorize(raw.slice(0, 4).join('\n')).split('\n');
+  assert.deepEqual(colored.map(l => l[0]), [' ', '+', '!', '-']);
+});
