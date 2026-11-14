@@ -362,9 +362,15 @@
     const x = RISK[r.risk.level];
     return x ? `<span class="pill ${x[0]}" title="${esc(r.risk.reasons.join('; ').replace(/`/g, ''))}">${x[1]}</span>` : '<span class="muted">None</span>';
   };
+  // A run's page: #runs/<owner>/<repo>/pull/<pr>/<run>. Only the last part (the run) is
+  // needed to open it; the rest says where it belongs. Old #runs/<run> links still work.
+  const runPath = (r) => {
+    const [, owner, ...name] = String(r.repo || '').split('/');
+    return owner && name.length && r.pr ? `runs/${owner}/${name.join('/')}/pull/${r.pr}/${r.id}` : `runs/${r.id}`;
+  };
   const runRow = (r) => {
     const s = summaryOf(r);
-    return `<tr class="click" data-run="${r.id}">
+    return `<tr class="click" data-run="${esc(runPath(r))}">
       <td>${statusPill(r)}</td>
       <td class="mono">${projLink(r.project)}${r.workspace !== 'default' ? ` <span class="muted">@${esc(r.workspace)}</span>` : ''}${r.targets?.length ? ' <span class="pill run">targeted</span>' : ''}</td>
       <td>${r.kind === 'plan' ? counts(s) : '<span class="muted">apply</span>'}</td>
@@ -466,8 +472,12 @@
         }), q ? 'No project matches your search.' : 'No projects yet.')}${list.length ? pager(list.length, params) : ''}</div>`;
     },
 
-    async run(id) {
+    async run(arg) {
+      const id = /(\d+)$/.exec(arg)?.[1] ?? arg;
       const r = await api(`/api/runs/${encodeURIComponent(id)}`);
+      // Show the full address (repo, PR, run), also when opened from an old #runs/<run> link.
+      const canonical = `#${runPath(r)}`;
+      if (location.hash.split('?')[0] !== canonical) history.replaceState(null, '', canonical);
       const s = summaryOf(r);
       const L = r.links || {};
       const dangerous = s ? s.changes.filter(c => c.action === 'delete' || c.action === 'replace') : [];
@@ -500,7 +510,11 @@
           <div class="card"><div class="card-head"><h2>Changed outside Terraform</h2></div>${s.drift.length ? `<pre class="changes">${changeLines(s.drift)}</pre>` : '<div class="empty">None</div>'}</div>
           <div class="card"><div class="card-head"><h2>Outputs</h2></div>${s.outputs.length ? `<pre class="changes">${s.outputs.map(o => `${esc(SYMBOL[o.action] || '~')}   ${esc(o.name)}`).join('\n')}</pre>` : '<div class="empty">None</div>'}</div>
         </div>` : ''}
-        <div class="card"><div class="card-head"><h2>Output</h2><span class="muted small">secrets redacted</span></div><pre class="log">${esc(r.output || '')}</pre></div>`;
+        ${r.status === 'running' || r.status === 'queued'
+          ? `<div class="card"><div class="card-head"><h2>Output</h2><span class="inline"><span class="pill run live"><span class="dot"></span> live</span>
+              <label class="small follow"><input type="checkbox" id="live-follow" checked> Follow</label></span></div>
+              <pre class="log" id="live-log" data-run="${r.id}"><span class="muted">Waiting for output…</span></pre></div>`
+          : `<div class="card"><div class="card-head"><h2>Output</h2><span class="muted small">secrets redacted</span></div><pre class="log">${esc(r.output || '')}</pre></div>`}`;
     },
 
     async locks() {
@@ -759,7 +773,7 @@
               ${tile(secsText(m.usage.cpu.p50), 'median CPU per run', `p95 ${secsText(m.usage.cpu.p95)}`)}
               ${tile(secsText(m.usage.cpu.total), 'CPU used in total', period)}
             </div>
-            ${table(['Heaviest runs', 'Pull request', 'Type', 'Peak memory', 'CPU', 'Processes', 'Took', 'By'], m.usage.heaviest.map(r => `<tr class="click" data-run="${r.id}">
+            ${table(['Heaviest runs', 'Pull request', 'Type', 'Peak memory', 'CPU', 'Processes', 'Took', 'By'], m.usage.heaviest.map(r => `<tr class="click" data-run="${esc(runPath(r))}">
               <td class="mono">${projLink(r.project)}</td>
               <td>${esc(repoName(r.repo))} <span class="muted">#${r.pr}</span></td>
               <td>${esc(r.kind)}${r.status === 'failed' ? ' <span class="pill bad">failed</span>' : ''}</td>
@@ -1003,9 +1017,56 @@
   const current = () => {
     const raw = location.hash.slice(1) || 'overview';
     const [path, qs] = raw.split('?');
-    const [name, arg] = path.split('/');
-    return { name, arg, params: new URLSearchParams(qs || '') };
+    const [name, ...rest] = path.split('/');
+    return { name, arg: rest.join('/') || undefined, params: new URLSearchParams(qs || '') };
   };
+  // ---- live output of a running plan or apply ----
+  // Read with fetch (not EventSource) so the API token header works too.
+  let liveAbort = null;
+  const stopLive = () => { liveAbort?.abort(); liveAbort = null; };
+  const startLive = async (pre) => {
+    const id = pre.dataset.run;
+    const ctrl = new AbortController();
+    liveAbort = ctrl;
+    let first = true;
+    let count = 0;
+    const append = (lines) => {
+      if (first) { pre.textContent = ''; first = false; }
+      pre.append(document.createTextNode(lines.join('\n') + '\n'));
+      count += lines.length;
+      // Keep the page light: very long logs keep their last 20,000 lines here.
+      while (count > 20000 && pre.firstChild) { count -= (pre.firstChild.textContent.match(/\n/g) || []).length; pre.firstChild.remove(); }
+      if ($('#live-follow')?.checked) pre.scrollTop = pre.scrollHeight;
+    };
+    try {
+      const res = await fetch(`/api/runs/${encodeURIComponent(id)}/live`, {
+        credentials: 'same-origin', signal: ctrl.signal,
+        headers: { 'X-Requested-With': 'teriac', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+      });
+      if (!res.ok || !res.body) throw new Error(`HTTP ${res.status}`);
+      const reader = res.body.pipeThrough(new TextDecoderStream()).getReader();
+      let buf = '';
+      for (;;) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        buf += value;
+        let cut;
+        while ((cut = buf.indexOf('\n\n')) >= 0) {
+          const block = buf.slice(0, cut);
+          buf = buf.slice(cut + 2);
+          const name = /^event: (.*)$/m.exec(block)?.[1];
+          const data = /^data: (.*)$/m.exec(block)?.[1];
+          if (name === 'lines') append(JSON.parse(data));
+          if (name === 'dropped') append([`[teriac] ${JSON.parse(data)} earlier lines are not kept live; the saved log has the end of the run`]);
+          if (name === 'done') { stopLive(); setTimeout(route, 600); return; }
+        }
+      }
+    } catch (err) {
+      if (err.name === 'AbortError') return;
+      if (first) pre.innerHTML = `<span class="muted">Live output isn't available (${esc(err.message)}). It appears here when the run finishes.</span>`;
+    }
+  };
+
   const route = async () => {
     if (!me) return;
     if (picker.el) closePicker(); // a popup belongs to the page it was opened on
@@ -1015,8 +1076,10 @@
     try {
       chartData = [];
       tip.hidden = true;
+      stopLive();
       view.innerHTML = await (viewName === 'runs' && arg ? views.run(arg) : views[viewName](arg, params));
       sizeBars();
+      if ($('#live-log')) startLive($('#live-log'));
       const list = listName(viewName, params);
       if (list && !arg) await loadList(list, params);
       $('#refreshed').textContent = `Updated ${new Date().toLocaleTimeString([], { hour: '2-digit', minute: '2-digit', second: '2-digit' })}`;
@@ -1098,7 +1161,7 @@
 
   view.addEventListener('click', async (e) => {
     const row = e.target.closest('tr[data-run]');
-    if (row && !e.target.closest('a,button')) { location.hash = `runs/${row.dataset.run}`; return; }
+    if (row && !e.target.closest('a,button')) { location.hash = row.dataset.run; return; }
     const linkRow = e.target.closest('tr[data-href]');
     if (linkRow && !e.target.closest('a,button')) { location.hash = linkRow.dataset.href; return; }
     const trig = e.target.closest('button[data-picker]');

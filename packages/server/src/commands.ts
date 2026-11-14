@@ -145,6 +145,8 @@ export const parseCommand = (body: string, names: string[]): ParseResult => {
   if (command.override && verb !== 'apply') return { ok: false, error: '`--override` only works with apply' };
   if (command.override && !command.project && !command.dir) return { ok: false, error: '`--override` needs a project: `teriac apply -p <project> --override`' };
   if (command.extraArgs.length && verb !== 'plan') return { ok: false, error: 'Extra arguments only work with plan' };
+  const extra = checkExtraArgs(command.extraArgs);
+  if (extra) return { ok: false, error: extra };
   if (command.targets.length && verb !== 'plan') {
     return { ok: false, error: 'Targets are set when planning: `teriac plan -p <project> -t <address>`, then `teriac apply -p <project>`' };
   }
@@ -152,6 +154,32 @@ export const parseCommand = (body: string, names: string[]): ParseResult => {
     return { ok: false, error: 'Targets need a project: `teriac plan -p <project> -t <address>`' };
   }
   return { ok: true, command };
+};
+
+// Flags allowed after `--` on plan (when the repo allows extra arguments). Anything else
+// could reach outside the project (-chdir, -state, -out, -plugin-dir) or print files
+// Terraform can't parse (a -var-file outside the repo is quoted in the error).
+const EXTRA_FLAGS = new Set(['-var', '-var-file', '-target', '-replace', '-refresh', '-refresh-only', '-destroy', '-parallelism', '-lock-timeout', '-compact-warnings']);
+
+// A -var-file path: relative, inside the repo (checked again against the checkout on disk).
+export const safeVarFile = (path: string): boolean =>
+  path.length > 0 && !path.startsWith('/') && !path.startsWith('~') && !/^[A-Za-z]:/.test(path) && !path.split(/[\\/]/).includes('..');
+
+export const checkExtraArgs = (args: string[]): string | null => {
+  for (let i = 0; i < args.length; i++) {
+    const a = args[i];
+    if (!a.startsWith('-')) return `\`${a}\` isn't a flag; extra arguments are plan flags such as \`-var=name=value\``;
+    const [flag, inline] = a.includes('=') ? [a.slice(0, a.indexOf('=')), a.slice(a.indexOf('=') + 1)] : [a, undefined];
+    const name = flag.replace(/^--/, '-');
+    if (!EXTRA_FLAGS.has(name)) return `\`${flag}\` isn't allowed after \`--\`. Allowed: ${[...EXTRA_FLAGS].map(f => `\`${f}\``).join(', ')}`;
+    if (name === '-var-file') {
+      const v = inline ?? args[++i];
+      if (!v || !safeVarFile(v)) return `\`-var-file\` must be a path inside the repo (relative, no \`..\`), not \`${v ?? ''}\``;
+    } else if (inline === undefined && ['-var', '-target', '-replace', '-parallelism', '-lock-timeout'].includes(name)) {
+      i++; // its value
+    }
+  }
+  return null;
 };
 
 // Arguments of a Terraform command: resource addresses must look like addresses,

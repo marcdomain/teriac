@@ -108,6 +108,6 @@ test('only teriac commands are picked up', () => {
   const names = ['teriac'];
   const a = parseCommand('teriac plan -p infra/dev', names);
   assert.ok(a && a.ok && a.command.verb === 'plan' && a.command.project === 'infra/dev');
-  assert.equal(parseCommand('atlantis plan', names), null);
+  assert.equal(parseCommand('otherbot plan', names), null);
   assert.equal(parseCommand('terraform plan', names), null);
 });

@@ -54,9 +54,10 @@ Set up the GitHub App like this:
 | `teriac plan --destroy` | Plan a destroy |
 | `teriac plan -p <project> --replace <address>` | Plan replacing a resource |
 | `teriac plan -p <project> --refresh-only` | Plan updating the state to match what's deployed |
+| `teriac plan -p <project> -- -var=env=prod` | Pass plan flags (off unless the repo sets `allow_extra_args: true`). Allowed: `-var`, `-var-file`, `-target`, `-replace`, `-refresh`, `-refresh-only`, `-destroy`, `-parallelism`, `-lock-timeout`, `-compact-warnings`. A `-var-file` must be a file inside the repo (checked on disk, symlinks included) |
 | `teriac apply` | Apply every ready project (can be turned off, see below) |
 | `teriac apply -p <project>` | Apply one project. The Apply button does the same |
-| `teriac unlock` | Release this PR's locks and drop its plans |
+| `teriac unlock` | Release this PR's locks and delete its saved plans and live output (`-p <project>` for one). Closing or merging the PR does the same |
 
 Apply always uses the saved plan, so what runs is exactly what was reviewed.
 
@@ -70,9 +71,14 @@ Apply always uses the saved plan, so what runs is exactly what was reviewed.
 | `teriac state rm <address>...`, `state mv <from> <to>`, `force-unlock <lock-id>` | `state_remove` and approvals |
 
 Commands that edit the state directly take the project's lock, are audited, and plan the
-project again Only these commands run, and arguments are checked, so nothing else (such as `console` or
+project again. Only these commands run, and arguments are checked, so nothing else (such as `console` or
 `-chdir`) can be passed through. Turn direct state edits off for a repo with
 `allow_state_changes: false`.
+
+Values Terraform marks as sensitive stay hidden in every command. `teriac output <name>` shows
+`(sensitive value)` for sensitive outputs (plain `terraform output <name>` would print them), and
+`state show` and `show` hide sensitive values wherever they appear, including where a resource
+copied one into an attribute Terraform doesn't mark.
 
 ## Settings
 
@@ -384,20 +390,44 @@ reply says who can override what is still blocking, and every use is audited.
 
 ## Leaked-secret scan
 
-Before any output reaches a PR comment, a check run or the dashboard, teriac looks for things that
-look like secrets: AWS keys, private keys, GitHub, GitLab, Slack and npm tokens, Slack webhooks,
-Google API keys, Stripe keys, JWTs, Azure storage keys, and `password = "…"` in plan lines.
-Terraform's own `(sensitive value)` is left alone.
+Before any output reaches a PR comment, a check run or the dashboard (live or saved), teriac
+hides secrets in layers:
+
+1. **Values Terraform marks sensitive**, read from the state and the plan, wherever they appear.
+   Terraform hides them in its own diffs but not everywhere: a resource that copies a sensitive
+   input into an unmarked attribute shows it in later plans, `state show` and `show`.
+2. **The server's own secrets** (the GitHub App key, webhook secret, tokens) and any environment
+   variable whose name looks secret, each line of multi-line values included.
+3. **Known secret formats**: AWS, GitHub, GitLab, Slack, npm, PyPI, Google, GCP service-account,
+   Stripe, Twilio, SendGrid, DigitalOcean, Datadog, Vault and Terraform Cloud tokens and keys;
+   OpenAI and Anthropic API keys; JWTs; Azure storage keys and SAS signatures; private keys (whole
+   or cut off); passwords in URLs (`postgres://user:pass@host`) and connection strings
+   (`Password=…;`); and `password`, `token`, `secret`, `api_key`, `client_secret`… in plan lines.
+4. **Your own patterns**, server-wide and per repo.
+
+Terraform's own placeholders (`(sensitive value)`, `(known after apply)`) are left alone.
+Terraform never gets `TF_LOG*` from the server: its debug logs print credentials.
 
 ```yaml
-secret_scan:                            # in repos.yaml
+secret_scan:                            # in repos.yaml (Helm: under `repos:`)
   mode: redact                          # redact (default) | fail | off; a repo entry can make it stricter, not looser
-  patterns:                             # your own, optional
+  patterns:                             # your own, optional; a match shows as ‹redacted: acme-token›
     - { name: acme-token, regex: "acme_[0-9a-f]{32}" }
+repos:
+  - id: github.com/acme/payments
+    secret_scan:                        # a repo can add patterns too (they add to the server's)
+      mode: fail
+      patterns: [{ name: payments-key, regex: "pay_live_[A-Za-z0-9]{24}" }]
 ```
 
 - `redact` replaces each match with `‹redacted: aws-access-key›` and adds a warning.
-- `fail` also refuses the plan, so it can't be applied until the secret is gone.
+- `fail` also refuses the plan, so it can't be applied until the secret is gone. Live output
+  stops at the first match.
+- `off` turns the pattern scan off; layers 1 and 2 always apply.
+
+No scan can recognise every possible secret (a secret is just a string), so these layers cover
+what can be known: what Terraform marks, what the server holds, and well-known formats. Mark
+secrets `sensitive = true` in Terraform, and add patterns for your own token formats.
 
 Every find is audited.
 
@@ -544,7 +574,9 @@ original" section, and logs it in the audit log.
 
 Open the server's URL in a browser. It shows:
 - an overview of runs, failures, locks and drift, with a banner while a change freeze is on;
-- every plan and apply, with its risk, change list and redacted log;
+- every plan and apply, with its risk, change list and redacted log, and **live output while it
+  runs** (cleaned of secrets line by line; kept in memory, dropped when the PR's lock is released or
+  the PR closes);
 - locks, with an Unlock button;
 - drift schedules, findings, and who last changed each resource;
 - the audit log;

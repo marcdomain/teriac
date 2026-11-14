@@ -4,7 +4,7 @@
 import { test, before, after, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync, copyFileSync, readFileSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync, copyFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { App } from '../src/app.ts';
@@ -35,8 +35,14 @@ if (cmd === 'plan') {
   const out = rest.find(a => a.startsWith('-out=')).slice(5);
   fs.writeFileSync(out, fs.existsSync('SECURITY') ? 'security' : 'changes');
   process.stdout.write(fs.readFileSync(path.join(F, 'plan-changes.txt')));
-  if (fs.existsSync('LEAK')) console.log('  + tags = { owner_key = "AKIAIOSFODNN7EXAMPLE" }');
+  if (fs.existsSync('LEAK')) { process.stdout.write('  + tags = { owner_key = "AKIAIOSF'); process.stdout.write('ODNN7EXAMPLE" }\\n'); }
+  if (fs.existsSync('SENSITIVE')) console.log('      - output = { password = "hunter2-SUPERSECRET" }');
   process.exit(2);
+}
+if (cmd === 'show' && rest[rest.length - 1] === '-json') {
+  // The state: with a sensitive value when the project has a SENSITIVE marker.
+  process.stdout.write(fs.existsSync('SENSITIVE') ? fs.readFileSync(path.join(F, 'state-sensitive.json')) : '{}');
+  process.exit(0);
 }
 if (cmd === 'show') {
   const plan = fs.readFileSync(rest[rest.length - 1], 'utf-8');
@@ -77,7 +83,8 @@ class FakeGitHub implements VcsAdapter {
   async comment(_r: Repo, n: number, body: string) { const id = String(++this.seq); this.comments.push({ id, pr: n, body }); return id; }
   async editComment(_r: Repo, id: string, body: string) { const c = this.comments.find(x => x.id === id); if (c) c.body = body; }
   async react() {}
-  async setCheck(_r: Repo, c: CheckRun) { this.checks.set(c.name, c); return `https://github.test/runs/${encodeURIComponent(c.name)}`; }
+  checkHistory: CheckRun[] = [];
+  async setCheck(_r: Repo, c: CheckRun) { this.checks.set(c.name, c); this.checkHistory.push(c); return `https://github.test/runs/${encodeURIComponent(c.name)}`; }
   async userPermission(_r: Repo, u: string) { return PERMS[u] ?? 'none'; }
   async inTeam(_r: Repo, t: string, u: string) { return (TEAMS[t] ?? []).includes(u); }
   async reviews(_r: Repo, n: number) { return this.reviewsByPr.get(n) ?? []; }
@@ -131,7 +138,7 @@ before(() => {
   tmp = mkdtempSync(join(tmpdir(), 'teriac-safety-'));
   fixtures = join(tmp, 'fixtures');
   mkdirSync(fixtures);
-  for (const f of ['plan-changes.txt', 'plan-changes.json']) copyFileSync(join(FIXTURES, f), join(fixtures, f));
+  for (const f of ['plan-changes.txt', 'plan-changes.json', 'state-sensitive.json']) copyFileSync(join(FIXTURES, f), join(fixtures, f));
   writeFileSync(join(fixtures, 'plan-security.json'), JSON.stringify({
     format_version: '1.2',
     resource_changes: [
@@ -560,4 +567,80 @@ describe('avatars in the comment', () => {
     assert.match(body2, /<img src="https:\/\/github\.com\/bob\.png\?size=36"/);
     assert.doesNotMatch(body2, /avatars\/round/);
   });
+});
+
+// ---------------------------------------------------------------------------
+describe('live output, secrets and cleanup', () => {
+  // Markers committed to the repo change what the fake terraform prints in envs/dev.
+  const markers = (files: string[], on: boolean) => {
+    for (const f of files) { const p = join(origin, 'envs/dev', f); if (on) writeFileSync(p, ''); else rmSync(p, { force: true }); }
+    sh(origin, '-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '-A');
+    sh(origin, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '--allow-empty', '-m', on ? 'markers' : 'no markers');
+    head = sh(origin, 'rev-parse', 'HEAD');
+  };
+  const liveLines = (app: any, store: Store) => {
+    const run = store.latestRuns('github.com/acme/infra', 1, 'plan').find(r => r.project === 'envs/dev')!;
+    return { run, lines: app.live.subscribe(run.id, () => {})?.backlog ?? null };
+  };
+
+  test('a plan streams its output live: whole lines, secrets hidden, state-sensitive values hidden', async () => {
+    markers(['LEAK', 'SENSITIVE'], true);
+    let got: ReturnType<typeof liveLines>;
+    try {
+      const { app, store, open } = setup();
+      await open();
+      got = liveLines(app, store);
+    } finally {
+      markers(['LEAK', 'SENSITIVE'], false);
+    }
+    const { run, lines } = got;
+    assert.ok(lines && lines.length > 5);
+    const text = lines!.join('\n');
+    assert.match(text, /^\$ terraform plan /m, 'commands are shown');
+    assert.match(text, /owner_key = "‹redacted: aws-access-key›"/, 'a key split across two chunks is caught');
+    assert.match(text, /password = "\(sensitive value\)"/, 'a value the state marks sensitive');
+    assert.doesNotMatch(text, /AKIAIOSF|hunter2/);
+    assert.doesNotMatch(text, /show -json/, 'teriac\'s own reads are not shown');
+    assert.doesNotMatch(run.output, /AKIAIOSF|hunter2/, 'nor in the saved output');
+  });
+
+  test('unlock deletes the saved plan files and live output; closing the PR drops the rest', async () => {
+    const { app, store, say, open, gh } = setup();
+    await open();
+    const plans = store.latestRuns('github.com/acme/infra', 1, 'plan');
+    const files = plans.map(r => r.planPath!).filter(Boolean);
+    assert.equal(files.length, 2);
+    assert.ok(files.every(f => existsSync(f) && existsSync(`${f}.json`)));
+    const dev = plans.find(r => r.project === 'envs/dev')!;
+    const prod = plans.find(r => r.project === 'envs/prod')!;
+    await say('bob', 'teriac unlock -p envs/dev');
+    assert.ok(!existsSync(dev.planPath!) && !existsSync(`${dev.planPath}.json`), 'that project\'s plan is gone');
+    assert.equal(app.live.has(dev.id), false, 'and its live output');
+    assert.ok(existsSync(prod.planPath!), 'the other project keeps its plan');
+    assert.equal(store.getRun(dev.id)!.planPath, null);
+    await app.handle(gh, { kind: 'pr_closed', repo, pr: pr(1, 'bob'), merged: true });
+    assert.ok(!existsSync(prod.planPath!), 'closing deletes the rest');
+    assert.equal(app.live.has(prod.id), false);
+  });
+
+  test('-var-file must stay inside the checkout, even through a symlink', async () => {
+    const { varFileEscape } = await import('../src/app.ts');
+    const { symlinkSync } = await import('node:fs');
+    const root = mkdtempSync(join(tmp, 'vf-'));
+    mkdirSync(join(root, 'envs/dev'), { recursive: true });
+    writeFileSync(join(root, 'envs/dev/prod.tfvars'), 'a = 1');
+    symlinkSync('/etc/hosts', join(root, 'envs/dev/evil.tfvars'));
+    const project = { name: 'envs/dev', dir: 'envs/dev' } as any;
+    assert.equal(varFileEscape(root, project, ['-var-file=prod.tfvars']), null);
+    assert.match(varFileEscape(root, project, ['-var-file', 'evil.tfvars'])!, /points outside the repo/);
+    assert.match(varFileEscape(root, project, ['-var-file=missing.tfvars'])!, /doesn't exist/);
+  });
+});
+
+test('while a plan runs, its check links to the live output (the PR\'s "Details" link)', async () => {
+  const { gh, open } = setup();
+  await open();
+  const running = gh.checkHistory.find(c => c.name === 'teriac: envs/dev' && c.status === 'in_progress')!;
+  assert.match(running.detailsUrl!, /^https:\/\/teriac\.example\.com\/#runs\/acme\/infra\/pull\/1\/\d+$/);
+  assert.match(running.summary, /▶ \[Watch the live output\]\(https:\/\/teriac\.example\.com\/#runs\/acme\/infra\/pull\/1\/\d+\)/);
 });
