@@ -360,3 +360,9 @@ details.table-view summary { cursor: pointer; padding: 8px 16px; color: var(--mu
   .cal-month + .cal-month { display: none; }
   .cal-grid { grid-template-columns: repeat(7, minmax(32px, 1fr)); }
 }
+
+/* Sign in with GitHub */
+a.button.sso.github { background: #1f2328; color: #fff; border-color: #1f2328; }
+a.button.sso.github:hover { background: #32383f; }
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) a.button.sso.github { background: #f6f8fa; color: #1f2328; border-color: #f6f8fa; } }
+:root[data-theme="dark"] a.button.sso.github { background: #f6f8fa; color: #1f2328; border-color: #f6f8fa; }

@@ -63,6 +63,27 @@ spec:
               value: /secrets/github/private-key
             - name: TERIAC_GITHUB_WEBHOOK_SECRET_FILE
               value: /secrets/github/webhook-secret
+            # Rotation: read only when these keys exist in the Secret, re-read when they change.
+            - name: TERIAC_GITHUB_PRIVATE_KEY_NEXT_FILE
+              value: /secrets/github/private-key-next
+            - name: TERIAC_GITHUB_WEBHOOK_SECRET_NEXT_FILE
+              value: /secrets/github/webhook-secret-next
+            {{- with .Values.github.clientId }}
+            - name: TERIAC_GITHUB_CLIENT_ID
+              value: {{ . | quote }}
+            {{- end }}
+            {{- if .Values.dashboard.github.enabled }}
+            - name: TERIAC_GITHUB_CLIENT_SECRET_FILE
+              value: /secrets/github/client-secret
+            - name: TERIAC_GITHUB_ADMIN_USERS
+              value: {{ join "," .Values.dashboard.github.adminUsers | quote }}
+            - name: TERIAC_GITHUB_ADMIN_TEAMS
+              value: {{ join "," .Values.dashboard.github.adminTeams | quote }}
+            - name: TERIAC_GITHUB_ALLOWED_TEAMS
+              value: {{ join "," .Values.dashboard.github.allowedTeams | quote }}
+            {{- end }}
+            - name: TERIAC_DASHBOARD_PASSWORD_LOGIN
+              value: {{ .Values.dashboard.passwordLogin | quote }}
             {{- with .Values.config.repoAllowlist }}
             - name: TERIAC_REPO_ALLOWLIST
               value: {{ join "," . | quote }}

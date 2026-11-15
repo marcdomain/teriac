@@ -528,7 +528,7 @@
             <td class="mono">${esc(l.project)}</td><td class="mono muted">${esc(l.workspace)}</td>
             <td>${prLink(l)}</td>
             <td>${who(l.user, l.links?.user, null, l.links?.userAvatar)}</td><td class="muted" title="${esc(when(l.createdAt))}">${ago(l.createdAt)}</td>
-            <td>${adminButton('Unlock', `data-unlock='${esc(JSON.stringify({ repo: l.repo, project: l.project, workspace: l.workspace, pr: l.pr, user: l.user, createdAt: l.createdAt, prUrl: l.links?.pr ?? null }))}'`)}</td>
+            <td>${l.canUnlock ? `<button class="ghost small" type="button" data-unlock=${`'${esc(JSON.stringify({ repo: l.repo, project: l.project, workspace: l.workspace, pr: l.pr, user: l.user, createdAt: l.createdAt, prUrl: l.links?.pr ?? null }))}'`}>Unlock</button>` : adminButton('Unlock', `data-unlock='${esc(JSON.stringify({ repo: l.repo, project: l.project, workspace: l.workspace, pr: l.pr, user: l.user, createdAt: l.createdAt, prUrl: l.links?.pr ?? null }))}'`)}</td>
           </tr>`;
         }), 'No projects are locked.')}</div>`;
     },
@@ -1346,7 +1346,7 @@
     $('#signout').hidden = false;
     const el = $('#me');
     el.hidden = false;
-    el.innerHTML = `${avatar(who.name)}<span class="who-name"><b>${esc(who.name)}</b><span class="muted small">${esc(who.role)} · ${esc(who.via || '')}</span></span>`;
+    el.innerHTML = `${avatar(who.name)}<span class="who-name"><b>${esc(who.name)}</b><span class="muted small">${esc(who.role)} · ${esc(who.via === 'github' ? 'GitHub' : who.via || '')}${who.repos != null ? ` · ${who.repos} repo${who.repos === 1 ? '' : 's'}` : ''}</span></span>`;
     $('#version').textContent = who.version ? `v${who.version}` : '';
     const conn = $('#connected');
     const ps = who.platforms || [];
@@ -1371,11 +1371,12 @@
     const sso = $('#sso');
     sso.hidden = !cfg.oidc;
     if (cfg.oidc) sso.textContent = `Sign in with ${cfg.oidc.name}`;
+    $('#github-signin').hidden = !cfg.github;
     $('#password-form').hidden = !cfg.password;
-    $('#or').hidden = !(cfg.oidc && cfg.password);
+    $('#or').hidden = !((cfg.oidc || cfg.github) && cfg.password);
     $('#token-box').hidden = !cfg.token;
-    $('#token-box').open = cfg.token && !cfg.oidc && !cfg.password;
-    $('#no-auth').hidden = !!(cfg.oidc || cfg.password || cfg.token);
+    $('#token-box').open = cfg.token && !cfg.oidc && !cfg.github && !cfg.password;
+    $('#no-auth').hidden = !!(cfg.oidc || cfg.github || cfg.password || cfg.token);
     (cfg.password ? $('#username') : null)?.focus();
   }
 

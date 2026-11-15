@@ -23,11 +23,18 @@ imagePullSecrets: []
 github:
   appId: ""                     # required
   apiUrl: ""                    # GitHub Enterprise Server, e.g. https://ghe.acme.com/api/v3
+  clientId: ""                  # the App's client ID (its settings page): JWT issuer, and "Sign in with GitHub"
   # Use an existing Secret with keys `private-key` and `webhook-secret`...
   existingSecret: ""
   # ...or let the chart create one (avoid committing these to git).
   privateKey: ""
   webhookSecret: ""
+  clientSecret: ""              # key `client-secret`: needed for dashboard.github (Sign in with GitHub)
+  # Rotation, no restart: add `private-key-next` (and/or `webhook-secret-next`) to the Secret. teriac
+  # uses them only when present and falls over to them when GitHub refuses the current ones. Once the
+  # old key is deleted in GitHub, move the new one to `private-key` and remove `private-key-next`.
+  privateKeyNext: ""
+  webhookSecretNext: ""
 
 config:
   repoAllowlist: []             # e.g. ["github.com/acme/*"]; or list repos in `repos` below
@@ -144,6 +151,16 @@ dashboard:
     groupsClaim: groups
     adminGroups: []             # e.g. [teriac-admins]
     allowedGroups: []           # if set, only these groups (and admins) may sign in
+  # Sign in with GitHub (the App's client ID and secret above). People see only the repos they
+  # can see on GitHub; they may release their own locks, or any lock in a repo where they have
+  # maintain/admin. Access is re-checked with GitHub every 10 minutes; sessions last at most 8 hours.
+  # Add <publicUrl>/auth/github/callback as a callback URL on the App's settings page.
+  github:
+    enabled: false
+    adminUsers: []              # GitHub logins that are dashboard admins
+    adminTeams: []              # e.g. [acme/platform-admins]
+    allowedTeams: []            # if set, only these teams (and admins) may sign in
+  passwordLogin: true           # false: turn off username/password sign-in (users below are ignored)
   # Username/password users. Hash with: node packages/server/src/hash-password.ts
   users: []
   #  - { username: ada, password_hash: "scrypt$16384$8$1$...", role: admin, name: Ada Lovelace }

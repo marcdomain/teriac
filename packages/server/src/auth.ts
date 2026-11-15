@@ -1,5 +1,5 @@
-// Dashboard sign-in: username/password, OIDC (Okta, Azure AD, Google, Keycloak, ...)
-// and API tokens. Sessions are HMAC-signed, HttpOnly cookies.
+// Dashboard sign-in: username/password, OIDC (Okta, Azure AD, Google, Keycloak, ...),
+// GitHub (the App's own sign-in) and API tokens. Sessions are HMAC-signed, HttpOnly cookies.
 import { createHash, createHmac, createPublicKey, createVerify, randomBytes, scryptSync, timingSafeEqual } from 'node:crypto';
 
 export type Role = 'admin' | 'viewer';
@@ -8,7 +8,8 @@ export interface Session {
   sub: string;            // username or OIDC subject
   name: string;           // shown in the UI and the audit log
   role: Role;
-  via: 'password' | 'oidc' | 'token';
+  via: 'password' | 'oidc' | 'github' | 'token';
+  login?: string;         // GitHub sign-in: the GitHub login (repo access and permissions come from GitHub)
   exp: number;            // epoch seconds
   email?: string;         // single sign-on only
   groups?: string[];      // single sign-on groups (for emergency-access grantors)
@@ -32,13 +33,26 @@ export interface OidcConfig {
   allowedGroups: string[];// if set, only these groups may sign in
 }
 
+export interface GitHubLoginConfig {
+  clientId: string;       // the GitHub App's client ID and secret
+  clientSecret: string;
+  webUrl: string;         // https://github.com, or the GitHub Enterprise Server address
+  apiUrl: string;
+  host: string;
+  adminUsers: string[];   // TERIAC_GITHUB_ADMIN_USERS: these logins are dashboard admins
+  adminTeams: string[];   // TERIAC_GITHUB_ADMIN_TEAMS: members of these teams ("org/slug") are admins
+  allowedTeams: string[]; // TERIAC_GITHUB_ALLOWED_TEAMS: if set, only these teams (and admins) may sign in
+}
+
 export interface AuthConfig {
   apiToken?: string;
   sessionSecret: string;
   sessionHours: number;
   secureCookies: boolean;
   users: DashboardUser[];
+  passwordLogin?: boolean; // TERIAC_DASHBOARD_PASSWORD_LOGIN (default true): username/password sign-in
   oidc?: OidcConfig;
+  github?: GitHubLoginConfig;
 }
 
 const b64url = (b: Buffer | string) => Buffer.from(b).toString('base64url');
@@ -107,6 +121,7 @@ export const cookie = (name: string, value: string, cfg: AuthConfig, maxAgeSecon
 
 export const SESSION_COOKIE = 'teriac_session';
 export const OIDC_COOKIE = 'teriac_oidc';
+export const GITHUB_COOKIE = 'teriac_github';
 
 export const newSession = (cfg: AuthConfig, s: Omit<Session, 'exp'>): { session: Session; setCookie: string } => {
   const session = { ...s, exp: now() + cfg.sessionHours * 3600 };
@@ -238,5 +253,134 @@ export class Oidc {
     if (typeof c.exp !== 'number' || c.exp < t - 60) throw new Error('OIDC: id_token expired');
     if (c.nonce !== nonce) throw new Error('OIDC: id_token nonce mismatch');
     return c;
+  }
+}
+
+// ---- GitHub sign-in (the App's user authorization; code + PKCE) ---------------------------
+//
+// A GitHub App's user token can reach only repos that both the person and the App can, so
+// "the repos this person may see in teriac" is exactly what GitHub lists for that token
+// (then narrowed to the repos this server serves). Admins come from logins or teams.
+
+export interface GitHubUserToken { access: string; refresh?: string; expires: number }
+
+export interface GitHubSignIn {
+  session: Omit<Session, 'exp'>;
+  repos: string[];        // "host/owner/name"
+  token: GitHubUserToken;
+}
+
+export interface GitHubLoginDeps {
+  fetchImpl?: typeof fetch;
+  serves: (repoKey: string) => boolean;                                  // in the server's allowlist
+  inTeam: (repoKey: string, team: string, login: string) => Promise<boolean>; // via the App
+}
+
+export class GitHubLogin {
+  readonly cfg: GitHubLoginConfig;
+  private redirectUri: string;
+  private d: GitHubLoginDeps;
+  constructor(cfg: GitHubLoginConfig, publicUrl: string, d: GitHubLoginDeps) {
+    this.cfg = cfg;
+    this.redirectUri = `${publicUrl}/auth/github/callback`;
+    this.d = d;
+  }
+
+  private fetch(url: string, init?: RequestInit) {
+    return (this.d.fetchImpl ?? fetch)(url, { ...init, signal: AbortSignal.timeout(15_000) });
+  }
+
+  start(secret: string, auth: AuthConfig): { url: string; setCookie: string } {
+    const st: OidcState = { state: b64url(randomBytes(16)), nonce: '', verifier: b64url(randomBytes(32)), exp: now() + 600 };
+    const q = new URLSearchParams({
+      client_id: this.cfg.clientId, redirect_uri: this.redirectUri, state: st.state, allow_signup: 'false',
+      code_challenge: b64url(createHash('sha256').update(st.verifier).digest()), code_challenge_method: 'S256',
+    });
+    return { url: `${this.cfg.webUrl}/login/oauth/authorize?${q}`, setCookie: cookie(GITHUB_COOKIE, sign(st, secret), auth, 600) };
+  }
+
+  private async token(body: Record<string, string>): Promise<GitHubUserToken> {
+    const res = await this.fetch(`${this.cfg.webUrl}/login/oauth/access_token`, {
+      method: 'POST', headers: { Accept: 'application/json', 'Content-Type': 'application/json' },
+      body: JSON.stringify({ client_id: this.cfg.clientId, client_secret: this.cfg.clientSecret, ...body }),
+    });
+    const t = await res.json().catch(() => ({})) as { access_token?: string; refresh_token?: string; expires_in?: number; error?: string; error_description?: string };
+    if (!res.ok || !t.access_token) throw new Error(`GitHub sign-in failed: ${t.error_description ?? t.error ?? `HTTP ${res.status}`}`);
+    return { access: t.access_token, refresh: t.refresh_token, expires: Date.now() + (t.expires_in ?? 8 * 3600) * 1000 };
+  }
+
+  refresh(t: GitHubUserToken): Promise<GitHubUserToken> {
+    if (!t.refresh) throw new Error('no refresh token');
+    return this.token({ grant_type: 'refresh_token', refresh_token: t.refresh });
+  }
+
+  private async api<T>(token: string, path: string): Promise<{ data: T; next: string | null }> {
+    const res = await this.fetch(path.startsWith('http') ? path : `${this.cfg.apiUrl}${path}`, {
+      headers: { Authorization: `Bearer ${token}`, Accept: 'application/vnd.github+json', 'X-GitHub-Api-Version': '2022-11-28', 'User-Agent': 'teriac-server' },
+    });
+    if (res.status === 401) throw Object.assign(new Error('GitHub no longer accepts this sign-in'), { revoked: true });
+    if (!res.ok) throw new Error(`GitHub ${path}: HTTP ${res.status}`);
+    return { data: await res.json() as T, next: /<([^>]+)>;\s*rel="next"/.exec(res.headers.get('link') ?? '')?.[1] ?? null };
+  }
+
+  // The repos this person can see through the App, that this server serves.
+  async repos(token: string): Promise<string[]> {
+    const out = new Set<string>();
+    let next: string | null = '/user/installations?per_page=100';
+    const installations: number[] = [];
+    while (next) {
+      const page: { data: { installations: { id: number }[] }; next: string | null } = await this.api(token, next);
+      installations.push(...page.data.installations.map(i => i.id));
+      next = page.next;
+    }
+    for (const id of installations) {
+      let more: string | null = `/user/installations/${id}/repositories?per_page=100`;
+      while (more) {
+        const page: { data: { repositories: { full_name: string }[] }; next: string | null } = await this.api(token, more);
+        for (const r of page.data.repositories) {
+          const key = `${this.cfg.host}/${r.full_name}`;
+          if (this.d.serves(key)) out.add(key);
+        }
+        more = page.next;
+      }
+    }
+    return [...out].sort();
+  }
+
+  // Admin (by login or team), or viewer; null when not allowed to sign in at all.
+  async role(login: string, repos: string[]): Promise<Role | null> {
+    const lower = login.toLowerCase();
+    const teamOf = async (teams: string[]) => {
+      for (const team of teams) {
+        const org = team.split('/')[0].toLowerCase();
+        const repo = repos.find(r => r.split('/')[1]?.toLowerCase() === org);
+        if (repo && await this.d.inTeam(repo, team, login).catch(() => false)) return true;
+      }
+      return false;
+    };
+    if (this.cfg.adminUsers.some(u => u.toLowerCase() === lower) || await teamOf(this.cfg.adminTeams)) return 'admin';
+    if (!repos.length) return null;
+    if (this.cfg.allowedTeams.length && !(await teamOf(this.cfg.allowedTeams))) return null;
+    return 'viewer';
+  }
+
+  async finish(query: URLSearchParams, stateCookie: string | undefined, secret: string): Promise<GitHubSignIn> {
+    if (query.get('error')) throw new Error(`sign-in was refused: ${query.get('error_description') ?? query.get('error')}`);
+    const st = unsign<OidcState>(stateCookie, secret);
+    if (!st) throw new Error('sign-in expired; try again');
+    if (!query.get('state') || !safeEqual(query.get('state')!, st.state)) throw new Error('sign-in state did not match; try again');
+    const token = await this.token({ code: query.get('code') ?? '', redirect_uri: this.redirectUri, code_verifier: st.verifier });
+    const { data: user } = await this.api<{ login: string; name?: string | null; email?: string | null }>(token.access, '/user');
+    const repos = await this.repos(token.access);
+    const role = await this.role(user.login, repos);
+    if (!role) {
+      throw new Error(repos.length
+        ? 'your GitHub account is not in a team allowed to use teriac'
+        : 'your GitHub account can\'t see any repository this teriac serves');
+    }
+    return {
+      session: { sub: `github:${user.login.toLowerCase()}`, name: user.login, login: user.login, role, via: 'github', email: user.email ?? undefined },
+      repos, token,
+    };
   }
 }

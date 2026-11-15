@@ -317,6 +317,19 @@ export const loadAuth = (env: NodeJS.ProcessEnv, publicUrl: string, users: Dashb
       allowedGroups: list(env.TERIAC_OIDC_ALLOWED_GROUPS),
     };
   }
+  // Sign in with GitHub: the App's client ID and secret (the App's settings page).
+  let github: AuthConfig['github'];
+  const ghSecret = readSecret(env, 'TERIAC_GITHUB_CLIENT_SECRET');
+  if (env.TERIAC_GITHUB_CLIENT_ID && ghSecret && parseBool(env.TERIAC_DASHBOARD_GITHUB_LOGIN, 'TERIAC_DASHBOARD_GITHUB_LOGIN') !== false) {
+    const apiUrl = (env.TERIAC_GITHUB_API_URL || 'https://api.github.com').replace(/\/+$/, '');
+    const host = apiUrl === 'https://api.github.com' ? 'github.com' : new URL(apiUrl).host;
+    github = {
+      clientId: env.TERIAC_GITHUB_CLIENT_ID, clientSecret: ghSecret, apiUrl, host,
+      webUrl: host === 'github.com' ? 'https://github.com' : `${new URL(apiUrl).protocol}//${host}`,
+      adminUsers: list(env.TERIAC_GITHUB_ADMIN_USERS), adminTeams: list(env.TERIAC_GITHUB_ADMIN_TEAMS), allowedTeams: list(env.TERIAC_GITHUB_ALLOWED_TEAMS),
+    };
+  }
+  const passwordLogin = parseBool(env.TERIAC_DASHBOARD_PASSWORD_LOGIN, 'TERIAC_DASHBOARD_PASSWORD_LOGIN') ?? true;
   const sessionSecret = readSecret(env, 'TERIAC_SESSION_SECRET');
   if (sessionSecret && sessionSecret.length < 32) throw new Error('TERIAC_SESSION_SECRET must be at least 32 characters');
   return {
@@ -326,7 +339,9 @@ export const loadAuth = (env: NodeJS.ProcessEnv, publicUrl: string, users: Dashb
     sessionHours: Math.max(1, Number(env.TERIAC_SESSION_HOURS || 12)),
     secureCookies: publicUrl.startsWith('https://'),
     users,
+    passwordLogin,
     oidc,
+    github,
   };
 };
 

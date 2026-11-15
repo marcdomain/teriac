@@ -66,6 +66,7 @@ export interface Grant {
 }
 
 export interface RunQuery {
+  repos?: string[];           // only these repos (a dashboard user who signed in with GitHub)
   q?: string;                 // matches project, repo, user, PR author, PR number
   user?: string;              // ran it or opened the PR
   project?: string;
@@ -80,6 +81,7 @@ export interface RunQuery {
 }
 
 export interface AuditQuery {
+  repos?: string[];
   q?: string;
   user?: string;
   project?: string;
@@ -156,6 +158,9 @@ CREATE TABLE IF NOT EXISTS grants (
   actions TEXT NOT NULL, bypass TEXT NOT NULL, reason TEXT NOT NULL, granted_by TEXT NOT NULL,
   created_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT, revoked_by TEXT, used_at TEXT,
   expiry_noted INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS dashboard_access (
+  sub TEXT PRIMARY KEY, repos TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'viewer', at TEXT NOT NULL
 );
 CREATE TABLE IF NOT EXISTS closed_prs (
   repo TEXT NOT NULL, pr INTEGER NOT NULL, at TEXT NOT NULL, merged INTEGER NOT NULL DEFAULT 0,
@@ -269,6 +274,17 @@ export class Store {
         AND r.id = (SELECT MAX(id) FROM runs x WHERE x.repo = r.repo AND x.pr = r.pr AND x.kind = 'apply' AND x.status = 'success')
         AND NOT EXISTS (SELECT 1 FROM closed_prs c WHERE c.repo = r.repo AND c.pr = r.pr)
     `).all(before) as Record<string, any>[]).map(toRun);
+  }
+
+  // ---- dashboard users who sign in with GitHub: the repos they may see ----
+
+  // role 'none': GitHub no longer accepts their sign-in (or they lost access): signed out.
+  setAccess(sub: string, repos: string[], role: 'admin' | 'viewer' | 'none', at = new Date().toISOString()): void {
+    this.db.prepare('INSERT INTO dashboard_access (sub, repos, role, at) VALUES (?, ?, ?, ?) ON CONFLICT(sub) DO UPDATE SET repos = excluded.repos, role = excluded.role, at = excluded.at').run(sub, JSON.stringify(repos), role, at);
+  }
+  getAccess(sub: string): { repos: string[]; role: 'admin' | 'viewer' | 'none'; at: string } | null {
+    const r = this.db.prepare('SELECT repos, role, at FROM dashboard_access WHERE sub = ?').get(sub) as { repos: string; role: 'admin' | 'viewer' | 'none'; at: string } | undefined;
+    return r ? { repos: JSON.parse(r.repos), role: r.role, at: r.at } : null;
   }
 
   // ---- settings changed from the dashboard (JSON values) ----
@@ -400,9 +416,10 @@ export class Store {
     for (const f of findings) stmt.run(run.id, run.repo, run.pr, run.project, run.user, f.rule, f.severity, f.address, f.message, mode, now());
   }
 
-  searchFindings(q: { q?: string; project?: string; rule?: string; severity?: string; mode?: string; from?: string; to?: string; limit?: number; offset?: number }): { total: number; items: Record<string, unknown>[] } {
+  searchFindings(q: { q?: string; project?: string; rule?: string; severity?: string; mode?: string; from?: string; to?: string; limit?: number; offset?: number; repos?: string[] }): { total: number; items: Record<string, unknown>[] } {
     const where: string[] = [];
     const args: (string | number)[] = [];
+    if (q.repos) { where.push('repo IN (SELECT value FROM json_each(?))'); args.push(JSON.stringify(q.repos)); }
     if (q.q) {
       where.push(`(rule LIKE ? ESCAPE '\\' OR address LIKE ? ESCAPE '\\' OR message LIKE ? ESCAPE '\\' OR project LIKE ? ESCAPE '\\' OR user LIKE ? ESCAPE '\\')`);
       const p = like(q.q);
@@ -418,8 +435,8 @@ export class Store {
     return { total, items };
   }
 
-  findingRules(): string[] {
-    return this.db.prepare('SELECT DISTINCT rule AS v FROM policy_findings ORDER BY v').all().map((r: Record<string, any>) => String(r.v));
+  findingRules(repos?: string[]): string[] {
+    return this.db.prepare(`SELECT DISTINCT rule AS v FROM policy_findings${repos ? ' WHERE repo IN (SELECT value FROM json_each(?))' : ''} ORDER BY v`).all(...(repos ? [JSON.stringify(repos)] : [])).map((r: Record<string, any>) => String(r.v));
   }
 
   getRun(id: number): Run | null {
@@ -434,7 +451,8 @@ export class Store {
     ).all(repo, pr, kind).map(toRun);
   }
 
-  recentRuns(limit = 50): Run[] {
+  recentRuns(limit = 50, repos?: string[]): Run[] {
+    if (repos) return this.db.prepare('SELECT * FROM runs WHERE repo IN (SELECT value FROM json_each(?)) ORDER BY id DESC LIMIT ?').all(JSON.stringify(repos), limit).map(toRun);
     return this.db.prepare('SELECT * FROM runs ORDER BY id DESC LIMIT ?').all(limit).map(toRun);
   }
 
@@ -449,13 +467,15 @@ export class Store {
   }
 
   // Everything the Metrics page shows, for runs started at or after `from`.
-  stats(from: string, to = '9999-12-31T00:00:00.000Z') {
+  stats(from: string, to = '9999-12-31T00:00:00.000Z', repos?: string[]) {
+    const S = (alias = '') => (repos ? ` AND ${alias}repo IN (SELECT value FROM json_each(?))` : '');
+    const A: string[] = repos ? [JSON.stringify(repos)] : [];
     const all = <T>(sql: string, ...args: (string | number)[]) => this.db.prepare(sql).all(...args) as T[];
     const secs = `(julianday(finished_at) - julianday(started_at)) * 86400`;
     const daily = all<{ day: string; kind: string; status: string; n: number }>(
-      `SELECT substr(started_at, 1, 10) AS day, kind, status, count(*) AS n FROM runs WHERE started_at >= ? AND started_at < ? GROUP BY day, kind, status ORDER BY day`, from, to);
+      `SELECT substr(started_at, 1, 10) AS day, kind, status, count(*) AS n FROM runs WHERE started_at >= ? AND started_at < ?${S('')} GROUP BY day, kind, status ORDER BY day`, from, to, ...A);
     const durations = all<{ kind: string; s: number }>(
-      `SELECT kind, ${secs} AS s FROM runs WHERE started_at >= ? AND started_at < ? AND finished_at IS NOT NULL AND status != 'running' ORDER BY s`, from, to);
+      `SELECT kind, ${secs} AS s FROM runs WHERE started_at >= ? AND started_at < ?${S('')} AND finished_at IS NOT NULL AND status != 'running' ORDER BY s`, from, to, ...A);
     const pct = (xs: number[], p: number) => (xs.length ? xs[Math.min(xs.length - 1, Math.floor((xs.length - 1) * p))] : null);
     const timing = (kind: string) => {
       const xs = durations.filter(d => d.kind === kind).map(d => d.s);
@@ -463,24 +483,24 @@ export class Store {
     };
     const projects = all<{ project: string; repo: string; runs: number; applies: number; failed: number; destroys: number }>(
       `SELECT project, repo, count(*) AS runs, sum(kind = 'apply') AS applies, sum(status = 'failed') AS failed, sum(kind = 'plan' AND destroys > 0) AS destroys
-       FROM runs WHERE started_at >= ? AND started_at < ? GROUP BY repo, project ORDER BY runs DESC LIMIT 10`, from, to);
+       FROM runs WHERE started_at >= ? AND started_at < ?${S('')} GROUP BY repo, project ORDER BY runs DESC LIMIT 10`, from, to, ...A);
     const people = all<{ user: string; runs: number; plans: number; applies: number; failed: number }>(
       `SELECT user, count(*) AS runs, sum(kind = 'plan') AS plans, sum(kind = 'apply') AS applies, sum(status = 'failed') AS failed
-       FROM runs WHERE started_at >= ? AND started_at < ? GROUP BY user ORDER BY runs DESC LIMIT 10`, from, to);
+       FROM runs WHERE started_at >= ? AND started_at < ?${S('')} GROUP BY user ORDER BY runs DESC LIMIT 10`, from, to, ...A);
     const engines = all<{ engine: string; n: number }>(
-      `SELECT engine, count(*) AS n FROM runs WHERE started_at >= ? AND started_at < ? AND engine != '' GROUP BY engine ORDER BY n DESC LIMIT 8`, from, to);
+      `SELECT engine, count(*) AS n FROM runs WHERE started_at >= ? AND started_at < ?${S('')} AND engine != '' GROUP BY engine ORDER BY n DESC LIMIT 8`, from, to, ...A);
     // Resources changed by applies, saved when each apply finished.
     const one = <T>(sql: string, ...args: (string | number)[]) => this.db.prepare(sql).get(...args) as T;
     const sums = one<{ added: number | null; changed: number | null; destroyed: number | null }>(
       `SELECT sum(json_extract(applied, '$.added')) AS added, sum(json_extract(applied, '$.changed')) AS changed, sum(json_extract(applied, '$.destroyed')) AS destroyed
-       FROM runs WHERE kind = 'apply' AND applied IS NOT NULL AND started_at >= ? AND started_at < ?`, from, to);
+       FROM runs WHERE kind = 'apply' AND applied IS NOT NULL AND started_at >= ? AND started_at < ?${S('')}`, from, to, ...A);
     const resources = { added: sums.added ?? 0, changed: sums.changed ?? 0, destroyed: sums.destroyed ?? 0 };
     // Resource usage of runs: percentiles, and the heaviest runs.
-    const mem = all<{ v: number }>(`SELECT json_extract(usage, '$.peakMemory') AS v FROM runs WHERE usage IS NOT NULL AND json_extract(usage, '$.quick') IS NULL AND started_at >= ? AND started_at < ? ORDER BY v`, from, to).map(x => x.v);
-    const cpu = all<{ v: number }>(`SELECT json_extract(usage, '$.cpuSeconds') AS v FROM runs WHERE usage IS NOT NULL AND json_extract(usage, '$.quick') IS NULL AND started_at >= ? AND started_at < ? ORDER BY v`, from, to).map(x => x.v);
+    const mem = all<{ v: number }>(`SELECT json_extract(usage, '$.peakMemory') AS v FROM runs WHERE usage IS NOT NULL AND json_extract(usage, '$.quick') IS NULL AND started_at >= ? AND started_at < ?${S('')} ORDER BY v`, from, to, ...A).map(x => x.v);
+    const cpu = all<{ v: number }>(`SELECT json_extract(usage, '$.cpuSeconds') AS v FROM runs WHERE usage IS NOT NULL AND json_extract(usage, '$.quick') IS NULL AND started_at >= ? AND started_at < ?${S('')} ORDER BY v`, from, to, ...A).map(x => x.v);
     const heaviest = all<{ id: number; repo: string; pr: number; project: string; kind: string; status: string; user: string; started_at: string; secs: number | null; usage: string }>(
       `SELECT id, repo, pr, project, kind, status, user, started_at, ${secs} AS secs, usage FROM runs
-       WHERE usage IS NOT NULL AND json_extract(usage, '$.quick') IS NULL AND started_at >= ? AND started_at < ? ORDER BY json_extract(usage, '$.peakMemory') DESC LIMIT 10`, from, to)
+       WHERE usage IS NOT NULL AND json_extract(usage, '$.quick') IS NULL AND started_at >= ? AND started_at < ?${S('')} ORDER BY json_extract(usage, '$.peakMemory') DESC LIMIT 10`, from, to, ...A)
       .map(r => ({ id: r.id, repo: r.repo, pr: r.pr, project: r.project, kind: r.kind, status: r.status, user: r.user, startedAt: r.started_at, seconds: r.secs, usage: JSON.parse(r.usage) }));
     const usage = {
       runs: mem.length,
@@ -492,33 +512,35 @@ export class Store {
       `SELECT count(*) AS runs, sum(kind = 'plan') AS plans, sum(kind = 'apply') AS applies, sum(status = 'failed') AS failed,
         count(DISTINCT repo || '#' || pr) AS prs, count(DISTINCT user) AS users, count(DISTINCT repo || '/' || project) AS projects,
         count(DISTINCT repo) AS repos, sum(kind = 'plan' AND destroys > 0) AS destroying
-       FROM runs WHERE started_at >= ? AND started_at < ?`, from, to);
+       FROM runs WHERE started_at >= ? AND started_at < ?${S('')}`, from, to, ...A);
     return {
       from,
       totals: Object.fromEntries(Object.entries(totals).map(([k, v]) => [k, v ?? 0])),
       daily, timing: { plan: timing('plan'), apply: timing('apply') },
       projects, people, engines, resources, usage,
       policy: {
-        bySeverity: all<{ severity: string; n: number }>(`SELECT severity, count(*) AS n FROM policy_findings WHERE at >= ? AND at < ? GROUP BY severity`, from, to),
-        topRules: all<{ rule: string; n: number; enforced: number }>(`SELECT rule, count(*) AS n, sum(mode = 'enforce') AS enforced FROM policy_findings WHERE at >= ? AND at < ? GROUP BY rule ORDER BY n DESC LIMIT 8`, from, to),
+        bySeverity: all<{ severity: string; n: number }>(`SELECT severity, count(*) AS n FROM policy_findings WHERE at >= ? AND at < ?${S()} GROUP BY severity`, from, to, ...A),
+        topRules: all<{ rule: string; n: number; enforced: number }>(`SELECT rule, count(*) AS n, sum(mode = 'enforce') AS enforced FROM policy_findings WHERE at >= ? AND at < ?${S()} GROUP BY rule ORDER BY n DESC LIMIT 8`, from, to, ...A),
       },
       decisions: {
-        total: one<{ n: number }>(`SELECT count(*) AS n FROM audit WHERE at >= ? AND at < ?`, from, to).n,
-        denied: all<{ action: string; n: number }>(`SELECT action, count(*) AS n FROM audit WHERE at >= ? AND at < ? AND allowed = 0 GROUP BY action ORDER BY n DESC LIMIT 8`, from, to),
+        total: one<{ n: number }>(`SELECT count(*) AS n FROM audit WHERE at >= ? AND at < ?${S()}`, from, to, ...A).n,
+        denied: all<{ action: string; n: number }>(`SELECT action, count(*) AS n FROM audit WHERE at >= ? AND at < ?${S()} AND allowed = 0 GROUP BY action ORDER BY n DESC LIMIT 8`, from, to, ...A),
       },
-      drift: all<{ status: string; n: number }>(`SELECT status, count(*) AS n FROM drift_runs WHERE at >= ? AND at < ? GROUP BY status`, from, to),
-      locks: one<{ n: number; oldest: string | null }>(`SELECT count(*) AS n, min(created_at) AS oldest FROM locks`),
-      delivery: this.delivery(from, to),
+      drift: all<{ status: string; n: number }>(`SELECT status, count(*) AS n FROM drift_runs WHERE at >= ? AND at < ?${S()} GROUP BY status`, from, to, ...A),
+      locks: one<{ n: number; oldest: string | null }>(`SELECT count(*) AS n, min(created_at) AS oldest FROM locks${repos ? ' WHERE repo IN (SELECT value FROM json_each(?))' : ''}`, ...A),
+      delivery: this.delivery(from, to, repos),
     };
   }
 
   // Projects whose runs take longest on average (finished runs only).
-  slowestProjects(from: string, to = '9999-12-31T00:00:00.000Z', limit = 5): { repo: string; project: string; runs: number; avgSeconds: number }[] {
+  slowestProjects(from: string, to = '9999-12-31T00:00:00.000Z', limit = 5, repos?: string[]): { repo: string; project: string; runs: number; avgSeconds: number }[] {
+    const S = (alias = '') => (repos ? ` AND ${alias}repo IN (SELECT value FROM json_each(?))` : '');
+    const A: string[] = repos ? [JSON.stringify(repos)] : [];
     return (this.db.prepare(
       `SELECT repo, project, count(*) AS runs, avg((julianday(finished_at) - julianday(started_at)) * 86400) AS avg
-       FROM runs WHERE finished_at IS NOT NULL AND status != 'running' AND started_at >= ? AND started_at < ?
+       FROM runs WHERE finished_at IS NOT NULL AND status != 'running' AND started_at >= ? AND started_at < ?${S('')}
        GROUP BY repo, project HAVING runs >= 2 ORDER BY avg DESC LIMIT ?`,
-    ).all(from, to, limit) as { repo: string; project: string; runs: number; avg: number }[])
+    ).all(from, to, ...A, limit) as { repo: string; project: string; runs: number; avg: number }[])
       .map(r => ({ repo: r.repo, project: r.project, runs: r.runs, avgSeconds: Math.round(r.avg) }));
   }
 
@@ -526,7 +548,9 @@ export class Store {
   //   leadTime: first run of a PR → its project's first successful apply (hours)
   //   failureRate: share of applies that failed
   //   recovery: a failed apply → the next successful apply of that project (hours)
-  delivery(from: string, to = '9999-12-31T00:00:00.000Z') {
+  delivery(from: string, to = '9999-12-31T00:00:00.000Z', repos?: string[]) {
+    const S = (alias = '') => (repos ? ` AND ${alias}repo IN (SELECT value FROM json_each(?))` : '');
+    const A: string[] = repos ? [JSON.stringify(repos)] : [];
     const all = <T>(sql: string, ...args: (string | number)[]) => this.db.prepare(sql).all(...args) as T[];
     const hours = (a: string, b: string) => (Date.parse(b) - Date.parse(a)) / 3_600_000;
     const pct = (xs: number[], p: number) => {
@@ -535,16 +559,16 @@ export class Store {
     };
     const lead = all<{ first: string; applied: string }>(
       `SELECT (SELECT min(r2.started_at) FROM runs r2 WHERE r2.repo = a.repo AND r2.pr = a.pr) AS first, min(a.finished_at) AS applied
-       FROM runs a WHERE a.kind = 'apply' AND a.status = 'success' AND a.finished_at IS NOT NULL AND a.started_at >= ? AND a.started_at < ?
-       GROUP BY a.repo, a.pr, a.project`, from, to).map(r => hours(r.first, r.applied)).filter(h => h >= 0);
+       FROM runs a WHERE a.kind = 'apply' AND a.status = 'success' AND a.finished_at IS NOT NULL AND a.started_at >= ? AND a.started_at < ?${S('a.')}
+       GROUP BY a.repo, a.pr, a.project`, from, to, ...A).map(r => hours(r.first, r.applied)).filter(h => h >= 0);
     const applies = all<{ status: string; n: number }>(
-      `SELECT status, count(*) AS n FROM runs WHERE kind = 'apply' AND status IN ('success', 'failed') AND started_at >= ? AND started_at < ? GROUP BY status`, from, to);
+      `SELECT status, count(*) AS n FROM runs WHERE kind = 'apply' AND status IN ('success', 'failed') AND started_at >= ? AND started_at < ?${S('')} GROUP BY status`, from, to, ...A);
     const ok = applies.find(a => a.status === 'success')?.n ?? 0;
     const failed = applies.find(a => a.status === 'failed')?.n ?? 0;
     const recovery = all<{ failedAt: string; fixedAt: string | null }>(
       `SELECT f.finished_at AS failedAt,
         (SELECT min(s.finished_at) FROM runs s WHERE s.repo = f.repo AND s.project = f.project AND s.kind = 'apply' AND s.status = 'success' AND s.finished_at > f.finished_at) AS fixedAt
-       FROM runs f WHERE f.kind = 'apply' AND f.status = 'failed' AND f.finished_at IS NOT NULL AND f.started_at >= ? AND f.started_at < ?`, from, to)
+       FROM runs f WHERE f.kind = 'apply' AND f.status = 'failed' AND f.finished_at IS NOT NULL AND f.started_at >= ? AND f.started_at < ?${S('f.')}`, from, to, ...A)
       .filter(r => r.fixedAt).map(r => hours(r.failedAt, r.fixedAt!)).filter(h => h >= 0);
     const days = Math.max(1, (Math.min(Date.parse(to), Date.now()) - Date.parse(from)) / 86_400_000);
     return {
@@ -574,6 +598,7 @@ export class Store {
     if (q.user) { where.push('(user = ? OR pr_author = ?)'); args.push(q.user, q.user); }
     if (q.project) { where.push('project = ?'); args.push(q.project); }
     if (q.repo) { where.push('repo = ?'); args.push(q.repo); }
+    if (q.repos) { where.push('repo IN (SELECT value FROM json_each(?))'); args.push(JSON.stringify(q.repos)); }
     if (q.kind) { where.push('kind = ?'); args.push(q.kind); }
     switch (q.status) {
       case 'failed': where.push(`status = 'failed'`); break;
@@ -598,18 +623,21 @@ export class Store {
   }
 
   // Values for the dashboard's filter dropdowns.
-  facets(): { users: string[]; projects: string[]; repos: string[]; actions: string[] } {
-    const col = (sql: string) => this.db.prepare(sql).all().map((r: Record<string, any>) => String(r.v)).filter(Boolean);
+  facets(repos?: string[]): { users: string[]; projects: string[]; repos: string[]; actions: string[] } {
+    const W = repos ? ' WHERE repo IN (SELECT value FROM json_each(?))' : '';
+    const A = repos ? [JSON.stringify(repos)] : [];
+    const col = (sql: string, n = 1) => this.db.prepare(sql).all(...Array.from({ length: n }).flatMap(() => A)).map((r: Record<string, any>) => String(r.v)).filter(Boolean);
     return {
-      users: col(`SELECT DISTINCT v FROM (SELECT user AS v FROM runs UNION SELECT pr_author FROM runs UNION SELECT user FROM audit) ORDER BY lower(v)`),
-      projects: col('SELECT DISTINCT project AS v FROM runs ORDER BY v'),
-      repos: col('SELECT DISTINCT repo AS v FROM runs ORDER BY v'),
-      actions: col('SELECT DISTINCT action AS v FROM audit ORDER BY v'),
+      users: col(`SELECT DISTINCT v FROM (SELECT user AS v FROM runs${W} UNION SELECT pr_author FROM runs${W} UNION SELECT user FROM audit${W}) ORDER BY lower(v)`, 3),
+      projects: col(`SELECT DISTINCT project AS v FROM runs${W} ORDER BY v`),
+      repos: col(`SELECT DISTINCT repo AS v FROM runs${W} ORDER BY v`),
+      actions: col(`SELECT DISTINCT action AS v FROM audit${W} ORDER BY v`),
     };
   }
 
   // One row per project: latest run, latest successful apply, lock.
-  projectSummaries(): ProjectSummary[] {
+  projectSummaries(repos?: string[]): ProjectSummary[] {
+    if (repos) { const allowed = new Set(repos); return this.projectSummaries().filter(p => allowed.has(p.repo)); }
     const latest = this.db.prepare(`SELECT * FROM runs WHERE id IN (SELECT MAX(id) FROM runs GROUP BY repo, project, workspace) ORDER BY repo, project`).all().map(toRun);
     const counts = new Map(this.db.prepare('SELECT repo, project, workspace, COUNT(*) AS n FROM runs GROUP BY repo, project, workspace').all()
       .map((r: Record<string, any>) => [`${r.repo}|${r.project}|${r.workspace}`, Number(r.n)]));
@@ -668,8 +696,11 @@ export class Store {
     for (const id of ids) stmt.run(result, id);
   }
 
-  recentDrift(limit = 100): Record<string, unknown>[] {
-    return this.db.prepare('SELECT * FROM drift_runs ORDER BY id DESC LIMIT ?').all(limit).map((r: Record<string, any>) => ({
+  recentDrift(limit = 100, repos?: string[]): Record<string, unknown>[] {
+    const rows = repos
+      ? this.db.prepare('SELECT * FROM drift_runs WHERE repo IN (SELECT value FROM json_each(?)) ORDER BY id DESC LIMIT ?').all(JSON.stringify(repos), limit)
+      : this.db.prepare('SELECT * FROM drift_runs ORDER BY id DESC LIMIT ?').all(limit);
+    return rows.map((r: Record<string, any>) => ({
       ...r, finding: JSON.parse(r.finding), notified: r.notified ? JSON.parse(r.notified) : null,
     }));
   }
@@ -691,6 +722,7 @@ export class Store {
     }
     if (q.user) { where.push('user = ?'); args.push(q.user); }
     if (q.project) { where.push('project = ?'); args.push(q.project); }
+    if (q.repos) { where.push('repo IN (SELECT value FROM json_each(?))'); args.push(JSON.stringify(q.repos)); }
     if (q.action) { where.push('action = ?'); args.push(q.action); }
     if (q.allowed !== undefined) { where.push('allowed = ?'); args.push(q.allowed ? 1 : 0); }
     if (q.from) { where.push('at >= ?'); args.push(q.from); }
@@ -703,8 +735,11 @@ export class Store {
     return { total, items };
   }
 
-  auditLog(limit = 100): AuditEntry[] {
-    return this.db.prepare('SELECT * FROM audit ORDER BY id DESC LIMIT ?').all(limit).map((r: Record<string, any>) => ({
+  auditLog(limit = 100, repos?: string[]): AuditEntry[] {
+    const rows = repos
+      ? this.db.prepare('SELECT * FROM audit WHERE repo IN (SELECT value FROM json_each(?)) ORDER BY id DESC LIMIT ?').all(JSON.stringify(repos), limit)
+      : this.db.prepare('SELECT * FROM audit ORDER BY id DESC LIMIT ?').all(limit);
+    return rows.map((r: Record<string, any>) => ({
       at: r.at, repo: r.repo, pr: r.pr, user: r.user, action: r.action, project: r.project, allowed: !!r.allowed, reason: r.reason,
     }));
   }

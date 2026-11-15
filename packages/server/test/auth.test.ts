@@ -116,7 +116,7 @@ const cookieOf = (res: Response) => res.headers.getSetCookie().map(c => c.split(
 
 describe('dashboard HTTP auth', () => {
   test('sign-in options reflect the server config', async () => {
-    assert.deepEqual(await (await fetch(`${base}/auth/config`)).json(), { password: true, oidc: { name: 'Okta' }, token: true });
+    assert.deepEqual(await (await fetch(`${base}/auth/config`)).json(), { password: true, oidc: { name: 'Okta' }, github: false, token: true });
   });
 
   test('API needs a session or token', async () => {
@@ -134,7 +134,7 @@ describe('dashboard HTTP auth', () => {
     const raw = res.headers.getSetCookie()[0];
     assert.match(raw, /^teriac_session=.+; Path=\/; HttpOnly; SameSite=Lax; Max-Age=3600$/);
     const me = await (await fetch(`${base}/api/me`, { headers: { Cookie: cookieOf(res) } })).json();
-    assert.deepEqual(me, { name: 'Ada Admin', role: 'admin', via: 'password', platforms: [], version: VERSION });
+    assert.deepEqual(me, { name: 'Ada Admin', role: 'admin', via: 'password', login: null, repos: null, platforms: [], version: VERSION });
   });
 
   test('viewers read; only admins act; cookie writes need the CSRF header', async () => {
@@ -180,7 +180,7 @@ describe('dashboard HTTP auth', () => {
     assert.equal(res.headers.get('location'), '/#overview');
     const session = res.headers.getSetCookie().find(c => c.startsWith('teriac_session='))!.split(';')[0];
     const me = await (await fetch(`${base}/api/me`, { headers: { Cookie: session } })).json();
-    assert.deepEqual(me, { name: 'Alice Okafor', role: 'admin', via: 'oidc', platforms: [], version: VERSION });
+    assert.deepEqual(me, { name: 'Alice Okafor', role: 'admin', via: 'oidc', login: null, repos: null, platforms: [], version: VERSION });
   });
 
   test('Okta sign-in: allowed group becomes viewer; others are refused', async () => {
