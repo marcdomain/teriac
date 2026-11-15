@@ -52,6 +52,7 @@ config:
   logLevel: info
   verifySignatures: true        # check vendor signatures on downloaded Terraform/OpenTofu/Terragrunt; false for mirrors without .sig files
   moduleAuth: true              # Terraform's git::https:// module downloads sign in with a read-only App token (private modules work); false to turn off
+  logRetentionDays: ""          # clear run logs this many days after a PR's last apply (summaries and PR comments stay); per repo: log_retention_days
 
 # Contents of repos.yaml: rules, approvers, channels, people, drift schedules, and the
 # safety settings (risk, freezes, protected resources, secret scan, emergency access,
@@ -93,6 +94,16 @@ repos: {}
 #      keep_approval_on_rebase: true      # default false: a rebase that doesn't change the PR's code keeps approvals
 #      stale_base: warn                   # off | warn (default) | block: base branch changed this project's files
 #      verify_plan: true                  # default true: apply only the exact plan file that was reviewed
+#      # After apply, merge and close
+#      allow_fork_prs: false              # default false: PRs from forks are refused
+#      checkout: merge                    # plan the PR merged into its base branch (default: branch, the PR's own commit)
+#      unlock_after_apply: false          # default false: an applied project stays locked until the PR merges or closes
+#      automerge: { method: squash, delete_branch: true }   # merge the PR once everything planned is applied
+#      notify_applies: [infra-alerts]     # every apply in this repo, done or failed
+#      log_retention_days: 30             # clear run logs 30 days after a PR's last apply
+#      remind_unmerged: { after_hours: 24, notify: [infra-alerts] }   # applied but not merged after 24 h
+#      hooks:                             # commands around plans and applies (server config only)
+#        post_plan: [{ name: scan, run: "checkov -f \"$PLAN_JSON\"" }]
 #      # The safety settings below can also go here, for this repo only. Lists (freezes, protected,
 #      # policies.rules, risk.stateful_types) add to the server-wide ones; secret_scan, policies.mode
 #      # and risk.size_limits can only get stricter; anything else set here wins for this repo.
