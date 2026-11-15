@@ -51,6 +51,7 @@ export interface RepoPolicy {
   allow_extra_args?: boolean;                 // `teriac plan -- -var=x` (default false)
   allow_fork_prs?: boolean;                   // plan and apply PRs from forks (default false: their code would run with this server's credentials)
   notify_applies?: string[];                  // channels told about every apply in this repo (done or failed)
+  unlock_after_apply?: boolean;               // free a project's lock once applied (default: held until merge/close/unlock)
   checkout?: 'branch' | 'merge';              // plan the PR's own commit (default) or its merge into the base branch
   automerge?: boolean | { method?: 'merge' | 'squash' | 'rebase'; delete_branch?: boolean }; // merge the PR once everything planned is applied
   log_retention_days?: number;                // clear this repo's run logs this many days after a PR's last apply
@@ -321,6 +322,7 @@ export const parseReposYaml = (text: string): RepoPolicy[] => {
     validateBool(repo.keep_approval_on_rebase, `${at}.keep_approval_on_rebase`);
     validateBool(repo.verify_plan, `${at}.verify_plan`);
     validateBool(repo.allow_fork_prs, `${at}.allow_fork_prs`);
+    validateBool(repo.unlock_after_apply, `${at}.unlock_after_apply`);
     if (repo.checkout !== undefined && !['branch', 'merge'].includes(repo.checkout)) throw new Error(`${at}.checkout must be branch or merge`);
     if (repo.hooks !== undefined) {
       if (typeof repo.hooks !== 'object' || repo.hooks === null) throw new Error(`${at}.hooks must be { pre_plan, post_plan, pre_apply, post_apply }`);

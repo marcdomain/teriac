@@ -6,7 +6,7 @@ import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync, copyFileSync, readFileSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
-import { join } from 'node:path';
+import { join, dirname } from 'node:path';
 import { App } from '../src/app.ts';
 import { Store } from '../src/store.ts';
 import { parseReposYaml, type ServerConfig } from '../src/config.ts';
@@ -56,6 +56,7 @@ if (cmd === 'show') {
   process.stdout.write(fs.readFileSync(path.join(F, plan === 'security' ? 'plan-security.json' : 'plan-changes.json')));
   process.exit(0);
 }
+if (cmd === 'apply' && fs.existsSync(path.join(path.dirname(process.argv[1]), 'apply-fail'))) { console.error('Error: creating bucket: AccessDenied'); process.exit(1); }
 if (cmd === 'apply') { console.log('Apply complete! Resources: 3 added, 1 changed, 2 destroyed.'); process.exit(0); }
 if (cmd === 'state' && rest[0] === 'list') { console.log('terraform_data.app'); process.exit(0); }
 if (cmd !== 'plan') process.exit(1);
@@ -848,5 +849,74 @@ describe('hooks (server config only)', () => {
     const { parseServerPolicy } = await import('../src/config.ts');
     assert.throws(() => parseServerPolicy('repos:\n  - id: github.com/a/b\n    hooks: { pre_deploy: [] }\n'), /unknown stage "pre_deploy"/);
     assert.throws(() => parseServerPolicy('repos:\n  - id: github.com/a/b\n    hooks: { pre_plan: [{ name: x }] }\n'), /needs a name and a run command/);
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('the end of a project in a PR: apply, unlock, merge, close', () => {
+  const REPO = 'github.com/acme/infra';
+  const approve = (gh: any) => gh.reviewsByPr.set(1, [{ user: 'carol', state: 'approved', commitSha: head }, { user: 'alice', state: 'approved', commitSha: head }]);
+  const lockOf = (store: any, project: string) => store.getLock(REPO, project, 'default');
+  const planFile = (store: any, project: string) => store.latestRuns(REPO, 1, 'plan').find((r: any) => r.project === project)?.planPath as string | null;
+  const other = async (app: any, gh: any) => {
+    gh.prs.set(2, pr(2, 'carol'));
+    gh.files.set(2, ['envs/dev/main.tf']);
+    await app.handle(gh, { kind: 'pr_opened', repo, pr: pr(2, 'carol') });
+    return gh.sticky.get(2) as string;
+  };
+
+  test('default: an applied project stays locked to its PR (so no other PR undoes it) and says so', async () => {
+    const { app, gh, say, open, store } = setup();
+    await open();
+    approve(gh);
+    await say('alice', 'teriac apply -p envs/dev');
+    assert.equal(lockOf(store, 'envs/dev')?.pr, 1);
+    assert.equal(planFile(store, 'envs/dev'), null, 'the applied plan file is freed');
+    assert.match(gh.comments.map((c: any) => c.body).join('\n'), /🔒 `envs\/dev` stays locked to this PR until it's merged or closed\. To free it sooner, comment `teriac unlock -p envs\/dev`\./);
+    assert.match(await other(app, gh), /locked by #1 \(bob\)/);
+    // Merging frees it, and the other PR can plan.
+    await app.handle(gh, { kind: 'pr_closed', repo, pr: pr(1, 'bob'), merged: true });
+    assert.equal(lockOf(store, 'envs/dev'), null);
+  });
+
+  test('unlock_after_apply: only applied projects are freed; a failed apply keeps its lock', async () => {
+    const { app, gh, say, open, store } = setup('    unlock_after_apply: true\n');
+    await open();
+    approve(gh);
+    await say('alice', 'teriac apply -p envs/dev');
+    assert.equal(lockOf(store, 'envs/dev'), null, 'applied: free');
+    assert.equal(lockOf(store, 'envs/prod')?.pr, 1, 'planned, not applied: still held');
+    assert.doesNotMatch(gh.comments.map((c: any) => c.body).join('\n'), /stays locked/);
+    assert.doesNotMatch(await other(app, gh), /locked by #1/);
+
+    const failing = setup('    unlock_after_apply: true\n');
+    await failing.open();
+    approve(failing.gh);
+    const flag = join(dirname(fakeTf), 'apply-fail');
+    writeFileSync(flag, '');
+    try { await failing.say('alice', 'teriac apply -p envs/dev'); } finally { rmSync(flag, { force: true }); }
+    assert.equal(failing.store.latestRuns(REPO, 1, 'apply')[0]?.status, 'failed');
+    assert.equal(lockOf(failing.store, 'envs/dev')?.pr, 1, 'failed apply: still held');
+  });
+
+  test('unlock -p discards the project\'s plan even when its lock is already free', async () => {
+    const { gh, say, open, store } = setup();
+    await open();
+    const path = planFile(store, 'envs/dev')!;
+    assert.ok(path && existsSync(path));
+    store.releaseLock(REPO, 'envs/dev', 'default'); // e.g. freed from the dashboard earlier
+    await say('bob', 'teriac unlock -p envs/dev');
+    assert.equal(existsSync(path), false);
+    assert.match(gh.lastReply(), /discarded the saved plans of `envs\/dev`/);
+    assert.ok(planFile(store, 'envs/prod'), 'other projects keep theirs');
+  });
+
+  test('closing without merging frees every lock and deletes the plans', async () => {
+    const { app, gh, open, store } = setup();
+    await open();
+    const paths = ['envs/dev', 'envs/prod'].map(p => planFile(store, p)!);
+    await app.handle(gh, { kind: 'pr_closed', repo, pr: pr(1, 'bob'), merged: false });
+    assert.equal(store.locksForPr(REPO, 1).length, 0);
+    for (const p of paths) assert.equal(existsSync(p), false);
   });
 });

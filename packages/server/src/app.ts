@@ -1316,6 +1316,10 @@ export class App {
       if (replanned.length) await this.refreshComment(ctx, new Map(), new Set(replanned), reply);
     }
     for (const n of staleNotes) reply.say(n);
+    const stillLocked = applied.filter(r => r.status === 'success' && this.deps.store.getLock(ctx.repoKey, r.project, r.workspace)?.pr === ctx.pr.number).map(r => r.project);
+    if (stillLocked.length && !ctx.policy.automerge) {
+      reply.say(`🔒 ${stillLocked.map(p => `\`${p}\``).join(', ')} ${stillLocked.length === 1 ? 'stays' : 'stay'} locked to this PR until it's merged or closed. To free ${stillLocked.length === 1 ? 'it' : 'them'} sooner, comment \`${this.deps.config.commandNames[0]} unlock${stillLocked.length === 1 ? ` -p ${stillLocked[0]}` : ''}\`.`);
+    }
     if (denied.length) reply.say(`**Not applied:**\n${denied.join('\n')}`);
     for (const [project, note] of notes) reply.say(`- \`${project}\`: ${note}`);
 
@@ -1395,9 +1399,11 @@ export class App {
       // Its run and output stay; the apply's live output stays for anyone still watching.
       if (r.ok) {
         this.forgetPlans(ctx.repoKey, ctx.pr.number, project.name, { keepLive: true });
-        // Applied: the project is free for other PRs again (a failed apply keeps the lock).
+        // unlock_after_apply: free the project for other PRs now. By default the lock stays
+        // until the PR is merged or closed, so another PR can't undo an unmerged apply.
+        // A failed apply always keeps it.
         const lock = store.getLock(ctx.repoKey, project.name, project.workspace);
-        if (lock?.pr === ctx.pr.number) store.releaseLock(ctx.repoKey, project.name, project.workspace);
+        if (ctx.policy.unlock_after_apply && lock?.pr === ctx.pr.number) store.releaseLock(ctx.repoKey, project.name, project.workspace);
       }
     } catch (err) {
       store.finishRun(runId, { status: 'failed', engine, output: `teriac could not apply this project: ${(err as Error).message}` });
@@ -1425,9 +1431,15 @@ export class App {
       this.forgetPlans(ctx.repoKey, ctx.pr.number, l.project);
       released.push(l.project);
     }
-    if (!cmd.project) this.forgetPlans(ctx.repoKey, ctx.pr.number);
+    // Unlock always ends the project here: its saved plans and live output go, lock or not.
+    let discarded = false;
+    if (!locks.length && (isAuthor || (cmd.project && (await this.allowed(ctx, 'plan', user, ctx.projects.find(p => p.name === cmd.project) ?? { name: cmd.project, dir: cmd.project } as Project)).allowed))) {
+      discarded = this.deps.store.latestRuns(ctx.repoKey, ctx.pr.number, 'plan').some(r => (!cmd.project || r.project === cmd.project) && r.planPath);
+      this.forgetPlans(ctx.repoKey, ctx.pr.number, cmd.project);
+    } else if (!cmd.project && released.length) this.forgetPlans(ctx.repoKey, ctx.pr.number);
     reply.say(released.length
       ? `🔓 Unlocked ${released.map(p => `\`${p}\``).join(', ')} and discarded the plans. Run \`teriac plan\` to plan again.`
+      : discarded ? `🗑️ No locks to release; discarded the saved plans${cmd.project ? ` of \`${cmd.project}\`` : ''}.`
       : 'This PR holds no locks you can release.');
   }
 
