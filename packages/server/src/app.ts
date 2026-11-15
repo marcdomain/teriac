@@ -461,6 +461,28 @@ export class App {
     return rulesFor(project, ctx.policy, ctx.rulesConfig);
   }
 
+  // Releasing another PR's lock from the dashboard: the `unlock` permission (default
+  // maintain), from repos.yaml and the teriac.yaml on that PR's base branch, as a PR uses.
+  async mayUnlock(adapter: VcsAdapter, lock: { repo: string; project: string; workspace: string; pr: number }, user: string): Promise<{ allowed: boolean; reason: string }> {
+    const [host, owner, ...rest] = lock.repo.split('/');
+    const name = rest.join('/');
+    const repo: Repo = { platform: adapter.platform, host, owner, name, fullName: `${owner}/${name}`, cloneUrl: '' };
+    const policy = repoPolicyFor(this.deps.config.repos, repo);
+    if (!policy) return { allowed: false, reason: 'this repo is not served here' };
+    const pr = await adapter.getPullRequest(repo, lock.pr).catch(() => null);
+    const base = pr?.baseRef ?? repo.defaultBranch ?? 'main';
+    const repoConfig = policy.allow_repo_config === false ? emptyRepoConfig()
+      : await loadRepoConfigFrom(f => adapter.fileAt(repo, f, base)).catch(() => emptyRepoConfig());
+    const dir = this.deps.store.latestRuns(lock.repo, lock.pr, 'plan').find(r => r.project === lock.project)?.dir || lock.project;
+    const project = { name: lock.project, dir, workspace: lock.workspace } as Project;
+    const lookup: Lookup = {
+      permission: u => adapter.userPermission(repo, u),
+      inTeam: (t, u) => adapter.inTeam(repo, t, u),
+      codeowners: () => adapter.codeowners(repo, base),
+    };
+    return checkPermission('unlock', user, project, rulesFor(project, policy, repoConfig), lookup);
+  }
+
   private async allowed(ctx: PrContext, action: Action, user: string, project: Project) {
     let decision = await checkPermission(action, user, project, this.rules(ctx, project), ctx.lookup);
     // Emergency access: a time-limited grant from the dashboard covers this action.

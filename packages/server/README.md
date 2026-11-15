@@ -165,7 +165,7 @@ Defaults when no rule applies:
 | `plan` | plans, `validate`, `providers`, `fmt`, `state list` | write | |
 | `apply` | applies | write | |
 | `apply_destroy` | applies that delete or replace | maintain | |
-| `unlock` | releasing another PR's lock | maintain | |
+| `unlock` | releasing another PR's lock from the dashboard (`teriac unlock` in a PR only releases that PR's own locks: its author or anyone who may plan) | maintain | |
 | `state_read` | `state show`, `show`, `output` | write | `plan` |
 | `state_write` | `import`, `taint`, `untaint` | write | `apply` |
 | `state_remove` | `state rm`, `state mv`, `force-unlock` | maintain | `apply_destroy` |
@@ -695,8 +695,8 @@ admins can also unlock, pause applies, start drift checks and start a backup.
 | API token | `TERIAC_API_TOKEN` (admin) |
 
 **Signed in with GitHub**, people see only the repos that both they and the App can see on
-GitHub (runs, live output, locks, audit, metrics, drift). They can release their own locks, and any
-lock in a repo where they have maintain or admin; other actions are for admins. teriac checks with
+GitHub (runs, live output, locks, audit, metrics, drift). They can release their own locks, and others
+where the project's `unlock` permission allows them (default maintain); other actions are for admins. teriac checks with
 GitHub again every 10 minutes, so lost access or leaving an admin team takes effect within that time;
 these sessions last at most 8 hours.
 

@@ -1001,3 +1001,22 @@ describe('depends_on in teriac.yaml (plain Terraform)', () => {
     assert.match(s.gh.comments.map(c => c.body).join('\n'), /`envs\/prod`: skipped: `envs\/dev` failed to apply first/);
   });
 });
+
+describe('the unlock permission (releasing another PR\'s lock from the dashboard)', () => {
+  test('default maintain; a project can name who may unlock it', async () => {
+    const { app, gh } = setup('', { repos: parseReposYaml(`repos:
+  - id: github.com/acme/*
+    projects:
+      - match: envs/prod
+        permissions: { unlock: [team:sre] }
+`) });
+    gh.prs.set(5, pr(5, 'bob'));
+    const lock = (project: string) => ({ repo: 'github.com/acme/infra', project, workspace: 'default', pr: 5 });
+    assert.equal((await app.mayUnlock(gh, lock('envs/dev'), 'erin')).allowed, true, 'maintain: the default');
+    assert.equal((await app.mayUnlock(gh, lock('envs/dev'), 'bob')).allowed, false, 'write is not enough');
+    assert.equal((await app.mayUnlock(gh, lock('envs/prod'), 'erin')).allowed, true, 'in team:sre');
+    const alice = await app.mayUnlock(gh, lock('envs/prod'), 'alice');
+    assert.equal(alice.allowed, false, 'a repo admin outside team:sre');
+    assert.match(alice.reason, /team:sre/);
+  });
+});
