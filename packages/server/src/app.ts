@@ -301,6 +301,7 @@ export class App {
 
   // Runs going and waiting right now, for the Metrics page.
   get runQueue() { return this.sched.stats; }
+  get commandName() { return this.deps.config.commandNames[0]; }
 
   // Wraps an adapter so every comment teriac writes is remembered exactly as written.
   private recording(adapter: VcsAdapter): VcsAdapter {
@@ -376,6 +377,14 @@ export class App {
         return this.respond(reply, () => this.cancel(adapter, event.repo, number, event.author, reply));
       }
     }
+    if (event.kind === 'api_command') {
+      const c = parseCommand(event.text, this.deps.config.commandNames);
+      if (c?.ok && c.command.verb === 'cancel') {
+        const reply = new Reply(adapter, event.repo, number, null);
+        reply.say(`_From the teriac API, by ${event.user} (${event.via})._`);
+        return this.respond(reply, () => this.cancel(adapter, event.repo, number, event.user, reply));
+      }
+    }
     if (event.kind === 'pr_opened' || event.kind === 'pr_updated') this.latestHead.set(key, event.pr.headSha);
     if (event.kind === 'pr_closed') this.latestHead.delete(key);
     return this.queue.run(key, async () => {
@@ -387,6 +396,16 @@ export class App {
           case 'pr_closed': return await this.closed(event.repo, number, event.merged);
           case 'bot_comment_changed': return await this.commentChanged(adapter, event);
           case 'comment': return await this.onComment(adapter, policy, event.repo, number, event.author, event.body, event.commentId);
+          case 'api_command': {
+            const parsed = parseCommand(event.text, this.deps.config.commandNames);
+            if (!parsed?.ok) return;
+            const reply = new Reply(adapter, event.repo, number, this.spinner(policy));
+            const cmdName = this.deps.config.commandNames[0];
+            await reply.start(`Running \`${event.text.slice(0, 120)}\` for ${event.user} (from the teriac API, ${event.via})…`);
+            reply.say(`_\`${event.text.slice(0, 120)}\`, run for ${event.user} from the teriac API (${event.via})._`);
+            this.deps.store.audit({ repo: this.repoKey(event.repo), pr: number, user: event.user, action: 'api_command', project: parsed.command.project ?? '*', allowed: true, reason: `\`${event.text}\` from the API (${event.via}); ${cmdName} checks permissions next` });
+            return await this.respond(reply, () => this.runCommand(adapter, policy, event.repo, number, event.user, parsed.command, reply));
+          }
           case 'apply_button': {
             const reply = new Reply(adapter, event.repo, number, this.spinner(policy));
             await reply.start(`Applying \`${event.project}\` (Apply button pressed by ${event.user})…`);

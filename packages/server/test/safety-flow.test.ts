@@ -943,3 +943,18 @@ describe('a plan is applied once', () => {
     assert.equal(store.latestRuns('github.com/acme/infra', 1, 'apply').find(r => r.project === 'envs/dev')!.status, 'success');
   });
 });
+
+describe('commands from the API', () => {
+  test('the same rules as a comment: permissions, approvals; the result goes on the PR', async () => {
+    const { app, gh, open, store } = setup();
+    await open();
+    const api = (user: string, text: string) => app.handle(gh, { kind: 'api_command', repo, prNumber: 1, user, text, via: 'API token' });
+    await api('erin', 'teriac apply -p envs/dev');
+    assert.match(gh.lastReply(), /`teriac apply -p envs\/dev`, run for erin from the teriac API \(API token\)/);
+    assert.match(gh.lastReply(), /1 more approval from write/, 'no approvals yet: refused like a comment');
+    gh.reviewsByPr.set(1, [{ user: 'carol', state: 'approved', commitSha: head }, { user: 'alice', state: 'approved', commitSha: head }]);
+    await api('erin', 'teriac apply -p envs/dev');
+    assert.equal(store.latestRuns('github.com/acme/infra', 1, 'apply').find(r => r.project === 'envs/dev')?.status, 'success');
+    assert.ok(store.searchAudit({ action: 'api_command' }).total >= 2);
+  });
+});

@@ -36,6 +36,7 @@ const fakeGitHub = (async (url: string, init?: RequestInit) => {
 }) as typeof fetch;
 
 const auth: AuthConfig = {
+  apiToken: 'api-token-for-tests-1234567890',
   sessionSecret: 's'.repeat(32), sessionHours: 12, secureCookies: false,
   users: [{ username: 'vic', password_hash: hashPassword('pw-vic-123'), role: 'viewer' }],
   github: { clientId: 'Iv23li', clientSecret: 'gh-client-secret', webUrl: 'https://github.com', apiUrl: 'https://api.github.com', host: 'github.com', adminUsers: [], adminTeams: ['acme/sre'], allowedTeams: [] },
@@ -45,6 +46,7 @@ let srv: Server;
 let base: string;
 let store: Store;
 const unlocked: string[] = [];
+const handled: any[] = [];
 
 before(async () => {
   store = new Store(':memory:');
@@ -65,7 +67,7 @@ before(async () => {
   });
   const adapter = { platform: 'github', userPermission: async (_r: unknown, login: string) => (login === 'mo' ? 'maintain' : 'write') } as any;
   srv = createHttpServer({
-    app: { runQueue: null, dashboardUnlock: async (_a: unknown, l: { project: string }) => { unlocked.push(l.project); return true; } } as any,
+    app: { runQueue: null, commandName: 'teriac', handle: async (_a: unknown, e: unknown) => { handled.push(e); }, dashboardUnlock: async (_a: unknown, l: { project: string }) => { unlocked.push(l.project); return true; } } as any,
     store, adapters: { github: adapter }, platforms: { 'github.com': 'github' }, auth, github, ready: () => true,
   });
   await new Promise<void>(r => srv.listen(0, '127.0.0.1', () => r()));
@@ -155,4 +157,32 @@ test('password sign-in can be turned off; existing password sessions stop workin
     assert.equal(res.status, 404);
     assert.equal((await get(old, '/api/me')).status, 401);
   } finally { auth.passwordLogin = undefined; }
+});
+
+test('API commands: run as a GitHub login, only plan/apply/unlock/cancel, only repos you can see', async () => {
+  const bearer = { Authorization: 'Bearer api-token-for-tests-1234567890', 'Content-Type': 'application/json' };
+  const call = (headers: Record<string, string>, body: unknown) => fetch(`${base}/api/commands`, { method: 'POST', headers, body: JSON.stringify(body) });
+  // The API token must say who it runs as.
+  let res = await call(bearer, { repo: INFRA, pr: 7, command: 'plan -p envs/dev' });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /"as": "<login>"/);
+  res = await call(bearer, { repo: INFRA, pr: 7, command: 'teriac apply -p envs/dev', as: 'alice' });
+  assert.equal(res.status, 202);
+  assert.deepEqual(handled.at(-1), { kind: 'api_command', repo: { platform: 'github', host: 'github.com', owner: 'acme', name: 'infra', fullName: 'acme/infra', cloneUrl: '' }, prNumber: 7, user: 'alice', text: 'teriac apply -p envs/dev', via: 'API token' });
+  assert.equal((await call(bearer, { repo: INFRA, pr: 7, command: 'state rm -p envs/dev aws_s3_bucket.a', as: 'alice' })).status, 400, 'state commands: comment them');
+  assert.equal((await call(bearer, { repo: INFRA, pr: 7, command: 'deploy', as: 'alice' })).status, 400);
+  assert.equal((await call(bearer, { repo: INFRA, pr: 7, command: 'plan', as: 'not a login!' })).status, 400);
+  // Signed in with GitHub: always as yourself, never "as" someone else; only your repos.
+  const bob = (await signIn('bob')).cookie;
+  const h = { Cookie: bob, 'X-Requested-With': 'teriac', 'Content-Type': 'application/json' };
+  assert.equal((await call(h, { repo: INFRA, pr: 7, command: 'plan', as: 'ada' })).status, 202);
+  assert.equal(handled.at(-1).user, 'bob');
+  assert.equal(handled.at(-1).via, 'dashboard');
+  assert.equal((await call(h, { repo: SECRET, pr: 1, command: 'plan' })).status, 404);
+  // Password users have no GitHub identity.
+  const pw = await fetch(`${base}/auth/login`, { method: 'POST', headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'teriac' }, body: JSON.stringify({ username: 'vic', password: 'pw-vic-123' }) });
+  const vic = { Cookie: cookieOf(pw, 'teriac_session'), 'X-Requested-With': 'teriac', 'Content-Type': 'application/json' };
+  res = await call(vic, { repo: INFRA, pr: 7, command: 'plan', as: 'ada' });
+  assert.equal(res.status, 400);
+  assert.match((await res.json()).error, /need a GitHub identity/);
 });

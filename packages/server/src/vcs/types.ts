@@ -39,6 +39,8 @@ export type VcsEvent =
   // Someone else edited or deleted a comment written by teriac.
   | { kind: 'bot_comment_changed'; repo: Repo; prNumber: number; commentId: string; by: string; change: 'edited' | 'deleted'; body: string }
   | { kind: 'apply_button'; repo: Repo; prNumber: number; project: string; user: string }
+  // A command from teriac's API (POST /api/commands): run as `user`, a GitHub login.
+  | { kind: 'api_command'; repo: Repo; prNumber: number; user: string; text: string; via: string }
   | { kind: 'ignored'; reason: string };
 
 // Repo permission levels, lowest to highest.

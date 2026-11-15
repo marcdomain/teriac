@@ -13,6 +13,7 @@ import { presenter } from './present.ts';
 import { isGrantor, parseGrantRequest, announce, grantText, type NotifyDeps } from './grants.ts';
 import { windowUntil } from './freeze.ts';
 import { matchGlob } from './glob.ts';
+import { parseCommand } from './commands.ts';
 import { destination, type BackupScheduler } from './backup.ts';
 import type { ServerConfig } from './config.ts';
 import { Avatars, roundAvatarSvg } from './avatars.ts';
@@ -477,6 +478,34 @@ export const createHttpServer = (deps: HttpDeps): Server => {
         deps.app.resumeApplies();
         deps.store.audit({ repo: '*', pr: 0, user: who.name, action: 'applies_resumed', project: '*', allowed: true, reason: was ? `paused by ${was.by}: ${was.reason}` : 'was not paused' });
         return send(res, 200, { paused: null });
+      }
+
+      // Run a PR command from outside GitHub: plan, apply, unlock or cancel. It runs as a GitHub
+      // login, so that person's permissions and the PR's approvals apply as for a comment;
+      // the result is posted on the PR. Signed in with GitHub: yourself. API token: `as`.
+      if (req.method === 'POST' && url.pathname === '/api/commands') {
+        const body = JSON.parse((await readBody(req)).toString('utf-8') || '{}');
+        const repoKey = String(body.repo ?? '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
+        const pr = Number(body.pr);
+        const text = String(body.command ?? '').trim().replace(/^teriac\s+/, '');
+        const as = who.via === 'github' ? who.login : who.via === 'token' ? String(body.as ?? '').trim() : '';
+        if (!as) return send(res, 400, { error: who.via === 'token' ? 'Say which GitHub login this runs as: "as": "<login>". Their permissions apply.' : 'Commands need a GitHub identity: sign in with GitHub, or use the API token with "as".' });
+        if (!/^[A-Za-z0-9](?:[A-Za-z0-9-]{0,38})$/.test(as)) return send(res, 400, { error: '"as" must be a GitHub login' });
+        if (!/^[^/]+\/[^/]+\/[^/]+$/.test(repoKey) || !Number.isInteger(pr) || pr < 1) return send(res, 400, { error: 'Give "repo" as host/owner/name (e.g. github.com/acme/infra) and "pr" as a number.' });
+        if (!inScope(repoKey)) return send(res, 404, { error: 'no such repo' });
+        const full = `${deps.app.commandName ?? 'teriac'} ${text}`;
+        const parsed = parseCommand(full, [deps.app.commandName ?? 'teriac']);
+        if (!parsed) return send(res, 400, { error: 'Give a command, e.g. "plan -p envs/dev".' });
+        if (!parsed.ok) return send(res, 400, { error: parsed.error });
+        if (!['plan', 'apply', 'unlock', 'cancel'].includes(parsed.command.verb)) return send(res, 400, { error: 'The API runs plan, apply, unlock and cancel. Comment other commands on the PR.' });
+        const [host, owner, name] = repoKey.split('/');
+        const adapter = deps.adapters[platformForHost(host, deps.platforms ?? {})];
+        if (!adapter) return send(res, 404, { error: 'no such repo' });
+        const repo = { platform: adapter.platform, host, owner, name, fullName: `${owner}/${name}`, cloneUrl: '' };
+        log.info('API command', { repo: repoKey, pr, command: full, as, by: who.sub });
+        send(res, 202, { accepted: full, pr, as, note: 'teriac checks permissions and posts the result on the pull request.' });
+        deps.app.handle(adapter, { kind: 'api_command', repo, prNumber: pr, user: as, text: full, via: who.via === 'token' ? 'API token' : 'dashboard' }).catch(err => log.error('API command failed', { err }));
+        return;
       }
 
       if (req.method === 'POST' && url.pathname === '/api/drift/run') {
