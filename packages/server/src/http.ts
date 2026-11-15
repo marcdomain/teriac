@@ -192,16 +192,14 @@ export const createHttpServer = (deps: HttpDeps): Server => {
     }).finally(() => rechecking.delete(who.sub));
   };
   // Releasing a lock from the dashboard: admins; or, signed in with GitHub, the person who
-  // holds it, or anyone with maintain or admin on the repo (the rule for PR comments too).
+  // holds it, or anyone the repo's `unlock` permission allows (default maintain).
   const canUnlock = async (who: Who, lock: Lock): Promise<boolean> => {
     if (ROLE_RANK[who.role] >= ROLE_RANK.admin) return true;
     if (who.via !== 'github' || !who.login || !(who.repos ?? []).includes(lock.repo)) return false;
     if (lock.user.toLowerCase() === who.login.toLowerCase()) return true;
-    const [host, owner, ...rest] = lock.repo.split('/');
-    const adapter = deps.adapters[platformForHost(host, deps.platforms ?? {})];
-    if (!adapter) return false;
-    const perm = await adapter.userPermission({ platform: adapter.platform, host, owner, name: rest.join('/'), fullName: `${owner}/${rest.join('/')}`, cloneUrl: '' }, who.login).catch(() => 'none');
-    return perm === 'maintain' || perm === 'admin';
+    const adapter = deps.adapters[platformForHost(lock.repo.split('/')[0], deps.platforms ?? {})];
+    if (!adapter || !deps.app.mayUnlock) return false;
+    return (await deps.app.mayUnlock(adapter, lock, who.login).catch(() => ({ allowed: false }))).allowed;
   };
   return createServer(async (req, res) => {
   const url = new URL(req.url ?? '/', 'http://localhost');
@@ -396,7 +394,7 @@ export const createHttpServer = (deps: HttpDeps): Server => {
         const body = JSON.parse((await readBody(req)).toString('utf-8') || '{}');
         const lock = deps.store.getLock(String(body.repo), String(body.project), String(body.workspace ?? 'default'));
         if (!lock || !inScope(lock.repo)) return send(res, 404, { error: 'no such lock' });
-        if (!(await canUnlock(who, lock))) return send(res, 403, { error: 'You can release your own locks, and locks in repos where you have maintain or admin on GitHub. Ask an admin for others.' });
+        if (!(await canUnlock(who, lock))) return send(res, 403, { error: 'You can release your own locks, and others where the repo\'s unlock permission allows you (default: maintain or admin on GitHub). Ask an admin for others.' });
         deps.store.releaseLock(lock.repo, lock.project, lock.workspace);
         deps.store.audit({ repo: lock.repo, pr: lock.pr, user: who.name, action: 'unlock', project: lock.project, allowed: true, reason: `released from the dashboard (${who.via})` });
         const host = lock.repo.split('/')[0];

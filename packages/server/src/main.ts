@@ -124,8 +124,31 @@ if (!process.env.TERIAC_SESSION_SECRET && !process.env.TERIAC_SESSION_SECRET_FIL
   log.warn('TERIAC_SESSION_SECRET is not set; dashboard sessions end when the server restarts');
 }
 
+// A heartbeat, so after a restart teriac knows since when it was down.
+const ALIVE_KEY = 'server_alive_at';
+const lastAlive = store.getSetting<string>(ALIVE_KEY);
+const heartbeat = setInterval(() => store.setSetting(ALIVE_KEY, new Date().toISOString()), 60_000);
+heartbeat.unref();
+
+// After a restart: close out runs it cut short, replay events saved during shutdown, and ask
+// GitHub to resend webhooks that failed while teriac was down (recent ones only).
+const catchUp = async () => {
+  const forHost = (host: string) => (config.github && host === config.github.host ? adapters.github : undefined);
+  await app.recoverInterrupted(forHost).catch(err => log.error('recovering interrupted runs failed', { err }));
+  await app.replayPending(p => (p === 'github' ? adapters.github : undefined)).catch(err => log.error('replaying saved events failed', { err }));
+  if (adapters.github && config.redeliverMissed && lastAlive) {
+    const windowStart = Date.now() - (config.redeliverWindowMinutes ?? 60) * 60_000;
+    const since = new Date(Math.max(windowStart, Date.parse(lastAlive) - 2 * 60_000));
+    const r = await adapters.github.redeliverMissed(since).catch(err => { log.warn('could not ask GitHub to resend missed webhooks', { err: (err as Error).message }); return null; });
+    if (r?.redelivered) log.info('asked GitHub to resend webhooks missed during the restart', { count: r.redelivered });
+    if (r?.tooOld) log.warn('webhooks failed too long ago to replay safely; check the PRs and comment again', { count: r.tooOld, windowMinutes: config.redeliverWindowMinutes });
+  }
+};
+
 server.listen(config.port, () => {
   ready = true;
+  store.setSetting(ALIVE_KEY, new Date().toISOString());
+  void catchUp();
   if (process.env.TERIAC_DRIFT !== 'false') drift.start();
   grants.start();
   summary.start();
@@ -144,18 +167,24 @@ for (const item of preinstall) {
     .catch(err => log.warn('preinstall failed', { item, err }));
 }
 
-// Kubernetes sends SIGTERM: stop taking work, let running plans/applies finish.
+// Kubernetes sends SIGTERM: stop taking work and let running plans and applies finish.
+// The server keeps answering (liveness stays green, /readyz says not ready); webhooks and
+// queued events are saved and run after the restart.
 const shutdown = async (signal: string) => {
   if (stopping) return;
   stopping = true;
-  log.info('shutting down; waiting for running jobs', { signal });
-  server.close();
+  app.drain();
+  log.info('shutting down; waiting for running jobs', { signal, queue: app.runQueue });
   drift.stop();
   grants.stop();
   summary.stop();
   backups?.stop();
   housekeeping.stop();
   await Promise.all([app.idle(), drift.idle(), backups?.idle()]);
+  clearInterval(heartbeat);
+  store.setSetting(ALIVE_KEY, new Date().toISOString());
+  log.info('running jobs finished; stopping');
+  server.close();
   store.close();
   process.exit(0);
 };

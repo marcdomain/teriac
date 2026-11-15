@@ -48,3 +48,25 @@ test('usage: measured on Linux; a command too fast to sample is reported as quic
   assert.ok(slow.peakMemory > 0 && slow.peakProcesses >= 1 && !slow.quick);
   assert.equal(combineUsage({ cpuSeconds: 0, peakMemory: 0, peakProcesses: 1, quick: true }, slow)!.quick, undefined);
 });
+
+test('per-repo numbers, everyone (not just the top 10), and waiting times', async () => {
+  const { Store } = await import('../src/store.ts');
+  const store = new Store(':memory:');
+  const db = (store as any).db;
+  const t = (min: number) => new Date(Date.parse('2026-11-10T10:00:00Z') + min * 60_000).toISOString();
+  const run = (repo: string, user: string, kind: 'plan' | 'apply', at: number, endMin: number, extra: Record<string, unknown> = {}) => {
+    const id = store.startRun({ repo, pr: 1, project: 'envs/dev', workspace: 'default', kind, headSha: 'abc', user, queuedMs: 4000 });
+    store.finishRun(id, { status: 'success', output: '', hasChanges: kind === 'plan', ...extra });
+    db.prepare('UPDATE runs SET started_at = ?, finished_at = ? WHERE id = ?').run(t(at), t(endMin), id);
+  };
+  for (let i = 0; i < 12; i++) run('github.com/acme/infra', `user${i}`, 'plan', i, i + 1);
+  run('github.com/acme/data', 'ada', 'plan', 20, 21);
+  run('github.com/acme/data', 'ada', 'apply', 81, 82);   // applied an hour after its plan finished
+  const s = store.stats(t(-60), t(600));
+  assert.equal(s.people.length, 13, 'everyone');
+  assert.deepEqual(s.repos.map((r: any) => [r.repo, r.runs, r.applies]), [['github.com/acme/infra', 12, 0], ['github.com/acme/data', 2, 1]]);
+  assert.equal(s.waits.planToApply.count, 1);
+  assert.equal(Math.round(s.waits.planToApply.p50!), 3600);
+  assert.equal(s.waits.queued.count, 14);
+  assert.equal(s.waits.queued.p50, 4);
+});

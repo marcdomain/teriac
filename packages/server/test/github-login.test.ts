@@ -67,7 +67,7 @@ before(async () => {
   });
   const adapter = { platform: 'github', userPermission: async (_r: unknown, login: string) => (login === 'mo' ? 'maintain' : 'write') } as any;
   srv = createHttpServer({
-    app: { runQueue: null, commandName: 'teriac', handle: async (_a: unknown, e: unknown) => { handled.push(e); }, dashboardUnlock: async (_a: unknown, l: { project: string }) => { unlocked.push(l.project); return true; } } as any,
+    app: { runQueue: null, commandName: 'teriac', handle: async (_a: unknown, e: unknown) => { handled.push(e); }, dashboardUnlock: async (_a: unknown, l: { project: string }) => { unlocked.push(l.project); return true; }, mayUnlock: async (_a: unknown, _l: unknown, login: string) => ({ allowed: login === 'mo', reason: '' }) } as any,
     store, adapters: { github: adapter }, platforms: { 'github.com': 'github' }, auth, github, ready: () => true,
   });
   await new Promise<void>(r => srv.listen(0, '127.0.0.1', () => r()));
@@ -117,7 +117,7 @@ test('locks: your own, or maintain/admin on the repo; never a repo you can\'t se
   assert.equal((await post(bob, '/api/locks/unlock', { repo: SECRET, project: 'vault' })).status, 404, 'not even shown');
   assert.equal((await post(bob, '/api/locks/unlock', { repo: INFRA, project: 'envs/dev' })).status, 200, 'his own');
   const mo = (await signIn('mo')).cookie;
-  assert.equal((await post(mo, '/api/locks/unlock', { repo: INFRA, project: 'envs/prod' })).status, 200, 'maintain on the repo');
+  assert.equal((await post(mo, '/api/locks/unlock', { repo: INFRA, project: 'envs/prod' })).status, 200, "the repo's unlock permission allows mo");
   assert.deepEqual(unlocked, ['envs/dev', 'envs/prod']);
   assert.equal((await post(mo, '/api/applies/pause', { reason: 'x' })).status, 403, 'admin actions stay admin-only');
 });

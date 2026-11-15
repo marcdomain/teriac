@@ -1001,3 +1001,64 @@ describe('depends_on in teriac.yaml (plain Terraform)', () => {
     assert.match(s.gh.comments.map(c => c.body).join('\n'), /`envs\/prod`: skipped: `envs\/dev` failed to apply first/);
   });
 });
+
+describe('the unlock permission (releasing another PR\'s lock from the dashboard)', () => {
+  test('default maintain; a project can name who may unlock it', async () => {
+    const { app, gh } = setup('', { repos: parseReposYaml(`repos:
+  - id: github.com/acme/*
+    projects:
+      - match: envs/prod
+        permissions: { unlock: [team:sre] }
+`) });
+    gh.prs.set(5, pr(5, 'bob'));
+    const lock = (project: string) => ({ repo: 'github.com/acme/infra', project, workspace: 'default', pr: 5 });
+    assert.equal((await app.mayUnlock(gh, lock('envs/dev'), 'erin')).allowed, true, 'maintain: the default');
+    assert.equal((await app.mayUnlock(gh, lock('envs/dev'), 'bob')).allowed, false, 'write is not enough');
+    assert.equal((await app.mayUnlock(gh, lock('envs/prod'), 'erin')).allowed, true, 'in team:sre');
+    const alice = await app.mayUnlock(gh, lock('envs/prod'), 'alice');
+    assert.equal(alice.allowed, false, 'a repo admin outside team:sre');
+    assert.match(alice.reason, /team:sre/);
+  });
+});
+
+describe('restarts', () => {
+  test('while shutting down, new and queued events are saved, then replayed on the next start', async () => {
+    const { app, gh, store } = setup();
+    gh.prs.set(1, pr(1, 'bob'));
+    app.drain();
+    await app.handle(gh, { kind: 'comment', repo, prNumber: 1, commentId: '1', author: 'bob', body: 'teriac plan' });
+    assert.equal(store.latestRuns('github.com/acme/infra', 1, 'plan').length, 0, 'not run while shutting down');
+    // The next server: same database.
+    const next = new App({ config: (app as any).deps.config, store, resolver: (app as any).deps.resolver, env: { ...process.env } });
+    assert.equal(await next.replayPending(() => gh), 1);
+    assert.equal(store.latestRuns('github.com/acme/infra', 1, 'plan').length, 2, 'planned after the restart');
+    assert.equal(await next.replayPending(() => gh), 0, 'replayed once');
+  });
+
+  test('runs cut short by a crash: marked failed, checks finished, plan dropped, the PR told what to do', async () => {
+    const { app, gh, store, open } = setup();
+    await open();
+    const plan = store.latestRuns('github.com/acme/infra', 1, 'plan').find(r => r.project === 'envs/dev')!;
+    const stuckPlan = store.startRun({ repo: 'github.com/acme/infra', pr: 1, project: 'envs/dev', workspace: 'default', kind: 'plan', headSha: head, user: 'bob' });
+    const stuckApply = store.startRun({ repo: 'github.com/acme/infra', pr: 1, project: 'envs/prod', workspace: 'default', kind: 'apply', headSha: head, user: 'alice' });
+    assert.equal(await app.recoverInterrupted(() => gh), 2);
+    assert.equal(store.getRun(stuckPlan)!.status, 'failed');
+    assert.match(store.getRun(stuckApply)!.output, /the server restarted while this ran/);
+    assert.equal(store.getRun(plan.id)!.planPath, null, "the project's saved plan is dropped");
+    assert.equal(gh.checks.get('teriac: envs/prod')!.conclusion, 'cancelled');
+    const msg = gh.lastReply();
+    assert.match(msg, /teriac restarted while this PR had work running/);
+    assert.match(msg, /Apply of `envs\/prod`: it may have stopped part-way\. Comment `teriac plan -p envs\/prod`.*force-unlock -p envs\/prod <lock-id>/);
+    assert.equal(await app.recoverInterrupted(() => gh), 0, 'once');
+  });
+});
+
+test('each plan and apply records how long it waited for a free slot', async () => {
+  const { gh, say, open, store } = setup();
+  await open();
+  gh.reviewsByPr.set(1, [{ user: 'carol', state: 'approved', commitSha: head }, { user: 'alice', state: 'approved', commitSha: head }]);
+  await say('alice', 'teriac apply -p envs/dev');
+  const rows = (store as any).db.prepare('SELECT kind, queued_ms FROM runs ORDER BY id').all() as { kind: string; queued_ms: number | null }[];
+  assert.ok(rows.length >= 3);
+  for (const r of rows) assert.ok(typeof r.queued_ms === 'number' && r.queued_ms >= 0, `${r.kind} has a queue time`);
+});

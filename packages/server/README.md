@@ -15,13 +15,16 @@ any webhook, and tag who last changed each resource.
 ## Quick start
 
 ```sh
-docker run -p 8080:8080 -v teriac-data:/data \
+docker run -p 8080:8080 -v teriac-data:/data --stop-timeout 3600 \
   -e TERIAC_GITHUB_APP_ID=123456 \
   -e TERIAC_GITHUB_PRIVATE_KEY_FILE=/run/secrets/app.pem \
   -e TERIAC_GITHUB_WEBHOOK_SECRET_FILE=/run/secrets/webhook \
   -e TERIAC_REPO_ALLOWLIST='github.com/acme/*' \
   ghcr.io/marcdomain/teriac-server
 ```
+
+`--stop-timeout` lets `docker stop` wait for running plans and applies (Docker's default is 10
+seconds); see [Restarts and upgrades](#restarts-and-upgrades).
 
 Set up the GitHub App like this:
 - **Webhook URL:** `https://<host>/events/github`
@@ -32,7 +35,7 @@ Set up the GitHub App like this:
   |---|---|---|
   | Repository → **Checks** | Read & write | A check run per plan, the **Apply** button, and code annotations on risky lines |
   | Repository → **Contents** | Read | Cloning the PR, reading `teriac.yaml` and `CODEOWNERS`, comparing the branch with its base (out-of-date warnings, keeping approvals after a rebase) |
-  | | Read & write | Only for drift fix PRs (`fix_pr: true`): pushing the fix branch |
+  | | Read & write | Only for drift fix PRs (`fix_pr: true`: pushing the fix branch) and `automerge` (merging the PR, deleting its branch) |
   | Repository → **Issues** | Read & write | Posting and editing comments, and the 👀 reaction on commands (PR comments use the Issues API) |
   | Repository → **Pull requests** | Read & write | Changed files, reviews and approvals, mergeable state, and opening drift fix PRs |
   | Repository → **Metadata** | Read | Required by GitHub for every App |
@@ -115,6 +118,8 @@ copied one into an attribute Terraform doesn't mark.
 | `TERIAC_MODULE_AUTH` | `true` | A read-only App token for Terraform's `git::https://` module downloads; see [Module sources](#settings) |
 | `TERIAC_VERIFY_SIGNATURES` | `true` | Check the vendor's signature on downloaded Terraform, OpenTofu and Terragrunt. `false` for mirrors that don't copy `.sig` files |
 | `TERIAC_BACKUP_ENABLED` | `false` | Scheduled database backups; see [Backups](#backups) for the `TERIAC_BACKUP_*` settings |
+| `TERIAC_REDELIVER_MISSED` | `true` | After a restart, ask GitHub to resend webhooks that failed while teriac was down; see [Restarts and upgrades](#restarts-and-upgrades) |
+| `TERIAC_REDELIVER_WINDOW_MINUTES` | `60` | Only resend webhooks this recent |
 | `TERIAC_LOG_RETENTION_DAYS` | | Clear run logs this many days after a PR's last apply. Summaries, metrics and PR comments stay. Per repo: `log_retention_days` |
 | `TERIAC_GITHUB_CLIENT_ID` | | The App's client ID: names the App when teriac signs in to GitHub, and enables "Sign in with GitHub" with the secret below |
 | `TERIAC_GITHUB_CLIENT_SECRET` | | Turns on "Sign in with GitHub" for the dashboard; see [Dashboard](#dashboard) |
@@ -165,7 +170,7 @@ Defaults when no rule applies:
 | `plan` | plans, `validate`, `providers`, `fmt`, `state list` | write | |
 | `apply` | applies | write | |
 | `apply_destroy` | applies that delete or replace | maintain | |
-| `unlock` | releasing another PR's lock | maintain | |
+| `unlock` | releasing another PR's lock from the dashboard (`teriac unlock` in a PR only releases that PR's own locks: its author or anyone who may plan) | maintain | |
 | `state_read` | `state show`, `show`, `output` | write | `plan` |
 | `state_write` | `import`, `taint`, `untaint` | write | `apply` |
 | `state_remove` | `state rm`, `state mv`, `force-unlock` | maintain | `apply_destroy` |
@@ -218,7 +223,7 @@ repos:
 - **Fork PRs** are refused unless `allow_fork_prs: true`; teriac says so on the PR.
 - **`checkout: merge`** plans GitHub's test merge of this exact commit into the base branch, so
   the plan includes what's on the base branch now. A PR with conflicts fails with a clear message.
-- **`automerge`** merges the whole PR (all its files, not just applied projects) once every
+- **`automerge`** (the App needs Contents: Read & write) merges the whole PR (all its files, not just applied projects) once every
   project with planned changes at the current commit is applied and nothing failed. Only that
   commit is merged: a newer push makes GitHub refuse it. Branch protection still applies; a
   refused merge is reported with GitHub's reason.
@@ -658,6 +663,29 @@ docker run -d -p 8080:8080 -v teriac-data:/data \
   … ghcr.io/marcdomain/teriac-server
 ```
 
+## Restarts and upgrades
+
+A restart, upgrade or node drain doesn't lose work. On `SIGTERM` teriac:
+- finishes the plans and applies already running. It keeps answering health checks, so it isn't
+  killed half-way, and `/readyz` says not ready so no new traffic comes;
+- saves webhooks that arrive, and commands queued behind running work, and runs them after the
+  restart;
+- exits once the running work is done.
+
+On start it:
+- marks runs that a crash cut short (grace period exceeded, node lost) as failed, finishes their
+  GitHub checks, drops half-written plans, and tells each PR what to do. For an apply that stopped
+  part-way, that's: plan again to see what's left, and `teriac force-unlock` if Terraform's state
+  lock is still held;
+- asks GitHub to send again the webhooks that failed while it was down (`TERIAC_REDELIVER_MISSED`,
+  on by default; needs no extra App permission). Only ones from the last
+  `TERIAC_REDELIVER_WINDOW_MINUTES` (default 60) are resent, so an old `teriac apply` comment is
+  never run hours later. Older failures are logged, for someone to comment again.
+
+Give it time to finish: the chart's `terminationGracePeriodSeconds` is 4200, above the default
+`TERIAC_RUN_TIMEOUT_SECONDS` of 3600. With Docker, use `--stop-timeout 3600` on `docker run`, or
+`docker stop -t 3600`.
+
 ## Tamper-proof output
 
 GitHub lets anyone with write access edit any comment, including teriac's. teriac never reads its
@@ -695,8 +723,8 @@ admins can also unlock, pause applies, start drift checks and start a backup.
 | API token | `TERIAC_API_TOKEN` (admin) |
 
 **Signed in with GitHub**, people see only the repos that both they and the App can see on
-GitHub (runs, live output, locks, audit, metrics, drift). They can release their own locks, and any
-lock in a repo where they have maintain or admin; other actions are for admins. teriac checks with
+GitHub (runs, live output, locks, audit, metrics, drift). They can release their own locks, and others
+where the project's `unlock` permission allows them (default maintain); other actions are for admins. teriac checks with
 GitHub again every 10 minutes, so lost access or leaving an admin team takes effect within that time;
 these sessions last at most 8 hours.
 

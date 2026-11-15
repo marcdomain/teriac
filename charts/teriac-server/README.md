@@ -4,7 +4,7 @@ Runs [teriac server](../../packages/server/README.md) on Kubernetes. It's pull r
 for Terraform, OpenTofu and Terragrunt, with per-project RBAC and approvers, drift alerts, and a
 dashboard.
 
-![teriac server: install with Helm or Docker, the PR comment with risk and approvals, apply, and the dashboard with runs, guardrails, backups, metrics and unlocking](docs/flow.gif)
+![teriac server: install with Helm or Docker, the PR comment with risk and approvals, apply, sign in with GitHub, and the dashboard with live output, runs, the emergency stop, metrics and unlocking](docs/flow.gif)
 
 ## Install
 
@@ -40,7 +40,7 @@ dashboard:
 Then:
 1. Point the GitHub App's webhook at `https://teriac.acme.dev/events/github`, with the events
    Pull request, Issue comment and Check run. The App needs **Checks**, **Issues** and **Pull
-   requests** (read & write), **Contents** (read; read & write only for drift fix PRs) and
+   requests** (read & write), **Contents** (read; read & write only for drift fix PRs and automerge) and
    organization **Members** (read). The [server README](../../packages/server/README.md#quick-start)
    says what each one is for.
 2. Register `https://teriac.acme.dev/auth/oidc/callback` as the redirect URI with Okta.

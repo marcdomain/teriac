@@ -159,6 +159,9 @@ CREATE TABLE IF NOT EXISTS grants (
   created_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT, revoked_by TEXT, used_at TEXT,
   expiry_noted INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS pending_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL, event TEXT NOT NULL, at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS dashboard_access (
   sub TEXT PRIMARY KEY, repos TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'viewer', at TEXT NOT NULL
 );
@@ -230,6 +233,7 @@ export class Store {
     if (!cols.includes('usage')) this.db.exec('ALTER TABLE runs ADD COLUMN usage TEXT');
     if (!cols.includes('applied')) this.db.exec('ALTER TABLE runs ADD COLUMN applied TEXT');
     if (!cols.includes('output_expired_at')) this.db.exec('ALTER TABLE runs ADD COLUMN output_expired_at TEXT');
+    if (!cols.includes('queued_ms')) this.db.exec('ALTER TABLE runs ADD COLUMN queued_ms INTEGER');
     if (!cols.includes('plan_sha')) this.db.exec('ALTER TABLE runs ADD COLUMN plan_sha TEXT');
     if (!cols.includes('risk')) this.db.exec('ALTER TABLE runs ADD COLUMN risk TEXT');
     if (!cols.includes('secrets')) this.db.exec('ALTER TABLE runs ADD COLUMN secrets TEXT');
@@ -274,6 +278,23 @@ export class Store {
         AND r.id = (SELECT MAX(id) FROM runs x WHERE x.repo = r.repo AND x.pr = r.pr AND x.kind = 'apply' AND x.status = 'success')
         AND NOT EXISTS (SELECT 1 FROM closed_prs c WHERE c.repo = r.repo AND c.pr = r.pr)
     `).all(before) as Record<string, any>[]).map(toRun);
+  }
+
+  // ---- restarts ----
+
+  // Events that arrived while the server was shutting down, replayed on the next start.
+  savePendingEvent(platform: string, event: unknown): void {
+    this.db.prepare('INSERT INTO pending_events (platform, event, at) VALUES (?, ?, ?)').run(platform, JSON.stringify(event), now());
+  }
+  takePendingEvents(): { platform: string; event: any }[] {
+    const rows = this.db.prepare('SELECT id, platform, event FROM pending_events ORDER BY id').all() as { id: number; platform: string; event: string }[];
+    if (rows.length) this.db.prepare(`DELETE FROM pending_events WHERE id <= ?`).run(rows.at(-1)!.id);
+    return rows.map(r => ({ platform: r.platform, event: JSON.parse(r.event) }));
+  }
+
+  // Runs still marked running or queued: on start, these were cut short by a restart or crash.
+  unfinishedRuns(): Run[] {
+    return (this.db.prepare(`SELECT * FROM runs WHERE status IN ('running', 'queued') ORDER BY id`).all() as Record<string, any>[]).map(toRun);
   }
 
   // ---- dashboard users who sign in with GitHub: the repos they may see ----
@@ -361,10 +382,11 @@ export class Store {
 
   // ---- runs ----
 
-  startRun(r: { repo: string; pr: number; project: string; workspace: string; kind: RunKind; headSha: string; user: string; targets?: string[]; prAuthor?: string; dir?: string }): number {
+  // queuedMs: how long the run waited for a free slot before it started.
+  startRun(r: { repo: string; pr: number; project: string; workspace: string; kind: RunKind; headSha: string; user: string; targets?: string[]; prAuthor?: string; dir?: string; queuedMs?: number }): number {
     const res = this.db.prepare(
-      'INSERT INTO runs (repo, pr, project, workspace, kind, status, head_sha, user, started_at, targets, pr_author, dir) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
-    ).run(r.repo, r.pr, r.project, r.workspace, r.kind, 'running', r.headSha, r.user, now(), r.targets?.length ? JSON.stringify(r.targets) : '', r.prAuthor ?? '', r.dir ?? '');
+      'INSERT INTO runs (repo, pr, project, workspace, kind, status, head_sha, user, started_at, targets, pr_author, dir, queued_ms) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+    ).run(r.repo, r.pr, r.project, r.workspace, r.kind, 'running', r.headSha, r.user, now(), r.targets?.length ? JSON.stringify(r.targets) : '', r.prAuthor ?? '', r.dir ?? '', r.queuedMs ?? null);
     return Number(res.lastInsertRowid);
   }
 
@@ -484,9 +506,27 @@ export class Store {
     const projects = all<{ project: string; repo: string; runs: number; applies: number; failed: number; destroys: number }>(
       `SELECT project, repo, count(*) AS runs, sum(kind = 'apply') AS applies, sum(status = 'failed') AS failed, sum(kind = 'plan' AND destroys > 0) AS destroys
        FROM runs WHERE started_at >= ? AND started_at < ?${S('')} GROUP BY repo, project ORDER BY runs DESC LIMIT 10`, from, to, ...A);
-    const people = all<{ user: string; runs: number; plans: number; applies: number; failed: number }>(
-      `SELECT user, count(*) AS runs, sum(kind = 'plan') AS plans, sum(kind = 'apply') AS applies, sum(status = 'failed') AS failed
-       FROM runs WHERE started_at >= ? AND started_at < ?${S('')} GROUP BY user ORDER BY runs DESC LIMIT 10`, from, to, ...A);
+    // Everyone who ran something (the page shows the top 10, and the rest on request).
+    const people = all<{ user: string; runs: number; plans: number; applies: number; failed: number; prs: number; last: string }>(
+      `SELECT user, count(*) AS runs, sum(kind = 'plan') AS plans, sum(kind = 'apply') AS applies, sum(status = 'failed') AS failed,
+        count(DISTINCT repo || '#' || pr) AS prs, max(started_at) AS last
+       FROM runs WHERE started_at >= ? AND started_at < ?${S('')} GROUP BY user ORDER BY runs DESC`, from, to, ...A);
+    const repoRows = all<{ repo: string; runs: number; plans: number; applies: number; failed: number; prs: number; projects: number; users: number }>(
+      `SELECT repo, count(*) AS runs, sum(kind = 'plan') AS plans, sum(kind = 'apply') AS applies, sum(status = 'failed') AS failed,
+        count(DISTINCT pr) AS prs, count(DISTINCT project) AS projects, count(DISTINCT user) AS users
+       FROM runs WHERE started_at >= ? AND started_at < ?${S('')} GROUP BY repo ORDER BY runs DESC`, from, to, ...A);
+    // Time waiting for a free slot (queued) before runs started, recorded since this was added.
+    const queued = all<{ v: number }>(`SELECT queued_ms / 1000.0 AS v FROM runs WHERE queued_ms IS NOT NULL AND started_at >= ? AND started_at < ?${S('')} ORDER BY v`, from, to, ...A).map(x => x.v);
+    // From a plan with changes to its apply: review, approvals and the decision to apply.
+    const toApply = all<{ v: number }>(
+      `SELECT (julianday(a.started_at) - julianday(p.finished_at)) * 86400 AS v FROM runs a
+       JOIN runs p ON p.id = (SELECT max(id) FROM runs x WHERE x.repo = a.repo AND x.pr = a.pr AND x.project = a.project AND x.workspace = a.workspace
+                              AND x.kind = 'plan' AND x.status = 'success' AND x.has_changes = 1 AND x.head_sha = a.head_sha AND x.id < a.id)
+       WHERE a.kind = 'apply' AND a.started_at >= ? AND a.started_at < ?${S('a.')} AND p.finished_at IS NOT NULL ORDER BY v`, from, to, ...A).map(x => x.v).filter(v => v >= 0);
+    const waits = {
+      queued: { count: queued.length, p50: pct(queued, 0.5), p95: pct(queued, 0.95), max: queued.at(-1) ?? null },
+      planToApply: { count: toApply.length, p50: pct(toApply, 0.5), p90: pct(toApply, 0.9) },
+    };
     const engines = all<{ engine: string; n: number }>(
       `SELECT engine, count(*) AS n FROM runs WHERE started_at >= ? AND started_at < ?${S('')} AND engine != '' GROUP BY engine ORDER BY n DESC LIMIT 8`, from, to, ...A);
     // Resources changed by applies, saved when each apply finished.
@@ -517,7 +557,7 @@ export class Store {
       from,
       totals: Object.fromEntries(Object.entries(totals).map(([k, v]) => [k, v ?? 0])),
       daily, timing: { plan: timing('plan'), apply: timing('apply') },
-      projects, people, engines, resources, usage,
+      projects, people, repos: repoRows, waits, engines, resources, usage,
       policy: {
         bySeverity: all<{ severity: string; n: number }>(`SELECT severity, count(*) AS n FROM policy_findings WHERE at >= ? AND at < ?${S()} GROUP BY severity`, from, to, ...A),
         topRules: all<{ rule: string; n: number; enforced: number }>(`SELECT rule, count(*) AS n, sum(mode = 'enforce') AS enforced FROM policy_findings WHERE at >= ? AND at < ?${S()} GROUP BY rule ORDER BY n DESC LIMIT 8`, from, to, ...A),

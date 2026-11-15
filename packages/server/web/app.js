@@ -158,7 +158,7 @@
       <div class="f custom"${range === 'custom' ? '' : ' hidden'}><span>From – to</span>${dateTrigger('filters', params.get('from'), params.get('to'))}</div>`;
   };
   const LABELS = {
-    q: 'Search', user: 'Person', project: 'Project', status: 'Result', kind: 'Type', action: 'Action', result: 'Decision', range: 'When', sort: 'Sort',
+    q: 'Search', user: 'Person', project: 'Project', repo: 'Repo', status: 'Result', kind: 'Type', action: 'Action', result: 'Decision', range: 'When', sort: 'Sort',
     rule: 'Rule', severity: 'Severity', mode: 'Mode',
   };
   const STATUS = [['', 'Any result'], ['changes', 'Has changes'], ['destroys', 'Destroys or replaces'], ['nochanges', 'No changes'], ['applied', 'Applied'], ['failed', 'Failed'], ['running', 'Running']];
@@ -166,7 +166,8 @@
     const shown = [...params.entries()].filter(([k, v]) => v && LABELS[k] && k !== 'sort' && !(k === 'range' && v === 'all'));
     if (!shown.length) return '';
     const text = (k, v) => k === 'status' ? (STATUS.find(s => s[0] === v)?.[1] ?? v)
-      : k === 'range' ? (v === 'custom' ? `${params.get('from') || '…'} – ${params.get('to') || '…'}` : RANGES.find(r => r[0] === v)?.[1] ?? v) : v;
+      : k === 'range' ? (v === 'custom' ? `${params.get('from') || '…'} – ${params.get('to') || '…'}` : RANGES.find(r => r[0] === v)?.[1] ?? v)
+      : k === 'repo' ? repoName(v) : v;
     return `<div class="chips">${shown.map(([k, v]) =>
       `<button type="button" class="chip" data-clear="${k}" title="Remove this filter"><span>${esc(LABELS[k])}:</span> ${esc(text(k, v))} <b aria-hidden="true">×</b></button>`).join('')}
       <button type="button" class="chip clear" data-clear="*">Clear all</button></div>`;
@@ -781,11 +782,21 @@
         <div class="grid3">
           <div class="card viz"><div class="card-head"><h2>Busiest projects</h2><a href="#projects">All projects</a></div>
             ${bars(m.projects.map(p => ({ label: `<span class="mono">${projLink(p.project)}</span>`, value: p.runs, note: p.failed ? `${p.failed} failed` : '' })), 'No runs in this period.')}</div>
-          <div class="card viz"><div class="card-head"><h2>Most active people</h2></div>
-            ${bars(m.people.map(p => ({ label: `<a class="plain" href="${esc(listLink('runs', { user: p.user }))}">${who(p.user)}</a>`, value: p.runs, note: `${p.plans} plans · ${p.applies} applies` })), 'Nobody has run anything in this period.')}</div>
+          <div class="card viz"><div class="card-head"><h2>Most active people</h2><span class="muted small">${fmt(m.people.length)} ${m.people.length === 1 ? 'person' : 'people'}</span></div>
+            ${bars(m.people.slice(0, 10).map(p => ({ label: `<a class="plain" href="${esc(listLink('runs', { user: p.user }))}">${who(p.user)}</a>`, value: p.runs, note: `${p.plans} plans · ${p.applies} applies` })), 'Nobody has run anything in this period.')}
+            ${m.people.length > 10 ? `<details class="table-view"><summary>Show all ${fmt(m.people.length)}</summary>${table(['Person', 'Runs', 'Plans', 'Applies', 'Failed', 'Pull requests', 'Last active'], m.people.map(p => `<tr><td><a class="plain" href="${esc(listLink('runs', { user: p.user }))}">${who(p.user)}</a></td><td class="num">${fmt(p.runs)}</td><td class="num">${fmt(p.plans)}</td><td class="num">${fmt(p.applies)}</td><td class="num">${p.failed ? `<span class="pill bad">${fmt(p.failed)}</span>` : 0}</td><td class="num">${fmt(p.prs)}</td><td class="muted">${ago(p.last)}</td></tr>`), '')}</details>` : ''}</div>
           <div class="card viz"><div class="card-head"><h2>Engines</h2></div>
             ${bars(m.engines.map(e => ({ label: esc(e.engine), value: e.n })), 'No runs in this period.')}</div>
         </div>
+        <div class="card"><div class="card-head"><h2>Waiting</h2><span class="muted small">where time goes before something changes</span></div>
+          <div class="tiles hero inner">
+            ${tile(secsText(m.waits.planToApply.p50), 'median plan to apply', m.waits.planToApply.count ? `p90 ${secsText(m.waits.planToApply.p90)} · ${fmt(m.waits.planToApply.count)} applies · review and approvals` : 'no applies yet')}
+            ${tile(secsText(m.waits.queued.p50), 'median wait for a free slot', m.waits.queued.count ? `p95 ${secsText(m.waits.queued.p95)} · longest ${secsText(m.waits.queued.max)}` : 'no runs recorded yet')}
+          </div><div class="pad-b"></div>
+          ${m.waits.queued.count && m.waits.queued.p95 > 60 ? '<div class="card-foot"><span class="muted small">Runs often wait for a free slot: raise <code>TERIAC_PARALLELISM</code> if the server has CPU and memory to spare.</span></div>' : ''}
+        </div>
+        ${(m.repos || []).length > 1 ? `<div class="card"><div class="card-head"><h2>Repos</h2><span class="muted small">${fmt(m.repos.length)} repos</span></div>
+          ${table(['Repo', 'Runs', 'Plans', 'Applies', 'Failed', 'Pull requests', 'Projects', 'People'], m.repos.map(r => `<tr class="click" data-href="${esc(listLink('runs', { repo: r.repo }))}"><td><a class="plain" href="${esc(listLink('runs', { repo: r.repo }))}">${esc(repoName(r.repo))}</a></td><td class="num">${fmt(r.runs)}</td><td class="num">${fmt(r.plans)}</td><td class="num">${fmt(r.applies)}</td><td class="num">${r.failed ? `<span class="pill bad">${fmt(r.failed)}</span>` : 0}</td><td class="num">${fmt(r.prs)}</td><td class="num">${fmt(r.projects)}</td><td class="num">${fmt(r.users)}</td></tr>`), '')}</div>` : ''}
         <div class="grid3">
           <div class="card"><div class="card-head"><h2>Run times</h2></div>
             ${table(['', 'Runs', 'Median', 'p95', 'Slowest'], ['plan', 'apply'].map(k => {
@@ -1013,7 +1024,7 @@
   </tr>`;
   const LISTS = {
     runs: {
-      url: '/api/runs/search', keys: ['q', 'user', 'project', 'status', 'kind', 'sort'], noun: ['run', 'runs'],
+      url: '/api/runs/search', keys: ['q', 'user', 'project', 'repo', 'status', 'kind', 'sort'], noun: ['run', 'runs'],
       head: ['Result', 'Project', 'Changes', 'Risk', 'Pull request', 'People', 'Engine', 'When'], row: runRow, empty: 'No runs match these filters.',
     },
     policy: {
