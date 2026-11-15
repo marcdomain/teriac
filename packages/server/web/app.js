@@ -67,6 +67,19 @@
   const PAST = { create: 'created', update: 'changed', delete: 'deleted', replace: 'replaced' };
   const SYMBOL = { create: '+', update: '~', delete: '-', replace: '-/+', import: '←', forget: '⊘', move: '→' };
   const LINE = { create: 'l-add', update: 'l-chg', delete: 'l-del', replace: 'l-del' };
+  // Terraform output coloured like the PR comments (GitHub's diff colours): + green, - red,
+  // ~ and -/+ orange; plus errors, warnings, the commands teriac ran and summary lines.
+  const logLineClass = (line) => {
+    const m = /^\s*(-\/\+|\+\/-|[+~-])( |$)/.exec(line);
+    if (m) return m[1] === '+' ? 'l-add' : m[1] === '-' ? 'l-del' : 'l-chg';
+    if (/^\s*(│\s*)?Error[:\s]|^\s*\[teriac\].*(failed|refused|withheld)/.test(line)) return 'l-err';
+    if (/^\s*(│\s*)?Warning[:\s]/.test(line)) return 'l-warn';
+    if (/^\$ /.test(line)) return 'l-cmd';
+    if (/^(Plan:|Apply complete!|No changes\.|Destroy complete!|Changes to Outputs:)/.test(line)) return 'l-sum';
+    return '';
+  };
+  const logLine = (line) => { const c = logLineClass(line); return c ? `<span class="${c}">${esc(line)}</span>` : esc(line); };
+  const colorLog = (text) => String(text).split('\n').map(logLine).join('\n');
   const changeLines = (list) => list.map(c =>
     `<span class="${LINE[c.action] || ''}">${esc((SYMBOL[c.action] || '?').padEnd(3))} ${esc(c.address)}${c.reason ? `   # ${esc(c.reason)}` : ''}</span>`).join('\n');
 
@@ -529,7 +542,7 @@
               <pre class="log" id="live-log" data-run="${r.id}"><span class="muted">Waiting for output…</span></pre></div>`
           : r.outputExpiredAt
             ? `<div class="card"><div class="card-head"><h2>Output</h2></div><div class="empty">This log was cleared on ${esc(when(r.outputExpiredAt))}, as set by <code>log_retention_days</code>. The plan summary and everything else on this page stay.</div></div>`
-            : `<div class="card"><div class="card-head"><h2>Output</h2><span class="muted small">secrets redacted</span></div><pre class="log">${esc(r.output || '')}</pre></div>`}`;
+            : `<div class="card"><div class="card-head"><h2>Output</h2><span class="muted small">secrets redacted</span></div><pre class="log">${colorLog(r.output || '')}</pre></div>`}`;
     },
 
     async locks() {
@@ -1051,7 +1064,9 @@
     let count = 0;
     const append = (lines) => {
       if (first) { pre.textContent = ''; first = false; }
-      pre.append(document.createTextNode(lines.join('\n') + '\n'));
+      const chunk = document.createElement('span');
+      chunk.innerHTML = lines.map(logLine).join('\n') + '\n';
+      pre.append(chunk);
       count += lines.length;
       // Keep the page light: very long logs keep their last 20,000 lines here.
       while (count > 20000 && pre.firstChild) { count -= (pre.firstChild.textContent.match(/\n/g) || []).length; pre.firstChild.remove(); }
