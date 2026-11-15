@@ -3,6 +3,7 @@
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
 import { rmSync, mkdirSync, readFileSync, existsSync, realpathSync } from 'node:fs';
+import { AsyncLocalStorage } from 'node:async_hooks';
 import type { ServerConfig, RepoPolicy, Action } from './config.ts';
 import type { VcsAdapter, VcsEvent, Repo, PullRequestState, Comparison, Annotation, CloneAuth } from './vcs/types.ts';
 import { Store, type Run, type Grant } from './store.ts';
@@ -649,9 +650,13 @@ export class App {
   }
 
   // Runs `fn` in this PR's turn; false when `teriac cancel` dropped it before it started.
+  // How long the current run waited for a slot, for the run it starts (each run its own value).
+  private waited = new AsyncLocalStorage<{ ms: number }>();
+
   private async inTurn(ctx: PrContext, fn: () => Promise<unknown>): Promise<boolean> {
+    const asked = Date.now();
     try {
-      await this.sched.use(`${ctx.repoKey}#${ctx.pr.number}`, fn);
+      await this.sched.use(`${ctx.repoKey}#${ctx.pr.number}`, () => this.waited.run({ ms: Date.now() - asked }, fn));
       return true;
     } catch (err) {
       if (err instanceof Cancelled) return false;
@@ -1020,7 +1025,7 @@ export class App {
     const { store, config } = this.deps;
     const checkName = `teriac: ${project.name}`;
     const started = Date.now();
-    const runId = store.startRun({ repo: ctx.repoKey, pr: ctx.pr.number, project: project.name, workspace: project.workspace, kind: 'plan', headSha: ctx.pr.headSha, user, targets: opts.targets, prAuthor: ctx.pr.author, dir: project.dir });
+    const runId = store.startRun({ repo: ctx.repoKey, pr: ctx.pr.number, project: project.name, workspace: project.workspace, kind: 'plan', headSha: ctx.pr.headSha, user, targets: opts.targets, prAuthor: ctx.pr.author, dir: project.dir, queuedMs: this.waited.getStore()?.ms });
     // Live output exists from the moment the run does, so a viewer never finds it missing.
     const live = this.liveFor(ctx, project, runId);
     // `teriac cancel` stops a running plan (never a running apply).
@@ -1470,7 +1475,7 @@ export class App {
   private async applyProject(ctx: PrContext, project: Project, user: string, plan: Run) {
     const { store, config } = this.deps;
     const started = Date.now();
-    const runId = store.startRun({ repo: ctx.repoKey, pr: ctx.pr.number, project: project.name, workspace: project.workspace, kind: 'apply', headSha: ctx.pr.headSha, user, prAuthor: ctx.pr.author, dir: project.dir });
+    const runId = store.startRun({ repo: ctx.repoKey, pr: ctx.pr.number, project: project.name, workspace: project.workspace, kind: 'apply', headSha: ctx.pr.headSha, user, prAuthor: ctx.pr.author, dir: project.dir, queuedMs: this.waited.getStore()?.ms });
     const live = this.liveFor(ctx, project, runId);
     const liveUrl = this.commentLinks(ctx).run!(runId);
     await this.check(ctx, { name: `teriac: ${project.name}`, headSha: ctx.pr.headSha, externalId: project.name, status: 'in_progress', title: 'Applying…', summary: `Applying \`${project.name}\` for @${user}\n\n▶ [Watch the live output](${liveUrl})`, detailsUrl: liveUrl });

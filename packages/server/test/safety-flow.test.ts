@@ -1052,3 +1052,13 @@ describe('restarts', () => {
     assert.equal(await app.recoverInterrupted(() => gh), 0, 'once');
   });
 });
+
+test('each plan and apply records how long it waited for a free slot', async () => {
+  const { gh, say, open, store } = setup();
+  await open();
+  gh.reviewsByPr.set(1, [{ user: 'carol', state: 'approved', commitSha: head }, { user: 'alice', state: 'approved', commitSha: head }]);
+  await say('alice', 'teriac apply -p envs/dev');
+  const rows = (store as any).db.prepare('SELECT kind, queued_ms FROM runs ORDER BY id').all() as { kind: string; queued_ms: number | null }[];
+  assert.ok(rows.length >= 3);
+  for (const r of rows) assert.ok(typeof r.queued_ms === 'number' && r.queued_ms >= 0, `${r.kind} has a queue time`);
+});
