@@ -958,3 +958,46 @@ describe('commands from the API', () => {
     assert.ok(store.searchAudit({ action: 'api_command' }).total >= 2);
   });
 });
+
+describe('depends_on in teriac.yaml (plain Terraform)', () => {
+  // A commit whose teriac.yaml says envs/prod depends on envs/dev.
+  const depsCommit = () => {
+    sh(origin, 'checkout', '-q', '-B', 'deps', head);
+    writeFileSync(join(origin, 'teriac.yaml'), 'projects:\n  - dir: envs/dev\n  - dir: envs/prod\n    depends_on: [envs/dev]\n');
+    sh(origin, 'add', 'teriac.yaml');
+    sh(origin, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'deps');
+    const sha = sh(origin, 'rev-parse', 'HEAD');
+    sh(origin, 'checkout', '-q', 'main');
+    return sha;
+  };
+  const start = async (s: ReturnType<typeof setup>, sha: string) => {
+    const p = { ...pr(1, 'bob'), headSha: sha };
+    s.gh.prs.set(1, p);
+    await s.app.handle(s.gh, { kind: 'pr_opened', repo, pr: p });
+    s.gh.reviewsByPr.set(1, [{ user: 'carol', state: 'approved', commitSha: sha }, { user: 'alice', state: 'approved', commitSha: sha }]);
+  };
+  const REPO = 'github.com/acme/infra';
+
+  test('dev applies first; prod is planned again with dev\'s new state, not applied', async () => {
+    const sha = depsCommit();
+    const s = setup();
+    await start(s, sha);
+    const prodPlan = s.store.latestRuns(REPO, 1, 'plan').find(r => r.project === 'envs/prod')!.id;
+    await s.say('alice', 'teriac apply');
+    const applies = s.store.latestRuns(REPO, 1, 'apply');
+    assert.deepEqual(applies.map(a => [a.project, a.status]), [['envs/dev', 'success']], 'only dev was applied');
+    assert.ok(s.store.latestRuns(REPO, 1, 'plan').find(r => r.project === 'envs/prod')!.id > prodPlan, 'prod has a new plan');
+    assert.match(s.gh.comments.map(c => c.body).join('\n'), /re-planned after `envs\/dev` applied/);
+  });
+
+  test('if dev fails to apply, prod is skipped', async () => {
+    const sha = depsCommit();
+    const s = setup();
+    await start(s, sha);
+    const flag = join(dirname(fakeTf), 'apply-fail');
+    writeFileSync(flag, '');
+    try { await s.say('alice', 'teriac apply'); } finally { rmSync(flag, { force: true }); }
+    assert.deepEqual(s.store.latestRuns(REPO, 1, 'apply').map(a => [a.project, a.status]), [['envs/dev', 'failed']]);
+    assert.match(s.gh.comments.map(c => c.body).join('\n'), /`envs\/prod`: skipped: `envs\/dev` failed to apply first/);
+  });
+});
