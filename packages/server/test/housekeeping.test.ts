@@ -75,36 +75,42 @@ test('settings are checked at start-up', async () => {
   assert.throws(() => parseServerPolicy('repos:\n  - id: github.com/a/b\n    log_retention_days: 0\n'), /whole number of days/);
 });
 
-test('key rotation: reminds when the key is due, while nothing runs, weekly until it changes', async () => {
+test('key rotation: reminds when the key is due, then every remind_every_days until it changes', async () => {
   const store = new Store(':memory:');
   const sent: any[] = [];
   const fetchImpl = (async (_u: string, init: RequestInit) => { sent.push(JSON.parse(String(init.body))); return new Response('ok'); }) as typeof fetch;
   let key = { fingerprint: 'aaaaaaaaaaaa', next: false };
-  let busy = false;
   const hk = new Housekeeper({
-    config: { ...config({}), keyRotation: { every_days: 90, notify: ['ops'] } }, store, adapterFor: () => undefined,
-    env: { HOOK: 'https://hook.test' }, fetchImpl, busy: () => busy, appKey: () => key,
+    config: { ...config({}), publicUrl: 'https://teriac.acme.com', keyRotation: { every_days: 90, remind_every_days: 7, notify: ['ops'] } }, store, adapterFor: () => undefined,
+    env: { HOOK: 'https://hook.test' }, fetchImpl, appKey: () => key,
     appSettingsUrl: async () => 'https://github.com/organizations/acme/settings/apps/teriac',
   });
   const day = (n: number) => new Date(Date.parse('2026-01-01T00:00:00Z') + n * 24 * HOUR);
   assert.equal(await hk.keyRotation(day(0)), false, 'first sight: remembered');
   assert.equal(await hk.keyRotation(day(89)), false, 'not due yet');
-  busy = true;
-  assert.equal(await hk.keyRotation(day(91)), false, 'due, but a plan is running: wait');
-  busy = false;
-  assert.equal(await hk.keyRotation(day(91)), true);
+  assert.equal(await hk.keyRotation(day(90)), true, 'due');
   assert.equal(sent[0].title, '🔑 Time to rotate the teriac GitHub App key');
   const text = JSON.stringify(sent[0]);
-  assert.match(text, /91 days old \(rotation every 90 days\)\. No plans or applies are running now\./);
+  assert.equal(sent[0].lines[0], 'The key is **90 days old**. Your rotation cycle is 90 days.');
+  assert.equal(sent[0].lines[2], '**1.** In the [App settings](https://github.com/organizations/acme/settings/apps/teriac), generate a new private key.');
+  assert.equal(sent[0].lines[4], '**3.** Wait an hour, [check nothing is running](https://teriac.acme.com/#runs?status=running), then delete the old key in GitHub.');
+  assert.match(sent[0].lines.at(-1), /Reminds again in 7 days until the key changes/);
   assert.match(text, /settings\/apps\/teriac/);
   assert.match(text, /private-key-next/);
-  assert.equal(await hk.keyRotation(day(95)), false, 'not again within a week');
-  assert.equal(await hk.keyRotation(day(98)), true, 'a week later, still the old key');
+  assert.equal(await hk.keyRotation(day(96)), false, 'not again before remind_every_days');
+  assert.equal(await hk.keyRotation(day(97)), true, '7 days later, still the old key');
   key = { fingerprint: 'bbbbbbbbbbbb', next: true };             // rotated
-  assert.equal(await hk.keyRotation(day(99)), false, 'new key: the count starts again');
-  assert.equal(await hk.keyRotation(day(150)), false);
-  assert.equal(await hk.keyRotation(day(190)), true);
+  assert.equal(await hk.keyRotation(day(98)), false, 'new key: the count starts again');
+  assert.equal(await hk.keyRotation(day(187)), false);
+  assert.equal(await hk.keyRotation(day(188)), true);
   assert.equal(sent.length, 3);
+});
+
+test('key rotation: remind_every_days defaults to 7', async () => {
+  const { parseServerPolicy } = await import('../src/config.ts');
+  const p = parseServerPolicy('repos: [{ id: github.com/a/b }]\nchannels: { ops: { type: webhook, webhook_url_env: HOOK } }\nkey_rotation: { every_days: 90, notify: [ops] }\n');
+  assert.deepEqual(p.keyRotation, { every_days: 90, remind_every_days: 7, notify: ['ops'] });
+  assert.equal(parseServerPolicy('repos: [{ id: github.com/a/b }]\nchannels: { ops: { type: webhook, webhook_url_env: HOOK } }\nkey_rotation: { every_days: 90, remind_every_days: 3, notify: [ops] }\n').keyRotation!.remind_every_days, 3);
 });
 
 test('key rotation: off unless set; checked at start-up', async () => {
@@ -114,4 +120,17 @@ test('key rotation: off unless set; checked at start-up', async () => {
   const { parseServerPolicy } = await import('../src/config.ts');
   assert.throws(() => parseServerPolicy('repos: [{ id: github.com/a/b }]\nkey_rotation: { every_days: 0, notify: [ops] }\n'), /every_days must be a whole number/);
   assert.throws(() => parseServerPolicy('repos: [{ id: github.com/a/b }]\nkey_rotation: { every_days: 90, notify: [nope] }\n'), /no channel named "nope"/);
+  assert.throws(() => parseServerPolicy('repos: [{ id: github.com/a/b }]\nchannels: { ops: { type: webhook, webhook_url_env: HOOK } }\nkey_rotation: { every_days: 90, remind_every_days: 0, notify: [ops] }\n'), /remind_every_days must be/);
+});
+
+test('chat channels get their own link and bold syntax; Teams gets buttons', async () => {
+  const { sendText } = await import('../src/notify.ts');
+  const bodies: any[] = [];
+  const fetchImpl = (async (_u: string, init: RequestInit) => { bodies.push(JSON.parse(String(init.body))); return new Response('ok'); }) as typeof fetch;
+  const msg = { title: 'T', lines: ['**1.** In the [App settings](https://x.test/a), go.'], event: 'e', buttons: [{ title: 'Open App settings', url: 'https://x.test/a' }] };
+  const ctx = { people: [], env: { H: 'https://hook.test' }, fetchImpl };
+  await sendText('s', { type: 'slack', webhook_url_env: 'H' } as any, msg, ctx);
+  await sendText('t', { type: 'teams', webhook_url_env: 'H' } as any, msg, ctx);
+  assert.equal(bodies[0].text, '*T*\n*1.* In the <https://x.test/a|App settings>, go.');
+  assert.deepEqual(bodies[1].attachments[0].content.actions, [{ type: 'Action.OpenUrl', title: 'Open App settings', url: 'https://x.test/a' }]);
 });

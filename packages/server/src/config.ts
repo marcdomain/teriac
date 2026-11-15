@@ -132,7 +132,7 @@ export interface ServerPolicy {
 }
 
 // key_rotation in repos.yaml: remind people to rotate the GitHub App key every N days.
-export interface KeyRotationConfig { every_days: number; notify: string[] }
+export interface KeyRotationConfig { every_days: number; remind_every_days: number; notify: string[] }
 
 export interface GitHubConfig {
   appId: string;
@@ -298,7 +298,8 @@ const validateKeyRotation = (v: unknown, channels: Record<string, ChannelConfig>
   if (typeof r !== 'object' || !(Number.isInteger(r.every_days) && (r.every_days as number) >= 1)) throw new Error('key_rotation.every_days must be a whole number of days, 1 or more');
   if (!Array.isArray(r.notify) || !r.notify.length || r.notify.some(c => typeof c !== 'string')) throw new Error('key_rotation.notify must list one or more channels');
   for (const c of r.notify as string[]) if (!channels[c]) throw new Error(`key_rotation.notify: no channel named "${c}" in repos.yaml`);
-  return { every_days: r.every_days as number, notify: r.notify as string[] };
+  if (r.remind_every_days !== undefined && !(Number.isInteger(r.remind_every_days) && (r.remind_every_days as number) >= 1)) throw new Error('key_rotation.remind_every_days must be a whole number of days, 1 or more');
+  return { every_days: r.every_days as number, remind_every_days: (r.remind_every_days as number | undefined) ?? 7, notify: r.notify as string[] };
 };
 
 export const parseUsers = (list: unknown, where: string): DashboardUser[] => {

@@ -136,6 +136,7 @@ repos: {}
 #    notify: [infra-alerts]
 #  key_rotation:                          # remind to rotate the GitHub App key (see github.privateKeyNext)
 #    every_days: 90
+#    remind_every_days: 7                 # repeat until the key changes (default 7)
 #    notify: [infra-alerts]
 
 dashboard:

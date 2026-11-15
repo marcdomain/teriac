@@ -287,13 +287,16 @@ export const notifyAll = async (names: string[], channels: Record<string, Channe
 
 export interface TextMessage {
   title: string;
-  lines: string[];            // markdown: `code` and **bold**
+  lines: string[];            // markdown: `code`, **bold**, _italic_ and [links](https://...)
   event: string;              // for webhook channels, e.g. "teriac.summary"
   data?: unknown;             // machine-readable details for webhook channels
   url?: string;
+  buttons?: { title: string; url: string }[]; // Teams shows these as buttons
 }
 
 const trim = (s: string, n: number) => (s.length > n ? `${s.slice(0, n - 20)}\n…(truncated)` : s);
+// Slack and Google Chat: *bold* and <url|text> links instead of markdown's.
+const chatMarkup = (s: string) => s.replace(/\*\*(.+?)\*\*/g, '*$1*').replace(/\[([^\]]+)\]\((https?:[^)\s]+)\)/g, '<$2|$1>');
 
 export const sendText = async (name: string, channel: ChannelConfig, msg: TextMessage, ctx: NotifyContext): Promise<void> => {
   const f = ctx.fetchImpl ?? fetch;
@@ -302,7 +305,7 @@ export const sendText = async (name: string, channel: ChannelConfig, msg: TextMe
   switch (channel.type) {
     case 'slack': {
       // Slack's mrkdwn: *bold*, `code`.
-      const text = trim(`*${msg.title}*\n${body.replace(/\*\*(.+?)\*\*/g, '*$1*')}${link}`, 3900);
+      const text = trim(`*${msg.title}*\n${chatMarkup(body)}${link}`, 3900);
       const token = channel.token_env ? secret(ctx.env, channel.token_env, `channel ${name}`) : null;
       if (token && channel.channel) {
         const out = JSON.parse(await post(f, 'https://slack.com/api/chat.postMessage', { channel: channel.channel, text, unfurl_links: false }, { Authorization: `Bearer ${token}` }));
@@ -319,7 +322,8 @@ export const sendText = async (name: string, channel: ChannelConfig, msg: TextMe
           { type: 'TextBlock', size: 'Large', weight: 'Bolder', wrap: true, text: msg.title },
           ...msg.lines.slice(0, 40).map(l => ({ type: 'TextBlock', wrap: true, spacing: 'Small', text: l })),
         ],
-        actions: msg.url ? [{ type: 'Action.OpenUrl', title: 'Open in teriac', url: msg.url }] : [],
+        actions: msg.buttons?.length ? msg.buttons.map(b => ({ type: 'Action.OpenUrl', title: b.title, url: b.url }))
+          : msg.url ? [{ type: 'Action.OpenUrl', title: 'Open in teriac', url: msg.url }] : [],
         msteams: { width: 'Full' },
       };
       await post(f, secret(ctx.env, channel.webhook_url_env, `channel ${name}`), { type: 'message', attachments: [{ contentType: 'application/vnd.microsoft.card.adaptive', contentUrl: null, content: card }] });
@@ -329,7 +333,7 @@ export const sendText = async (name: string, channel: ChannelConfig, msg: TextMe
       await post(f, secret(ctx.env, channel.webhook_url_env, `channel ${name}`), { content: trim(`**${msg.title}**\n${body}${link}`, 1900), allowed_mentions: { parse: [] } });
       return;
     case 'googlechat':
-      await post(f, secret(ctx.env, channel.webhook_url_env, `channel ${name}`), { text: trim(`*${msg.title}*\n${body.replace(/\*\*(.+?)\*\*/g, '*$1*')}${link}`, 4000) });
+      await post(f, secret(ctx.env, channel.webhook_url_env, `channel ${name}`), { text: trim(`*${msg.title}*\n${chatMarkup(body)}${link}`, 4000) });
       return;
     case 'webhook':
       await post(f, secret(ctx.env, channel.webhook_url_env, `channel ${name}`), { event: msg.event, title: msg.title, lines: msg.lines, url: msg.url, data: msg.data ?? null });

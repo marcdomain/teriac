@@ -87,7 +87,6 @@ const grants = new GrantWatcher(grantNotices);
 const summary = new SummaryScheduler({ store, cfg: config.summary, ...chat });
 const housekeeping = new Housekeeper({
   config, store, adapterFor: host => (config.github && host === config.github.host ? adapters.github : undefined),
-  busy: () => { const q = app.runQueue; return q.active > 0 || q.waiting > 0; },
   appKey: () => adapters.github?.keyInUse() ?? null,
   appSettingsUrl: () => adapters.github?.appSettingsUrl() ?? Promise.resolve(null),
 });

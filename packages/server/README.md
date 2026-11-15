@@ -470,12 +470,13 @@ that). It only reminds you when it's time, and switches to the new key without a
 ```yaml
 key_rotation:                           # in repos.yaml; off unless set
   every_days: 90
+  remind_every_days: 7                  # default 7
   notify: [infra-alerts]
 ```
 
 When the key teriac uses is `every_days` old (counted from when teriac first saw it), it sends
-one message with the steps, at a moment when no plan or apply is running, then again weekly
-until the key changes:
+a message with the steps, and again every `remind_every_days` until the key changes. Check the
+dashboard (the message links to running jobs) before deleting the old key:
 
 1. On the App's settings page (linked in the message), **Generate a private key**.
 2. Add it to teriac's GitHub Secret as `private-key-next` (Helm: `github.privateKeyNext`). The

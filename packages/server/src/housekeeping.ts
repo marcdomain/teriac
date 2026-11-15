@@ -4,7 +4,7 @@
 // - remind_unmerged: a PR that was applied but is still open after `after_hours` gets one
 //   reminder, as a comment to whoever applied and/or in chat;
 // - key_rotation: when the GitHub App key in use is `every_days` old, a reminder with the
-//   steps, sent while no plan or apply is running, then weekly until the key changes.
+//   steps, then every `remind_every_days` (default 7) until the key changes.
 import type { ServerConfig, RepoPolicy } from './config.ts';
 import type { Store, Run } from './store.ts';
 import type { Repo, VcsAdapter } from './vcs/types.ts';
@@ -22,13 +22,11 @@ export interface HousekeepingDeps {
   adapterFor: (host: string) => VcsAdapter | undefined;
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
-  busy?: () => boolean;                       // plans or applies running or queued
   appKey?: () => { fingerprint: string; next: boolean } | null;
   appSettingsUrl?: () => Promise<string | null>;
 }
 
 const DAY = 24 * HOUR;
-const REMIND_AGAIN_DAYS = 7;
 
 const policyOf = (config: ServerConfig, repoKey: string): RepoPolicy | undefined => config.repos.find(p => matchGlob(p.id, repoKey));
 
@@ -67,21 +65,25 @@ export class Housekeeper {
     if (age < cfg.every_days) return false;
     const lastKey = `key_reminded:${key.fingerprint}`;
     const last = this.d.store.getSetting(lastKey) as string | null;
-    if (last && now.getTime() - Date.parse(last) < REMIND_AGAIN_DAYS * DAY) return false;
-    if (this.d.busy?.()) return false; // wait for a quiet moment; checked again in 10 minutes
+    if (last && now.getTime() - Date.parse(last) < cfg.remind_every_days * DAY) return false;
     const settings = await this.d.appSettingsUrl?.().catch(() => null) ?? null;
-    const where = settings ? `[the App's settings](${settings})` : "the App's settings (GitHub → Settings → Developer settings → GitHub Apps)";
+    const dashboard = `${this.d.config.publicUrl}/#runs?status=running`;
+    const appSettings = settings ? `[App settings](${settings})` : 'App settings (GitHub → Settings → Developer settings → GitHub Apps)';
     const sent = await notifyText(cfg.notify, this.d.config.channels, {
       title: '🔑 Time to rotate the teriac GitHub App key',
       lines: [
-        `The key teriac uses is ${age} days old (rotation every ${cfg.every_days} days). No plans or applies are running now.`,
-        `1. In ${where}, click **Generate a private key**.`,
-        '2. Add it to teriac\'s GitHub Secret as `private-key-next`. No restart needed.',
-        '3. After an hour, delete the old key in GitHub. teriac switches to the new one by itself.',
-        '4. Then move the new key to `private-key` and remove `private-key-next`.',
+        `The key is **${age} days old**. Your rotation cycle is ${cfg.every_days} days.`,
+        '',
+        `**1.** In the ${appSettings}, generate a new private key.`,
+        '**2.** Add it to the teriac GitHub Secret as `private-key-next`.',
+        `**3.** Wait an hour, [check nothing is running](${dashboard}), then delete the old key in GitHub.`,
+        '**4.** Move the new key to `private-key` and remove `private-key-next`.',
+        '',
+        `_No restart needed. Reminds again in ${cfg.remind_every_days} day${cfg.remind_every_days === 1 ? '' : 's'} until the key changes._`,
       ],
-      event: 'teriac.key_rotation', url: settings ?? undefined,
-      data: { ageDays: age, everyDays: cfg.every_days, keyFingerprint: key.fingerprint, settingsUrl: settings },
+      buttons: [...(settings ? [{ title: 'Open App settings', url: settings }] : []), { title: 'Check running jobs', url: dashboard }],
+      event: 'teriac.key_rotation',
+      data: { ageDays: age, everyDays: cfg.every_days, remindEveryDays: cfg.remind_every_days, keyFingerprint: key.fingerprint, settingsUrl: settings, dashboardUrl: dashboard },
     }, { people: this.d.config.people, env: this.d.env ?? process.env, fetchImpl: this.d.fetchImpl });
     if (!sent.some(r => r.ok)) return false;      // try again next tick
     this.d.store.setSetting(lastKey, now.toISOString());
