@@ -167,7 +167,7 @@ dialog::backdrop { background: rgb(5 6 12 / 0.55); backdrop-filter: blur(3px); }
   background: var(--sunken); border: 1px solid var(--line); border-radius: var(--radius-sm); font-size: 13px; }
 .modal-body .facts span:nth-child(odd) { color: var(--muted); }
 .modal-actions { display: flex; justify-content: flex-end; gap: 8px; }
-button.danger { background: var(--bad); border-color: transparent; color: #fff; box-shadow: none; }
+button.danger { background: var(--bad); border-color: transparent; color: var(--accent-ink); box-shadow: none; }
 button.danger:hover:not(:disabled) { background: var(--bad); filter: brightness(1.08); }
 
 /* toast */
@@ -184,9 +184,9 @@ h2 { font-size: 14px; font-weight: 600; margin: 0; letter-spacing: -0.01em; }
 .page-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 8px 16px; flex-wrap: wrap; padding-bottom: 4px; }
 .page-head > span.muted { flex-basis: 100%; order: 2; font-size: 15px; }
 /* Overview hero, like the site's: a status chip, a big title with a gradient, a lead line. */
-.hero { display: grid; gap: 14px; justify-items: start; padding: 6px 0 4px; }
-.hero h1 { font-size: clamp(30px, 4vw, 44px); letter-spacing: -0.04em; }
-.hero p { font-size: 16px; max-width: 62ch; margin: 0; }
+.ov-hero { display: grid; gap: 14px; justify-items: start; padding: 6px 0 4px; }
+.ov-hero h1 { font-size: clamp(30px, 4vw, 44px); letter-spacing: -0.04em; }
+.ov-hero p { font-size: 16px; max-width: 62ch; margin: 0; }
 .grad { background: var(--grad); -webkit-background-clip: text; background-clip: text; color: transparent; }
 .hero-chip { display: inline-flex; align-items: center; gap: 10px; padding: 4px 12px 4px 4px; border: 1px solid var(--line-strong);
   border-radius: 999px; background: var(--surface); color: var(--muted); font-size: 13px; box-shadow: var(--shadow); }
@@ -446,3 +446,14 @@ a.button.sso.github { background: #1f2328; color: #fff; border-color: #1f2328; }
 a.button.sso.github:hover { background: #32383f; }
 @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) a.button.sso.github { background: #f6f8fa; color: #1f2328; border-color: #f6f8fa; } }
 :root[data-theme="dark"] a.button.sso.github { background: #f6f8fa; color: #1f2328; border-color: #f6f8fa; }
+
+/* "All applies paused" banner and the emergency stop */
+.banner.stop { display: flex; align-items: center; justify-content: space-between; gap: 12px 18px; flex-wrap: wrap;
+  border-color: color-mix(in srgb, var(--warn) 35%, transparent); border-left-color: var(--warn); background: var(--warn-bg); }
+.banner.stop b { color: var(--ink); }
+.stop-row { display: flex; align-items: center; justify-content: space-between; gap: 12px 18px; flex-wrap: wrap; padding: 16px 18px; }
+.stop-row p { margin: 0; max-width: 60ch; }
+label.field { display: grid; gap: 6px; }
+label.field > span { font: 500 10.5px/1 var(--mono); text-transform: uppercase; letter-spacing: 0.12em; color: var(--faint); }
+label.field input { font: 14px var(--font); padding: 10px 12px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--bg-elev); color: var(--ink); }
+label.field input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }

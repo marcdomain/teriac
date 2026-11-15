@@ -382,10 +382,18 @@
     </tr>`;
   };
 
+  // "All applies paused" (the dashboard's emergency stop): who, when, why, and Resume for admins.
+  const pauseBanner = (a) => (a?.paused
+    ? `<div class="banner stop"><div><b>⏸ All applies are paused</b> by ${esc(a.paused.by)} ${esc(ago(a.paused.at))}: ${esc(a.paused.reason)}
+        <div class="muted small">Plans still run. Every apply and state change is refused until someone resumes.</div></div>
+        ${a.canChange ? '<button type="button" class="small" data-resume-applies>Resume applies</button>' : ''}</div>`
+    : '');
+
   const views = {
     async overview() {
-      const [runs, locks, drift, schedules, safety] = await Promise.all([
+      const [runs, locks, drift, schedules, safety, applies] = await Promise.all([
         api('/api/runs?limit=100'), api('/api/locks'), api('/api/drift'), api('/api/drift/schedules'), api('/api/safety').catch(() => null),
+        api('/api/applies').catch(() => null),
       ]);
       const frozen = (safety?.freezes || []).filter(w => w.until);
       const day = Date.now() - 86400e3;
@@ -399,11 +407,12 @@
       const failed = today.filter(r => r.status === 'failed');
       const nextRun = schedules.map(s => s.next).filter(Boolean).sort()[0];
       return `
-        <div class="hero">
-          <span class="hero-chip"><b>${today.some(r => r.status === 'running' || r.status === 'queued') ? '<span class="dot"></span>Running' : 'All quiet'}</b>${esc(today.length)} run${today.length === 1 ? '' : 's'} today · ${esc(locks.length)} locked</span>
+        <div class="ov-hero">
+          <span class="hero-chip"><b>${applies?.paused ? '⏸ Applies paused' : today.some(r => r.status === 'running' || r.status === 'queued') ? '<span class="dot"></span>Running' : 'All quiet'}</b>${esc(today.length)} run${today.length === 1 ? '' : 's'} today · ${esc(locks.length)} locked</span>
           <h1>Your infrastructure, <span class="grad">at a glance.</span></h1>
           <p class="muted">Every plan and apply teriac ran across your repos: what changed, who approved it, and what's still waiting.</p>
         </div>
+        ${pauseBanner(applies)}
         ${frozen.length ? `<div class="banner"><b>Change freeze on:</b> ${frozen.map(w => `${esc(w.name)} until ${esc(w.until)}`).join(', ')} · <a href="#guardrails">Guardrails</a></div>` : ''}
         <div class="tiles">
           <a class="tile" href="${listLink('runs', { range: '24h' })}"><span class="n">${today.length}</span><span class="k">runs in the last 24 hours</span></a>
@@ -538,7 +547,7 @@
     },
 
     async guardrails() {
-      const [g, b] = await Promise.all([api('/api/safety'), api('/api/backups').catch(() => ({ enabled: false }))]);
+      const [g, b, applies] = await Promise.all([api('/api/safety'), api('/api/backups').catch(() => ({ enabled: false })), api('/api/applies').catch(() => null)]);
       if (g.error) return `<div class="page-head"><h1>Guardrails</h1></div><div class="card"><div class="empty">Not available on this server.</div></div>`;
       const people = (list) => (list.length ? list.map(p => `<span class="pill">${esc(p)}</span>`).join(' ') : '<span class="muted">nobody</span>');
       const globs = (list) => (list.length ? list.map(x => `<code>${esc(x)}</code>`).join(', ') : '<span class="muted">all projects</span>');
@@ -548,6 +557,10 @@
       const r = g.risk || {};
       return `
         <div class="page-head"><h1>Guardrails</h1><span class="muted">What stops a risky apply, from repos.yaml</span></div>
+        ${pauseBanner(applies)}
+        ${applies && !applies.paused ? `<div class="card"><div class="card-head"><h2>Emergency stop</h2><span class="muted small">for an incident; planned windows belong in change freezes</span></div>
+          <div class="stop-row"><p class="muted">Pause every apply and state change in every repo, at once. Running applies finish; plans still run.</p>
+          ${applies.canChange ? '<button type="button" class="danger" data-pause-applies>Pause all applies</button>' : '<button type="button" class="ghost" disabled title="Admins only">Pause all applies</button>'}</div></div>` : ''}
         ${on.length ? `<div class="banner"><b>${on.length} change freeze${on.length === 1 ? ' is' : 's are'} on now:</b> ${on.map(w => `${esc(w.name)} (until ${esc(w.until)})`).join(', ')}</div>` : ''}
         <div class="card"><div class="card-head"><h2>Change freezes</h2><span class="muted small">no applies or state edits; plans still run</span></div>
           ${table(['Name', 'Status', 'When', 'Projects', 'Applies to', 'Can override'], g.freezes.map(w => `<tr>
@@ -1233,6 +1246,35 @@
       }
       location.hash = `#metrics?${params}`;
       return;
+    }
+    if (e.target.closest('button[data-pause-applies]')) {
+      const ok = await confirmDialog({
+        title: 'Pause all applies?',
+        body: `<ul>
+            <li>Every apply and state change, in every repo, is refused until someone resumes.</li>
+            <li>Applies already running finish. Plans keep running.</li>
+            <li>The reason is shown on every refused apply and recorded in the audit log.</li>
+          </ul>
+          <label class="field"><span>Reason</span><input id="pause-reason" maxlength="200" placeholder="e.g. incident INC-142: database failover" required></label>`,
+        ok: 'Pause all applies', danger: true,
+      });
+      const reason = $('#pause-reason')?.value.trim();
+      if (!ok) return;
+      if (!reason) return toast('Say why applies are paused; nothing was changed.', true);
+      try {
+        await api('/api/applies/pause', { method: 'POST', body: JSON.stringify({ reason }) });
+        toast('All applies are paused.');
+      } catch (err) { toast(`Could not pause: ${err.message}`, true); }
+      return route();
+    }
+    if (e.target.closest('button[data-resume-applies]')) {
+      const ok = await confirmDialog({ title: 'Resume applies?', body: '<p>Applies and state changes are allowed again, under the usual rules and approvals.</p>', ok: 'Resume applies' });
+      if (!ok) return;
+      try {
+        await api('/api/applies/resume', { method: 'POST' });
+        toast('Applies are allowed again.');
+      } catch (err) { toast(`Could not resume: ${err.message}`, true); }
+      return route();
     }
     const unlock = e.target.closest('button[data-unlock]');
     if (unlock) {
