@@ -1020,3 +1020,35 @@ describe('the unlock permission (releasing another PR\'s lock from the dashboard
     assert.match(alice.reason, /team:sre/);
   });
 });
+
+describe('restarts', () => {
+  test('while shutting down, new and queued events are saved, then replayed on the next start', async () => {
+    const { app, gh, store } = setup();
+    gh.prs.set(1, pr(1, 'bob'));
+    app.drain();
+    await app.handle(gh, { kind: 'comment', repo, prNumber: 1, commentId: '1', author: 'bob', body: 'teriac plan' });
+    assert.equal(store.latestRuns('github.com/acme/infra', 1, 'plan').length, 0, 'not run while shutting down');
+    // The next server: same database.
+    const next = new App({ config: (app as any).deps.config, store, resolver: (app as any).deps.resolver, env: { ...process.env } });
+    assert.equal(await next.replayPending(() => gh), 1);
+    assert.equal(store.latestRuns('github.com/acme/infra', 1, 'plan').length, 2, 'planned after the restart');
+    assert.equal(await next.replayPending(() => gh), 0, 'replayed once');
+  });
+
+  test('runs cut short by a crash: marked failed, checks finished, plan dropped, the PR told what to do', async () => {
+    const { app, gh, store, open } = setup();
+    await open();
+    const plan = store.latestRuns('github.com/acme/infra', 1, 'plan').find(r => r.project === 'envs/dev')!;
+    const stuckPlan = store.startRun({ repo: 'github.com/acme/infra', pr: 1, project: 'envs/dev', workspace: 'default', kind: 'plan', headSha: head, user: 'bob' });
+    const stuckApply = store.startRun({ repo: 'github.com/acme/infra', pr: 1, project: 'envs/prod', workspace: 'default', kind: 'apply', headSha: head, user: 'alice' });
+    assert.equal(await app.recoverInterrupted(() => gh), 2);
+    assert.equal(store.getRun(stuckPlan)!.status, 'failed');
+    assert.match(store.getRun(stuckApply)!.output, /the server restarted while this ran/);
+    assert.equal(store.getRun(plan.id)!.planPath, null, "the project's saved plan is dropped");
+    assert.equal(gh.checks.get('teriac: envs/prod')!.conclusion, 'cancelled');
+    const msg = gh.lastReply();
+    assert.match(msg, /teriac restarted while this PR had work running/);
+    assert.match(msg, /Apply of `envs\/prod`: it may have stopped part-way\. Comment `teriac plan -p envs\/prod`.*force-unlock -p envs\/prod <lock-id>/);
+    assert.equal(await app.recoverInterrupted(() => gh), 0, 'once');
+  });
+});

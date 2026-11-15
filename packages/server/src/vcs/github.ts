@@ -86,6 +86,39 @@ export class GitHubAdapter implements VcsAdapter {
     return { fingerprint: fp(used), next: used !== keys[0] };
   }
 
+  // After a restart: ask GitHub to send again the webhooks that failed since `since` (teriac
+  // was down). A delivery counts as done once any attempt for it succeeded. Returns how many
+  // were redelivered, and how many failed earlier than `since` (too old to replay safely).
+  async redeliverMissed(since: Date, now = new Date()): Promise<{ redelivered: number; tooOld: number }> {
+    const latest = new Map<string, { id: number; at: number; ok: boolean }>();
+    let tooOld = 0;
+    let url: string | null = `${this.cfg.apiUrl}/app/hook/deliveries?per_page=100`;
+    for (let page = 0; url && page < 10; page++) {
+      const res: Response = await this.appFetch(url);
+      if (!res.ok) throw new Error(`GitHub: listing webhook deliveries failed (HTTP ${res.status})`);
+      const list = await res.json() as { id: number; guid: string; delivered_at: string; status_code: number }[];
+      let older = false;
+      for (const d of list) {
+        const at = Date.parse(d.delivered_at);
+        if (at < since.getTime() - 3 * 24 * 3_600_000) { older = true; continue; }
+        const ok = d.status_code >= 200 && d.status_code < 300;
+        const prev = latest.get(d.guid);
+        latest.set(d.guid, { id: prev && prev.at > at ? prev.id : d.id, at: Math.max(prev?.at ?? 0, at), ok: ok || !!prev?.ok });
+        if (at < since.getTime()) older = true;
+      }
+      url = older ? null : (/<([^>]+)>;\s*rel="next"/.exec(res.headers.get('link') ?? '')?.[1] ?? null);
+    }
+    let redelivered = 0;
+    for (const d of latest.values()) {
+      if (d.ok) continue;
+      if (d.at < since.getTime()) { tooOld++; continue; }
+      if (d.at > now.getTime()) continue;
+      const res = await this.appFetch(`${this.cfg.apiUrl}/app/hook/deliveries/${d.id}/attempts`, { method: 'POST' }).catch(() => null);
+      if (res && (res.status === 202 || res.ok)) redelivered++;
+    }
+    return { redelivered, tooOld };
+  }
+
   // Where the App's keys are managed (its settings page).
   async appSettingsUrl(): Promise<string | null> {
     const res = await this.appFetch(`${this.cfg.apiUrl}/app`).catch(() => null);
@@ -475,12 +508,13 @@ export class GitHubAdapter implements VcsAdapter {
 
   // Merges only the commit that was applied (`sha`): a newer push makes GitHub refuse it.
   async mergePullRequest(repo: Repo, number: number, method: 'merge' | 'squash' | 'rebase', sha: string): Promise<{ ok: boolean; message: string }> {
-    const { status, data } = await this.api(repo, 'PUT', `/repos/${repo.fullName}/pulls/${number}/merge`, { merge_method: method, sha }, [405, 409, 422]);
+    const { status, data } = await this.api(repo, 'PUT', `/repos/${repo.fullName}/pulls/${number}/merge`, { merge_method: method, sha }, [403, 405, 409, 422]);
+    if (status === 403) return { ok: false, message: 'the GitHub App needs Contents: Read & write to merge pull requests (App settings → Permissions)' };
     return { ok: status === 200 && data?.merged !== false, message: data?.message ?? `HTTP ${status}` };
   }
 
   async deleteBranch(repo: Repo, branch: string): Promise<boolean> {
-    const { status } = await this.api(repo, 'DELETE', `/repos/${repo.fullName}/git/refs/heads/${branch.split('/').map(encodeURIComponent).join('/')}`, undefined, [404, 422]);
+    const { status } = await this.api(repo, 'DELETE', `/repos/${repo.fullName}/git/refs/heads/${branch.split('/').map(encodeURIComponent).join('/')}`, undefined, [403, 404, 422]);
     return status === 204;
   }
 

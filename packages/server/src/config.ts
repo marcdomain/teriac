@@ -162,6 +162,8 @@ export interface ServerConfig {
   commentMode: 'new' | 'update';              // TERIAC_COMMENT_MODE: a new comment per plan (default) or one updated comment
   moduleAuth?: boolean;                       // TERIAC_MODULE_AUTH: read-only App token for git module downloads (default on)
   logRetentionDays?: number;                  // TERIAC_LOG_RETENTION_DAYS: clear run logs this many days after a PR's last apply
+  redeliverMissed?: boolean;                  // TERIAC_REDELIVER_MISSED (default on): after a restart, ask GitHub to resend failed webhooks
+  redeliverWindowMinutes?: number;            // TERIAC_REDELIVER_WINDOW_MINUTES (default 60): only ones this recent
   spinnerUrl: string | null;                  // animated icon GitHub can load; null → fall back to 👀
   github?: GitHubConfig;
   repos: RepoPolicy[];
@@ -515,6 +517,8 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): ServerConfig =
     commentMode: parseCommentMode(env.TERIAC_COMMENT_MODE, 'TERIAC_COMMENT_MODE') ?? 'new',
     moduleAuth: parseBool(env.TERIAC_MODULE_AUTH, 'TERIAC_MODULE_AUTH') ?? true,
     logRetentionDays: parseDays(env.TERIAC_LOG_RETENTION_DAYS),
+    redeliverMissed: parseBool(env.TERIAC_REDELIVER_MISSED, 'TERIAC_REDELIVER_MISSED') ?? true,
+    redeliverWindowMinutes: Math.max(1, Number(env.TERIAC_REDELIVER_WINDOW_MINUTES || 60)),
     spinnerUrl: spinnerUrlFor(publicUrl),
     github,
     repos,

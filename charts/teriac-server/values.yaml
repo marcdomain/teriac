@@ -98,7 +98,7 @@ repos: {}
 #      allow_fork_prs: false              # default false: PRs from forks are refused
 #      checkout: merge                    # plan the PR merged into its base branch (default: branch, the PR's own commit)
 #      unlock_after_apply: false          # default false: an applied project stays locked until the PR merges or closes
-#      automerge: { method: squash, delete_branch: true }   # merge the PR once everything planned is applied
+#      automerge: { method: squash, delete_branch: true }   # merge the PR once everything planned is applied (App needs Contents: write)
 #      notify_applies: [infra-alerts]     # every apply in this repo, done or failed
 #      log_retention_days: 30             # clear run logs 30 days after a PR's last apply
 #      remind_unmerged: { after_hours: 24, notify: [infra-alerts] }   # applied but not merged after 24 h
@@ -308,8 +308,13 @@ securityContext:
   capabilities:
     drop: [ALL]
 
-# Give running plans and applies time to finish on upgrades and node drains.
-terminationGracePeriodSeconds: 3600
+# Restarts, upgrades and node drains are graceful: on SIGTERM teriac finishes the plans and applies
+# already running (it keeps answering health checks, and says "not ready" so no new traffic comes),
+# saves webhooks and queued commands to run after the restart, and on start asks GitHub to resend
+# webhooks that failed while it was down (TERIAC_REDELIVER_MISSED). Keep this above the longest
+# run (TERIAC_RUN_TIMEOUT_SECONDS, default 3600). A run cut short anyway is marked failed on start
+# and its PR is told what to do.
+terminationGracePeriodSeconds: 4200
 
 podAnnotations: {}
 podLabels: {}

@@ -357,6 +357,63 @@ export class App {
     log.warn('teriac comment changed by someone else', { repo: repoKey, pr: e.prNumber, by: e.by, change: e.change });
   }
 
+  // Shutting down: running work finishes, new and queued events are saved for the next start.
+  private draining = false;
+  drain() { this.draining = true; }
+  get isDraining() { return this.draining; }
+
+  private park(adapter: VcsAdapter, event: VcsEvent) {
+    this.deps.store.savePendingEvent(adapter.platform, event);
+    log.info('shutting down: event saved for the next start', { kind: event.kind, repo: 'repo' in event ? `${event.repo.host}/${event.repo.fullName}` : '' });
+  }
+
+  // On start: the events saved while the last server shut down, in order.
+  async replayPending(adapterFor: (platform: string) => VcsAdapter | undefined): Promise<number> {
+    const pending = this.deps.store.takePendingEvents();
+    for (const p of pending) {
+      const adapter = adapterFor(p.platform);
+      if (!adapter) continue;
+      log.info('replaying an event saved at shutdown', { kind: p.event.kind });
+      await this.handle(adapter, p.event as VcsEvent).catch(err => log.error('replayed event failed', { err }));
+    }
+    return pending.length;
+  }
+
+  // On start: runs a restart or crash cut short. They're marked failed, their checks are
+  // finished, half-written plans are dropped, and each PR is told what to do next.
+  async recoverInterrupted(adapterFor: (host: string) => VcsAdapter | undefined): Promise<number> {
+    const { store } = this.deps;
+    const runs = store.unfinishedRuns();
+    const byPr = new Map<string, Run[]>();
+    for (const r of runs) {
+      store.finishRun(r.id, { status: 'failed', engine: r.engine, summary: r.summary, output: `${r.output ? `${r.output}\n` : ''}[teriac] the server restarted while this ran, so it stopped here.` });
+      if (r.kind === 'plan') store.discardPlans(r.repo, r.pr, r.project).forEach(p => { rmSync(p, { force: true }); rmSync(`${p}.json`, { force: true }); });
+      store.audit({ repo: r.repo, pr: r.pr, user: r.user, action: `${r.kind}_interrupted`, project: r.project, allowed: false, reason: 'the server restarted while this ran' });
+      byPr.set(`${r.repo}#${r.pr}`, [...(byPr.get(`${r.repo}#${r.pr}`) ?? []), r]);
+    }
+    const cmd = this.deps.config.commandNames[0];
+    for (const list of byPr.values()) {
+      const [host, owner, ...rest] = list[0].repo.split('/');
+      const adapter = adapterFor(host);
+      if (!adapter) continue;
+      const repo: Repo = { platform: adapter.platform, host, owner, name: rest.join('/'), fullName: `${owner}/${rest.join('/')}`, cloneUrl: '' };
+      for (const r of list) {
+        await adapter.setCheck(repo, { name: `teriac: ${r.project}`, headSha: r.headSha, externalId: r.project, status: 'completed', conclusion: 'cancelled',
+          title: `${r.kind === 'apply' ? 'Apply' : 'Plan'} stopped: teriac restarted`, summary: `teriac restarted while this ${r.kind} ran. See the PR for what to do next.` }).catch(() => {});
+      }
+      const applies = list.filter(r => r.kind === 'apply').map(r => r.project);
+      const plans = list.filter(r => r.kind !== 'apply').map(r => r.project);
+      const lines = ['⚠️ **teriac restarted while this PR had work running**, so it stopped.'];
+      if (plans.length) lines.push(`- Plan of ${plans.map(p => `\`${p}\``).join(', ')}: nothing was changed. Comment \`${cmd} plan\` to plan again.`);
+      for (const p of applies) {
+        lines.push(`- Apply of \`${p}\`: it may have stopped part-way. Comment \`${cmd} plan -p ${p}\` to see what's left, then apply that plan. If Terraform says the state is locked, release it with \`${cmd} force-unlock -p ${p} <lock-id>\`.`);
+      }
+      await adapter.comment(repo, list[0].pr, lines.join('\n')).catch(err => log.warn('could not tell the PR about an interrupted run', { err: (err as Error).message }));
+    }
+    if (runs.length) log.warn('runs cut short by a restart were marked failed', { runs: runs.length });
+    return runs.length;
+  }
+
   async handle(rawAdapter: VcsAdapter, event: VcsEvent): Promise<void> {
     if (event.kind === 'ignored') return;
     const adapter = this.recording(rawAdapter);
@@ -385,9 +442,12 @@ export class App {
         return this.respond(reply, () => this.cancel(adapter, event.repo, number, event.user, reply));
       }
     }
+    if (this.draining) return this.park(rawAdapter, event);
     if (event.kind === 'pr_opened' || event.kind === 'pr_updated') this.latestHead.set(key, event.pr.headSha);
     if (event.kind === 'pr_closed') this.latestHead.delete(key);
     return this.queue.run(key, async () => {
+      // Queued behind other work when shutdown began: run it after the restart instead.
+      if (this.draining) return this.park(rawAdapter, event);
       try {
         switch (event.kind) {
           case 'pr_opened': case 'pr_updated':

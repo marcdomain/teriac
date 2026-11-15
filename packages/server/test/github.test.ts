@@ -281,3 +281,34 @@ test('rotation: key files are re-read when they change, without a restart', asyn
     rmSync(dir, { recursive: true, force: true });
   }
 });
+
+test('after a restart: failed webhooks since then are resent once; older ones are only counted', async () => {
+  const now = new Date('2026-11-15T12:00:00Z');
+  const at = (minAgo: number) => new Date(now.getTime() - minAgo * 60_000).toISOString();
+  const deliveries = [
+    { id: 1, guid: 'a', delivered_at: at(5), status_code: 0 },     // failed during the restart
+    { id: 2, guid: 'b', delivered_at: at(6), status_code: 502 },   // failed, then
+    { id: 3, guid: 'b', delivered_at: at(4), status_code: 202 },   // ...a later attempt succeeded
+    { id: 4, guid: 'c', delivered_at: at(3), status_code: 202 },   // fine
+    { id: 5, guid: 'd', delivered_at: at(180), status_code: 0 },   // failed 3 hours ago: too old
+  ];
+  const posted: string[] = [];
+  const fetchImpl = (async (url: string, init?: RequestInit) => {
+    if (init?.method === 'POST') { posted.push(url); return new Response('', { status: 202 }); }
+    return Response.json(deliveries);
+  }) as typeof fetch;
+  const a = new GitHubAdapter(cfg, fetchImpl);
+  const r = await a.redeliverMissed(new Date(now.getTime() - 60 * 60_000), now);
+  assert.deepEqual(r, { redelivered: 1, tooOld: 1 });
+  assert.deepEqual(posted, ['https://api.github.com/app/hook/deliveries/1/attempts']);
+});
+
+test('automerge without Contents: write says which permission to add', async () => {
+  const fetchImpl = (async (url: string) => {
+    if (url.includes('/access_tokens')) return Response.json({ token: 'ghs_x', expires_at: new Date(Date.now() + 3_600_000).toISOString() }, { status: 201 });
+    return new Response('{"message":"Resource not accessible by integration"}', { status: 403 });
+  }) as typeof fetch;
+  const a = new GitHubAdapter(cfg, fetchImpl);
+  const repo = { platform: 'github', host: 'github.com', owner: 'acme', name: 'infra', fullName: 'acme/infra', cloneUrl: '', installationId: 9 } as any;
+  assert.deepEqual(await a.mergePullRequest(repo, 7, 'squash', 'abc'), { ok: false, message: 'the GitHub App needs Contents: Read & write to merge pull requests (App settings → Permissions)' });
+});

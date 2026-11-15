@@ -159,6 +159,9 @@ CREATE TABLE IF NOT EXISTS grants (
   created_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT, revoked_by TEXT, used_at TEXT,
   expiry_noted INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS pending_events (
+  id INTEGER PRIMARY KEY AUTOINCREMENT, platform TEXT NOT NULL, event TEXT NOT NULL, at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS dashboard_access (
   sub TEXT PRIMARY KEY, repos TEXT NOT NULL, role TEXT NOT NULL DEFAULT 'viewer', at TEXT NOT NULL
 );
@@ -274,6 +277,23 @@ export class Store {
         AND r.id = (SELECT MAX(id) FROM runs x WHERE x.repo = r.repo AND x.pr = r.pr AND x.kind = 'apply' AND x.status = 'success')
         AND NOT EXISTS (SELECT 1 FROM closed_prs c WHERE c.repo = r.repo AND c.pr = r.pr)
     `).all(before) as Record<string, any>[]).map(toRun);
+  }
+
+  // ---- restarts ----
+
+  // Events that arrived while the server was shutting down, replayed on the next start.
+  savePendingEvent(platform: string, event: unknown): void {
+    this.db.prepare('INSERT INTO pending_events (platform, event, at) VALUES (?, ?, ?)').run(platform, JSON.stringify(event), now());
+  }
+  takePendingEvents(): { platform: string; event: any }[] {
+    const rows = this.db.prepare('SELECT id, platform, event FROM pending_events ORDER BY id').all() as { id: number; platform: string; event: string }[];
+    if (rows.length) this.db.prepare(`DELETE FROM pending_events WHERE id <= ?`).run(rows.at(-1)!.id);
+    return rows.map(r => ({ platform: r.platform, event: JSON.parse(r.event) }));
+  }
+
+  // Runs still marked running or queued: on start, these were cut short by a restart or crash.
+  unfinishedRuns(): Run[] {
+    return (this.db.prepare(`SELECT * FROM runs WHERE status IN ('running', 'queued') ORDER BY id`).all() as Record<string, any>[]).map(toRun);
   }
 
   // ---- dashboard users who sign in with GitHub: the repos they may see ----

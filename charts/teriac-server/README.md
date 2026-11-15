@@ -40,7 +40,7 @@ dashboard:
 Then:
 1. Point the GitHub App's webhook at `https://teriac.acme.dev/events/github`, with the events
    Pull request, Issue comment and Check run. The App needs **Checks**, **Issues** and **Pull
-   requests** (read & write), **Contents** (read; read & write only for drift fix PRs) and
+   requests** (read & write), **Contents** (read; read & write only for drift fix PRs and automerge) and
    organization **Members** (read). The [server README](../../packages/server/README.md#quick-start)
    says what each one is for.
 2. Register `https://teriac.acme.dev/auth/oidc/callback` as the redirect URI with Okta.
