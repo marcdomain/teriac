@@ -399,7 +399,11 @@
       const failed = today.filter(r => r.status === 'failed');
       const nextRun = schedules.map(s => s.next).filter(Boolean).sort()[0];
       return `
-        <div class="page-head"><h1>Overview</h1><span class="muted">Everything teriac did across your repos</span></div>
+        <div class="hero">
+          <span class="hero-chip"><b>${today.some(r => r.status === 'running' || r.status === 'queued') ? '<span class="dot"></span>Running' : 'All quiet'}</b>${esc(today.length)} run${today.length === 1 ? '' : 's'} today · ${esc(locks.length)} locked</span>
+          <h1>Your infrastructure, <span class="grad">at a glance.</span></h1>
+          <p class="muted">Every plan and apply teriac ran across your repos: what changed, who approved it, and what's still waiting.</p>
+        </div>
         ${frozen.length ? `<div class="banner"><b>Change freeze on:</b> ${frozen.map(w => `${esc(w.name)} until ${esc(w.until)}`).join(', ')} · <a href="#guardrails">Guardrails</a></div>` : ''}
         <div class="tiles">
           <a class="tile" href="${listLink('runs', { range: '24h' })}"><span class="n">${today.length}</span><span class="k">runs in the last 24 hours</span></a>

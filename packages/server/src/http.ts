@@ -37,6 +37,11 @@ for (const [path, file, type] of [
 ] as const) {
   try { WEB[path] = { type, body: readFileSync(join(WEB_DIR, file), 'utf-8') }; } catch { /* dashboard not shipped */ }
 }
+// Fonts (Geist, SIL Open Font License; web/fonts/LICENSE-Geist.txt), served from here.
+const FONTS: Record<string, Buffer> = {};
+for (const f of ['geist-latin-wght-normal.woff2', 'geist-mono-latin-wght-normal.woff2']) {
+  try { FONTS[`/fonts/${f}`] = readFileSync(join(WEB_DIR, 'fonts', f)); } catch { /* not shipped */ }
+}
 // The spinner GitHub shows in teriac's "Running…" replies (fetched by GitHub, so no auth).
 let SPINNER: Buffer | null = null;
 try { SPINNER = readFileSync(join(WEB_DIR, 'spinner.gif')); } catch { /* not shipped */ }
@@ -592,6 +597,11 @@ export const createHttpServer = (deps: HttpDeps): Server => {
       return send(res, 404, { error: 'not found' });
     }
 
+    const font = req.method === 'GET' ? FONTS[url.pathname] : undefined;
+    if (font) {
+      res.writeHead(200, { 'Content-Type': 'font/woff2', 'Cache-Control': 'public, max-age=604800, immutable', 'X-Content-Type-Options': 'nosniff' });
+      return res.end(font);
+    }
     const page = req.method === 'GET' ? WEB[url.pathname] : undefined;
     if (page) {
       res.writeHead(200, { 'Content-Type': page.type, ...WEB_HEADERS });
