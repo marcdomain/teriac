@@ -509,6 +509,16 @@ export class App {
   }
 
   // Hides possible secrets in tool output; "fail" mode also refuses to keep the run.
+  // A PR from a fork runs an outsider's code with this server's credentials (cloud access,
+  // state, the GitHub App), so it isn't planned or applied unless the repo allows forks.
+  private async forkRefusal(adapter: VcsAdapter, policy: RepoPolicy, repo: Repo, number: number): Promise<string | null> {
+    if (policy.allow_fork_prs) return null;
+    const pr = await adapter.getPullRequest(repo, number);
+    if (!pr.fromFork) return null;
+    return '🚫 teriac doesn\'t plan or apply pull requests from forks: their code would run with this server\'s credentials. '
+      + 'Push the branch to this repository instead, or ask an admin to allow forks for this repo (`allow_fork_prs: true` in repos.yaml).';
+  }
+
   // Live output of one run, cleaned with the repo's secret scan settings.
   private liveFor(ctx: PrContext, project: Project, runId: number): LiveWriter {
     const s = this.safety(ctx);
@@ -517,12 +527,13 @@ export class App {
 
   // Saved plans (the plan file and its JSON) and live output are dropped when a lock is
   // released or the PR closes: they were made under that lock.
-  private forgetPlans(repoKey: string, pr: number, project?: string) {
+  // Only files go: runs, their output and the PR's comments stay, as history.
+  private forgetPlans(repoKey: string, pr: number, project?: string, opts: { keepLive?: boolean } = {}) {
     for (const path of this.deps.store.discardPlans(repoKey, pr, project)) {
       rmSync(path, { force: true });
       rmSync(`${path}.json`, { force: true });
     }
-    this.live.dropPr(`${repoKey}#${pr}`, project);
+    if (!opts.keepLive) this.live.dropPr(`${repoKey}#${pr}`, project);
   }
 
   private scan(ctx: PrContext, text: string): { text: string; found: string[]; fail: boolean } {
@@ -541,6 +552,13 @@ export class App {
 
   private async autoplan(adapter: VcsAdapter, policy: RepoPolicy, repo: Repo, number: number) {
     if (policy.autoplan === false) return;
+    // A fork's PR is not checked out or planned (unless the repo allows forks); one
+    // comment, kept up to date, says why.
+    const fork = await this.forkRefusal(adapter, policy, repo, number);
+    if (fork) {
+      await this.recording(adapter).upsertComment(repo, number, '<!-- teriac:fork -->', `<!-- teriac:fork -->\n${fork}`).catch(err => log.warn('fork notice failed', { err }));
+      return;
+    }
     const ctx = await this.context(adapter, policy, repo, number);
     if (ctx.pr.draft && !policy.plan_drafts) return;
     const targets = affectedProjects(ctx.projects, await adapter.changedFiles(repo, number));
@@ -627,6 +645,12 @@ export class App {
     if (cmd.verb === 'help') {
       const oneAtATime = this.deps.config.requireApplyProject || policy.require_apply_project === true;
       return reply.say(helpText(name, oneAtATime));
+    }
+    // Checked before anything is checked out: a fork's code must not run here.
+    const fork = await this.forkRefusal(adapter, policy, repo, number);
+    if (fork) {
+      this.deps.store.audit({ repo: this.repoKey(repo), pr: number, user, action: cmd.verb, project: cmd.project ?? '*', allowed: false, reason: 'pull request from a fork' });
+      return reply.say(fork);
     }
     if (cmd.targets.length && policy.allow_targets === false) {
       return reply.say('❌ Targeted plans are turned off for this repo (`allow_targets` in repos.yaml).');
@@ -1235,6 +1259,9 @@ export class App {
       this.auditSecrets(ctx, user, project, scanned.found, 'apply');
       // The counts are saved now, so the Metrics page never has to read logs.
       store.finishRun(runId, { status: r.ok ? 'success' : 'failed', engine, output: scanned.text, summary: plan.summary, usage: r.usage ?? null, applied: parseApplyResult(r.output), secrets: scanned.found });
+      // An applied plan can't be applied again (Terraform calls it stale): free its space.
+      // Its run and output stay; the apply's live output stays for anyone still watching.
+      if (r.ok) this.forgetPlans(ctx.repoKey, ctx.pr.number, project.name, { keepLive: true });
     } catch (err) {
       store.finishRun(runId, { status: 'failed', engine, output: `teriac could not apply this project: ${(err as Error).message}` });
     } finally {

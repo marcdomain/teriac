@@ -49,6 +49,7 @@ export interface RepoPolicy {
   apply_requirements?: Requirement[];
   allow_repo_config?: boolean;                // read the repo's teriac.yaml (default true)
   allow_extra_args?: boolean;                 // `teriac plan -- -var=x` (default false)
+  allow_fork_prs?: boolean;                   // plan and apply PRs from forks (default false: their code would run with this server's credentials)
   autoplan?: boolean;                         // default true
   plan_drafts?: boolean;                      // default false
   allow_repo_schedules?: boolean;             // drift schedules from teriac.yaml (default true)
@@ -304,6 +305,7 @@ export const parseReposYaml = (text: string): RepoPolicy[] => {
     validateBool(repo.reapprove_on_change, `${at}.reapprove_on_change`);
     validateBool(repo.keep_approval_on_rebase, `${at}.keep_approval_on_rebase`);
     validateBool(repo.verify_plan, `${at}.verify_plan`);
+    validateBool(repo.allow_fork_prs, `${at}.allow_fork_prs`);
     validateStaleBase(repo.stale_base, `${at}.stale_base`);
     if (repo.secret_scan !== undefined) {
       // `secret_scan: fail`, or `{ mode, patterns }`: the repo's patterns add to the server's.

@@ -48,6 +48,7 @@ start_server() {
     -e TERIAC_BACKUP_BACKEND=s3 -e TERIAC_BACKUP_BUCKET=backups -e TERIAC_BACKUP_PATH="${2:-teriac/e2e}" \
     -e TERIAC_BACKUP_S3_ENDPOINT="http://$S3:9000" -e TERIAC_BACKUP_S3_REGION=us-east-1 \
     -e AWS_ACCESS_KEY_ID="$KEY" -e AWS_SECRET_ACCESS_KEY="${1:-$SECRET}" \
+    -e RCLONE_CONTIMEOUT=3s -e RCLONE_RETRIES=1 -e RCLONE_LOW_LEVEL_RETRIES=1 \
     "$IMAGE" >/dev/null
   docker start "$SRV" >/dev/null
 }
@@ -94,13 +95,14 @@ api "localhost:$PORT/api/backups" | grep -q '"trigger":"schedule","ok":true' || 
 curl -s "localhost:$PORT/metrics" | grep -q '^teriac_backup_last_ok 1' || fail "metrics"
 ok "schedule (* * * * *): backed up on its own; metrics say ok"
 
-# Upload fails while the bucket is down: recorded, nothing left behind, then recovers.
-docker stop "$S3" >/dev/null
+# Upload fails while the bucket can't be reached (nothing answers, as when its host is
+# gone): recorded, nothing left behind, then recovers. Short rclone timeouts keep it quick.
+docker network disconnect "$NET" "$S3"
 code=$(api -o "$WORK/fail.json" -w '%{http_code}' -X POST "localhost:$PORT/api/backups/run")
 [ "$code" = 502 ] || fail "expected 502 while the bucket is down, got $code"
 [ -z "$(leftovers)" ] || fail "copies left after a failed upload: $(leftovers)"
 curl -s "localhost:$PORT/metrics" | grep -q '^teriac_backup_last_ok 0' || fail "metrics after failure"
-docker start "$S3" >/dev/null
+docker network connect --alias "$S3" "$NET" "$S3"
 sleep 2
 api -X POST "localhost:$PORT/api/backups/run" | grep -q '"ok":true' || fail "backup after the bucket came back"
 ok "bucket down: backup fails cleanly (502, nothing left on the volume) and works again after"

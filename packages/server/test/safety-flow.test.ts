@@ -644,3 +644,53 @@ test('while a plan runs, its check links to the live output (the PR\'s "Details"
   assert.match(running.detailsUrl!, /^https:\/\/teriac\.example\.com\/#runs\/acme\/infra\/pull\/1\/\d+$/);
   assert.match(running.summary, /▶ \[Watch the live output\]\(https:\/\/teriac\.example\.com\/#runs\/acme\/infra\/pull\/1\/\d+\)/);
 });
+
+// ---------------------------------------------------------------------------
+describe('pull requests from forks', () => {
+  const forkPr = () => ({ ...pr(1, 'bob'), fromFork: true });
+
+  test('not planned on open or push: nothing is checked out, one comment says why', async () => {
+    const { gh, store, app, dataDir } = setup();
+    gh.prs.set(1, forkPr());
+    await app.handle(gh, { kind: 'pr_opened', repo, pr: forkPr() });
+    await app.handle(gh, { kind: 'pr_updated', repo, pr: forkPr() });
+    assert.equal(store.latestRuns('github.com/acme/infra', 1, 'plan').length, 0);
+    assert.ok(!existsSync(join(dataDir, 'work/github.com/acme/infra/1')), 'the fork\'s code was never checked out');
+    assert.match(gh.sticky.get(1)!, /doesn't plan or apply pull requests from forks/);
+  });
+
+  test('commands on a fork PR are refused and audited, even from an admin', async () => {
+    const { gh, store, say } = setup();
+    gh.prs.set(1, forkPr());
+    await say('alice', 'teriac plan -p envs/dev');
+    assert.match(gh.lastReply(), /doesn't plan or apply pull requests from forks/);
+    await say('alice', 'teriac apply -p envs/dev');
+    assert.equal(store.latestRuns('github.com/acme/infra', 1, 'plan').length, 0);
+    assert.ok(store.auditLog(10).some(a => !a.allowed && a.reason === 'pull request from a fork'));
+    await say('alice', 'teriac help');
+    assert.doesNotMatch(gh.lastReply(), /forks/, 'help still works');
+  });
+
+  test('allow_fork_prs: true plans them (the author still needs plan rights)', async () => {
+    const { gh, store, app } = setup('    allow_fork_prs: true\n');
+    gh.prs.set(1, forkPr());
+    await app.handle(gh, { kind: 'pr_opened', repo, pr: forkPr() });
+    assert.equal(store.latestRuns('github.com/acme/infra', 1, 'plan').length, 2);
+  });
+});
+
+test('after a successful apply its plan file is deleted; the runs, output and comments stay', async () => {
+  const { gh, store, say, open } = setup();
+  await open();
+  gh.reviewsByPr.set(1, [{ user: 'carol', state: 'approved', commitSha: head }]);
+  const plan = store.latestRuns('github.com/acme/infra', 1, 'plan').find(r => r.project === 'envs/dev')!;
+  assert.ok(existsSync(plan.planPath!));
+  const comments = gh.comments.length;
+  await say('erin', 'teriac apply -p envs/dev');
+  const apply = store.latestRuns('github.com/acme/infra', 1, 'apply').find(r => r.project === 'envs/dev')!;
+  assert.equal(apply.status, 'success');
+  assert.ok(!existsSync(plan.planPath!) && !existsSync(`${plan.planPath}.json`), 'plan file and its JSON deleted');
+  const kept = store.getRun(plan.id)!;
+  assert.ok(kept.output.length > 0 && kept.summary, 'the plan run keeps its output and summary');
+  assert.ok(gh.comments.length > comments && gh.sticky.get(1), 'comments are added, never removed');
+});

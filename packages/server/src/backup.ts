@@ -96,7 +96,16 @@ export interface Remote {
 }
 
 export const rcloneEnv = (c: BackupConfig): Record<string, string> => {
-  const e: Record<string, string> = { RCLONE_CONFIG: '/dev/null' };
+  const e: Record<string, string> = {
+    RCLONE_CONFIG: '/dev/null',
+    // Give up on an unreachable bucket in about a minute, not 12: without a connect
+    // timeout, a host that doesn't answer makes every retry wait for the system's own.
+    // Set the same RCLONE_* variables on the server to change them.
+    RCLONE_CONTIMEOUT: process.env.RCLONE_CONTIMEOUT ?? '10s',
+    RCLONE_TIMEOUT: process.env.RCLONE_TIMEOUT ?? '60s',
+    RCLONE_RETRIES: process.env.RCLONE_RETRIES ?? '2',
+    RCLONE_LOW_LEVEL_RETRIES: process.env.RCLONE_LOW_LEVEL_RETRIES ?? '3',
+  };
   const set = (k: string, v: string | undefined) => { if (v) e[`RCLONE_CONFIG_TERIAC_${k}`] = v; };
   if (c.backend === 's3') {
     set('TYPE', 's3');
@@ -137,7 +146,7 @@ export const rcloneRemote = (c: BackupConfig, bin = process.env.TERIAC_RCLONE_BI
   addSecret(c.azure.key);
   const base = `teriac:${c.bucket}/${c.path}`;
   const run = (args: string[]) => new Promise<string>((resolve, reject) => {
-    const child = spawn(bin, [...args, '--retries', '3', '--low-level-retries', '10', '--stats', '0'], {
+    const child = spawn(bin, [...args, '--stats', '0'], {
       env: { ...process.env, ...rcloneEnv(c) }, stdio: ['ignore', 'pipe', 'pipe'],
     });
     let out = '', err = '';

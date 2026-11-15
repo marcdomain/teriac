@@ -549,7 +549,9 @@ that matters to you.
 **Watching it.** The dashboard's **Guardrails** page shows the destination, the next
 backup, the latest results and a **Back up now** button for admins (audited).
 `/metrics` has `teriac_backup_last_ok` and `teriac_backup_last_success_timestamp_seconds`,
-for an alert such as "no good backup in 26 hours". A backup needs free space on the
+for an alert such as "no good backup in 26 hours". A bucket that can't be reached fails the backup in about a minute (rclone's
+`RCLONE_CONTIMEOUT`, `RCLONE_TIMEOUT`, `RCLONE_RETRIES` and `RCLONE_LOW_LEVEL_RETRIES` can be set on the
+server to change that). A backup needs free space on the
 volume about the size of the database while it runs.
 
 Docker:
