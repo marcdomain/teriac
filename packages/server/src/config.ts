@@ -1,6 +1,6 @@
 // Server configuration: environment variables plus the server-side repos.yaml
 // policy file. The repo-side teriac.yaml is in repoConfig.ts.
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import YAML from 'yaml';
 import { parseCron, validTimeZone } from './cron.ts';
@@ -49,6 +49,14 @@ export interface RepoPolicy {
   apply_requirements?: Requirement[];
   allow_repo_config?: boolean;                // read the repo's teriac.yaml (default true)
   allow_extra_args?: boolean;                 // `teriac plan -- -var=x` (default false)
+  allow_fork_prs?: boolean;                   // plan and apply PRs from forks (default false: their code would run with this server's credentials)
+  notify_applies?: string[];                  // channels told about every apply in this repo (done or failed)
+  unlock_after_apply?: boolean;               // free a project's lock once applied (default: held until merge/close/unlock)
+  checkout?: 'branch' | 'merge';              // plan the PR's own commit (default) or its merge into the base branch
+  automerge?: boolean | { method?: 'merge' | 'squash' | 'rebase'; delete_branch?: boolean }; // merge the PR once everything planned is applied
+  log_retention_days?: number;                // clear this repo's run logs this many days after a PR's last apply
+  remind_unmerged?: { after_hours: number; notify?: string[]; comment?: boolean }; // applied but not merged after this long: remind
+  hooks?: Partial<Record<'pre_plan' | 'post_plan' | 'pre_apply' | 'post_apply', { name: string; run: string }[]>>; // server-only commands around plans and applies
   autoplan?: boolean;                         // default true
   plan_drafts?: boolean;                      // default false
   allow_repo_schedules?: boolean;             // drift schedules from teriac.yaml (default true)
@@ -120,7 +128,11 @@ export interface ServerPolicy {
   protected?: ProtectedConfig;
   breakGlass?: BreakGlassConfig;
   summary?: SummaryConfig;
+  keyRotation?: KeyRotationConfig;
 }
+
+// key_rotation in repos.yaml: remind people to rotate the GitHub App key every N days.
+export interface KeyRotationConfig { every_days: number; remind_every_days: number; notify: string[] }
 
 export interface GitHubConfig {
   appId: string;
@@ -128,6 +140,11 @@ export interface GitHubConfig {
   webhookSecret: string;
   apiUrl: string;
   host: string;
+  clientId?: string;      // TERIAC_GITHUB_CLIENT_ID: the App's client ID (JWT issuer; GitHub sign-in)
+  clientSecret?: string;  // TERIAC_GITHUB_CLIENT_SECRET: for "Sign in with GitHub" on the dashboard
+  // Key rotation: the keys and webhook secrets in force now, current first. Files are
+  // re-read when they change, so a rotated Kubernetes Secret applies without a restart.
+  secrets?: () => { keys: string[]; webhookSecrets: string[] };
 }
 
 export interface ServerConfig {
@@ -144,6 +161,7 @@ export interface ServerConfig {
   progressReply: boolean;                     // TERIAC_PROGRESS_REPLY: spinning "Running…" reply, edited into the result (default off)
   commentMode: 'new' | 'update';              // TERIAC_COMMENT_MODE: a new comment per plan (default) or one updated comment
   moduleAuth?: boolean;                       // TERIAC_MODULE_AUTH: read-only App token for git module downloads (default on)
+  logRetentionDays?: number;                  // TERIAC_LOG_RETENTION_DAYS: clear run logs this many days after a PR's last apply
   spinnerUrl: string | null;                  // animated icon GitHub can load; null → fall back to 👀
   github?: GitHubConfig;
   repos: RepoPolicy[];
@@ -157,8 +175,27 @@ export interface ServerConfig {
   protected?: ProtectedConfig;
   breakGlass?: BreakGlassConfig;
   summary?: SummaryConfig;
+  keyRotation?: KeyRotationConfig;        // key_rotation in repos.yaml
   backup?: BackupConfig;                  // scheduled database backups (TERIAC_BACKUP_*)
 }
+
+// A secret that may change while the server runs: re-read from its file when the file
+// changes (a missing or empty file means "not set").
+const liveSecret = (env: NodeJS.ProcessEnv, name: string): (() => string | undefined) => {
+  const file = env[`${name}_FILE`];
+  if (!file) { const v = env[name]?.trim(); return () => v || undefined; }
+  let seen = -1;
+  let value: string | undefined;
+  return () => {
+    let m = 0;
+    try { m = statSync(file).mtimeMs; } catch { seen = -1; return (value = undefined); }
+    if (m !== seen) {
+      seen = m;
+      try { value = readFileSync(file, 'utf-8').trim() || undefined; } catch { value = undefined; }
+    }
+    return value;
+  };
+};
 
 const readSecret = (env: NodeJS.ProcessEnv, name: string): string | undefined => {
   const file = env[`${name}_FILE`];
@@ -235,6 +272,14 @@ export const parseServerPolicy = (text: string): ServerPolicy => {
   }
   const policies = validatePolicies(doc.policies, 'policies');
   for (const [i, r] of repos.entries()) r.policies = validatePolicies(r.policies, `repos[${i}].policies`);
+  for (const [i, r] of repos.entries()) {
+    if (r.notify_applies === undefined) continue;
+    if (!Array.isArray(r.notify_applies) || r.notify_applies.some(c => typeof c !== 'string')) throw new Error(`repos[${i}].notify_applies must be a list of channel names`);
+    for (const c of r.notify_applies) if (!channels[c]) throw new Error(`repos[${i}].notify_applies: no channel named "${c}" in repos.yaml`);
+  }
+  for (const [i, r] of repos.entries()) {
+    for (const c of r.remind_unmerged?.notify ?? []) if (!channels[c]) throw new Error(`repos[${i}].remind_unmerged.notify: no channel named "${c}" in repos.yaml`);
+  }
   return {
     repos, channels, people, users, policies,
     secretScan: validateSecretScan(doc.secret_scan, 'secret_scan'),
@@ -243,7 +288,18 @@ export const parseServerPolicy = (text: string): ServerPolicy => {
     protected: validateProtected(doc.protected, 'protected'),
     breakGlass: validateBreakGlass(doc.break_glass, 'break_glass', channels),
     summary: validateSummary(doc.summary, 'summary', channels),
+    keyRotation: validateKeyRotation(doc.key_rotation, channels),
   };
+};
+
+const validateKeyRotation = (v: unknown, channels: Record<string, ChannelConfig>): KeyRotationConfig | undefined => {
+  if (v === undefined || v === null) return undefined;
+  const r = v as Record<string, unknown>;
+  if (typeof r !== 'object' || !(Number.isInteger(r.every_days) && (r.every_days as number) >= 1)) throw new Error('key_rotation.every_days must be a whole number of days, 1 or more');
+  if (!Array.isArray(r.notify) || !r.notify.length || r.notify.some(c => typeof c !== 'string')) throw new Error('key_rotation.notify must list one or more channels');
+  for (const c of r.notify as string[]) if (!channels[c]) throw new Error(`key_rotation.notify: no channel named "${c}" in repos.yaml`);
+  if (r.remind_every_days !== undefined && !(Number.isInteger(r.remind_every_days) && (r.remind_every_days as number) >= 1)) throw new Error('key_rotation.remind_every_days must be a whole number of days, 1 or more');
+  return { every_days: r.every_days as number, remind_every_days: (r.remind_every_days as number | undefined) ?? 7, notify: r.notify as string[] };
 };
 
 export const parseUsers = (list: unknown, where: string): DashboardUser[] => {
@@ -277,6 +333,19 @@ export const loadAuth = (env: NodeJS.ProcessEnv, publicUrl: string, users: Dashb
       allowedGroups: list(env.TERIAC_OIDC_ALLOWED_GROUPS),
     };
   }
+  // Sign in with GitHub: the App's client ID and secret (the App's settings page).
+  let github: AuthConfig['github'];
+  const ghSecret = readSecret(env, 'TERIAC_GITHUB_CLIENT_SECRET');
+  if (env.TERIAC_GITHUB_CLIENT_ID && ghSecret && parseBool(env.TERIAC_DASHBOARD_GITHUB_LOGIN, 'TERIAC_DASHBOARD_GITHUB_LOGIN') !== false) {
+    const apiUrl = (env.TERIAC_GITHUB_API_URL || 'https://api.github.com').replace(/\/+$/, '');
+    const host = apiUrl === 'https://api.github.com' ? 'github.com' : new URL(apiUrl).host;
+    github = {
+      clientId: env.TERIAC_GITHUB_CLIENT_ID, clientSecret: ghSecret, apiUrl, host,
+      webUrl: host === 'github.com' ? 'https://github.com' : `${new URL(apiUrl).protocol}//${host}`,
+      adminUsers: list(env.TERIAC_GITHUB_ADMIN_USERS), adminTeams: list(env.TERIAC_GITHUB_ADMIN_TEAMS), allowedTeams: list(env.TERIAC_GITHUB_ALLOWED_TEAMS),
+    };
+  }
+  const passwordLogin = parseBool(env.TERIAC_DASHBOARD_PASSWORD_LOGIN, 'TERIAC_DASHBOARD_PASSWORD_LOGIN') ?? true;
   const sessionSecret = readSecret(env, 'TERIAC_SESSION_SECRET');
   if (sessionSecret && sessionSecret.length < 32) throw new Error('TERIAC_SESSION_SECRET must be at least 32 characters');
   return {
@@ -286,7 +355,9 @@ export const loadAuth = (env: NodeJS.ProcessEnv, publicUrl: string, users: Dashb
     sessionHours: Math.max(1, Number(env.TERIAC_SESSION_HOURS || 12)),
     secureCookies: publicUrl.startsWith('https://'),
     users,
+    passwordLogin,
     oidc,
+    github,
   };
 };
 
@@ -304,6 +375,31 @@ export const parseReposYaml = (text: string): RepoPolicy[] => {
     validateBool(repo.reapprove_on_change, `${at}.reapprove_on_change`);
     validateBool(repo.keep_approval_on_rebase, `${at}.keep_approval_on_rebase`);
     validateBool(repo.verify_plan, `${at}.verify_plan`);
+    validateBool(repo.allow_fork_prs, `${at}.allow_fork_prs`);
+    validateBool(repo.unlock_after_apply, `${at}.unlock_after_apply`);
+    if (repo.checkout !== undefined && !['branch', 'merge'].includes(repo.checkout)) throw new Error(`${at}.checkout must be branch or merge`);
+    if (repo.hooks !== undefined) {
+      if (typeof repo.hooks !== 'object' || repo.hooks === null) throw new Error(`${at}.hooks must be { pre_plan, post_plan, pre_apply, post_apply }`);
+      for (const [stage, list] of Object.entries(repo.hooks)) {
+        if (!['pre_plan', 'post_plan', 'pre_apply', 'post_apply'].includes(stage)) throw new Error(`${at}.hooks: unknown stage "${stage}" (pre_plan, post_plan, pre_apply, post_apply)`);
+        if (!Array.isArray(list)) throw new Error(`${at}.hooks.${stage} must be a list of { name, run }`);
+        for (const [j, h] of list.entries()) if (!h || typeof h.name !== 'string' || typeof h.run !== 'string' || !h.run.trim()) throw new Error(`${at}.hooks.${stage}[${j}] needs a name and a run command`);
+      }
+    }
+    if (repo.log_retention_days !== undefined && !(Number.isInteger(repo.log_retention_days) && repo.log_retention_days >= 1)) throw new Error(`${at}.log_retention_days must be a whole number of days, 1 or more`);
+    if (repo.remind_unmerged !== undefined) {
+      const r = repo.remind_unmerged as Record<string, any>;
+      if (!r || typeof r !== 'object' || !(typeof r.after_hours === 'number' && r.after_hours > 0)) throw new Error(`${at}.remind_unmerged needs after_hours (a number above 0)`);
+      if (r.notify !== undefined && (!Array.isArray(r.notify) || r.notify.some((c: unknown) => typeof c !== 'string'))) throw new Error(`${at}.remind_unmerged.notify must be a list of channel names`);
+      validateBool(r.comment, `${at}.remind_unmerged.comment`);
+      if (r.comment === false && !r.notify?.length) throw new Error(`${at}.remind_unmerged: with comment: false, set notify (or nobody is reminded)`);
+    }
+    if (repo.automerge !== undefined && typeof repo.automerge !== 'boolean') {
+      const am = repo.automerge as Record<string, unknown>;
+      if (typeof am !== 'object' || am === null) throw new Error(`${at}.automerge must be true, false or { method, delete_branch }`);
+      if (am.method !== undefined && !['merge', 'squash', 'rebase'].includes(am.method as string)) throw new Error(`${at}.automerge.method must be merge, squash or rebase`);
+      validateBool(am.delete_branch, `${at}.automerge.delete_branch`);
+    }
     validateStaleBase(repo.stale_base, `${at}.stale_base`);
     if (repo.secret_scan !== undefined) {
       // `secret_scan: fail`, or `{ mode, patterns }`: the repo's patterns add to the server's.
@@ -327,6 +423,13 @@ export const parseReposYaml = (text: string): RepoPolicy[] => {
     }
   }
   return repos;
+};
+
+const parseDays = (v: string | undefined): number | undefined => {
+  if (!v?.trim()) return undefined;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1) throw new Error(`TERIAC_LOG_RETENTION_DAYS must be a whole number of days, 1 or more, not "${v}"`);
+  return n;
 };
 
 const parseBool = (v: string | undefined, name: string): boolean | undefined => {
@@ -376,7 +479,21 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): ServerConfig =
     }
     const apiUrl = (env.TERIAC_GITHUB_API_URL || 'https://api.github.com').replace(/\/+$/, '');
     const host = apiUrl === 'https://api.github.com' ? 'github.com' : new URL(apiUrl).host;
-    github = { appId, privateKey: privateKey.replace(/\\n/g, '\n'), webhookSecret, apiUrl, host };
+    const pem = (v: string | undefined) => v?.replace(/\\n/g, '\n');
+    const key = liveSecret(env, 'TERIAC_GITHUB_PRIVATE_KEY');
+    const keyNext = liveSecret(env, 'TERIAC_GITHUB_PRIVATE_KEY_NEXT');
+    const hook = liveSecret(env, 'TERIAC_GITHUB_WEBHOOK_SECRET');
+    const hookNext = liveSecret(env, 'TERIAC_GITHUB_WEBHOOK_SECRET_NEXT');
+    const clientSecret = readSecret(env, 'TERIAC_GITHUB_CLIENT_SECRET');
+    if (clientSecret && !env.TERIAC_GITHUB_CLIENT_ID) throw new Error('TERIAC_GITHUB_CLIENT_SECRET needs TERIAC_GITHUB_CLIENT_ID (the App\'s client ID, on its settings page)');
+    github = {
+      appId, privateKey: pem(privateKey)!, webhookSecret, apiUrl, host,
+      clientId: env.TERIAC_GITHUB_CLIENT_ID || undefined, clientSecret: clientSecret || undefined,
+      secrets: () => ({
+        keys: [...new Set([pem(key()) ?? pem(privateKey)!, pem(keyNext())].filter((k): k is string => !!k))],
+        webhookSecrets: [...new Set([hook() ?? webhookSecret, hookNext()].filter((k): k is string => !!k))],
+      }),
+    };
   }
   if (!github) throw new Error('No source-control platform configured (set TERIAC_GITHUB_APP_ID and friends)');
 
@@ -397,6 +514,7 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): ServerConfig =
     progressReply: env.TERIAC_PROGRESS_REPLY === 'true',
     commentMode: parseCommentMode(env.TERIAC_COMMENT_MODE, 'TERIAC_COMMENT_MODE') ?? 'new',
     moduleAuth: parseBool(env.TERIAC_MODULE_AUTH, 'TERIAC_MODULE_AUTH') ?? true,
+    logRetentionDays: parseDays(env.TERIAC_LOG_RETENTION_DAYS),
     spinnerUrl: spinnerUrlFor(publicUrl),
     github,
     repos,
@@ -409,6 +527,7 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): ServerConfig =
     protected: policy.protected,
     breakGlass: policy.breakGlass,
     summary: policy.summary,
+    keyRotation: policy.keyRotation,
     backup: parseBackup({ ...env, TERIAC_BACKUP_AZURE_KEY: readSecret(env, 'TERIAC_BACKUP_AZURE_KEY') }, policy.channels),
     auth: loadAuth(env, publicUrl, policy.users),
   };

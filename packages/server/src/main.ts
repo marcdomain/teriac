@@ -28,10 +28,12 @@ const { createHttpServer } = await import('./http.ts');
 const { teriacResolver } = await import('./runner.ts');
 const { teriac, setDownloadToken } = await import('./teriac.ts');
 const { DriftScheduler } = await import('./drift.ts');
-const { Oidc } = await import('./auth.ts');
+const { Oidc, GitHubLogin } = await import('./auth.ts');
+const { repoPolicyFor } = await import('./policy.ts');
 const { Avatars } = await import('./avatars.ts');
 const { GrantWatcher } = await import('./grants.ts');
 const { SummaryScheduler } = await import('./summary.ts');
+const { Housekeeper } = await import('./housekeeping.ts');
 
 const { BackupScheduler, cleanLeftovers, destination, rcloneRemote, restoreLatest } = await import('./backup.ts');
 const { notifyText } = await import('./notify.ts');
@@ -83,6 +85,11 @@ const chat = { channels: config.channels, people: config.people, env: process.en
 const grantNotices = { store, cfg: config.breakGlass, ...chat };
 const grants = new GrantWatcher(grantNotices);
 const summary = new SummaryScheduler({ store, cfg: config.summary, ...chat });
+const housekeeping = new Housekeeper({
+  config, store, adapterFor: host => (config.github && host === config.github.host ? adapters.github : undefined),
+  appKey: () => adapters.github?.keyInUse() ?? null,
+  appSettingsUrl: () => adapters.github?.appSettingsUrl() ?? Promise.resolve(null),
+});
 const backups = config.backup && remote ? new BackupScheduler({
   cfg: config.backup, store, remote, dataDir: config.dataDir,
   notify: config.backup.notify.length
@@ -98,6 +105,10 @@ const server = createHttpServer({
   people: config.people,
   avatars: new Avatars(config.dataDir, config.github ? { [config.github.host]: 'github' } : {}),
   oidc: config.auth.oidc ? new Oidc(config.auth.oidc, config.publicUrl) : undefined,
+  github: config.auth.github && adapters.github ? new GitHubLogin(config.auth.github, config.publicUrl, {
+    serves: key => { const [host, owner, ...rest] = key.split('/'); return !!repoPolicyFor(config.repos, { platform: 'github', host, owner, name: rest.join('/'), fullName: `${owner}/${rest.join('/')}`, cloneUrl: '' }); },
+    inTeam: (key, team, login) => { const [host, owner, ...rest] = key.split('/'); return adapters.github!.inTeam({ platform: 'github', host, owner, name: rest.join('/'), fullName: `${owner}/${rest.join('/')}`, cloneUrl: '' }, team, login); },
+  }) : undefined,
   grants: grantNotices,
   backups,
   config,
@@ -105,6 +116,10 @@ const server = createHttpServer({
 });
 addSecret(config.auth.apiToken);
 addSecret(config.auth.oidc?.clientSecret);
+addSecret(config.auth.github?.clientSecret);
+if (config.auth.passwordLogin === false && !config.auth.oidc && !config.auth.github && !config.auth.apiToken) {
+  log.warn('password sign-in is off and no other sign-in is set up: nobody can use the dashboard');
+}
 if (!process.env.TERIAC_SESSION_SECRET && !process.env.TERIAC_SESSION_SECRET_FILE) {
   log.warn('TERIAC_SESSION_SECRET is not set; dashboard sessions end when the server restarts');
 }
@@ -115,6 +130,7 @@ server.listen(config.port, () => {
   grants.start();
   summary.start();
   backups?.start();
+  housekeeping.start();
   log.info('teriac-server listening', { port: config.port, dataDir: config.dataDir, repos: config.repos.map(r => r.id) });
 });
 
@@ -138,6 +154,7 @@ const shutdown = async (signal: string) => {
   grants.stop();
   summary.stop();
   backups?.stop();
+  housekeeping.stop();
   await Promise.all([app.idle(), drift.idle(), backups?.idle()]);
   store.close();
   process.exit(0);

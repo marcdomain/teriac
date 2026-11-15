@@ -23,11 +23,18 @@ imagePullSecrets: []
 github:
   appId: ""                     # required
   apiUrl: ""                    # GitHub Enterprise Server, e.g. https://ghe.acme.com/api/v3
+  clientId: ""                  # the App's client ID (its settings page): JWT issuer, and "Sign in with GitHub"
   # Use an existing Secret with keys `private-key` and `webhook-secret`...
   existingSecret: ""
   # ...or let the chart create one (avoid committing these to git).
   privateKey: ""
   webhookSecret: ""
+  clientSecret: ""              # key `client-secret`: needed for dashboard.github (Sign in with GitHub)
+  # Rotation, no restart: add `private-key-next` (and/or `webhook-secret-next`) to the Secret. teriac
+  # uses them only when present and falls over to them when GitHub refuses the current ones. Once the
+  # old key is deleted in GitHub, move the new one to `private-key` and remove `private-key-next`.
+  privateKeyNext: ""
+  webhookSecretNext: ""
 
 config:
   repoAllowlist: []             # e.g. ["github.com/acme/*"]; or list repos in `repos` below
@@ -45,6 +52,7 @@ config:
   logLevel: info
   verifySignatures: true        # check vendor signatures on downloaded Terraform/OpenTofu/Terragrunt; false for mirrors without .sig files
   moduleAuth: true              # Terraform's git::https:// module downloads sign in with a read-only App token (private modules work); false to turn off
+  logRetentionDays: ""          # clear run logs this many days after a PR's last apply (summaries and PR comments stay); per repo: log_retention_days
 
 # Contents of repos.yaml: rules, approvers, channels, people, drift schedules, and the
 # safety settings (risk, freezes, protected resources, secret scan, emergency access,
@@ -86,6 +94,16 @@ repos: {}
 #      keep_approval_on_rebase: true      # default false: a rebase that doesn't change the PR's code keeps approvals
 #      stale_base: warn                   # off | warn (default) | block: base branch changed this project's files
 #      verify_plan: true                  # default true: apply only the exact plan file that was reviewed
+#      # After apply, merge and close
+#      allow_fork_prs: false              # default false: PRs from forks are refused
+#      checkout: merge                    # plan the PR merged into its base branch (default: branch, the PR's own commit)
+#      unlock_after_apply: false          # default false: an applied project stays locked until the PR merges or closes
+#      automerge: { method: squash, delete_branch: true }   # merge the PR once everything planned is applied
+#      notify_applies: [infra-alerts]     # every apply in this repo, done or failed
+#      log_retention_days: 30             # clear run logs 30 days after a PR's last apply
+#      remind_unmerged: { after_hours: 24, notify: [infra-alerts] }   # applied but not merged after 24 h
+#      hooks:                             # commands around plans and applies (server config only)
+#        post_plan: [{ name: scan, run: "checkov -f \"$PLAN_JSON\"" }]
 #      # The safety settings below can also go here, for this repo only. Lists (freezes, protected,
 #      # policies.rules, risk.stateful_types) add to the server-wide ones; secret_scan, policies.mode
 #      # and risk.size_limits can only get stricter; anything else set here wins for this repo.
@@ -127,6 +145,10 @@ repos: {}
 #    schedule: "0 9 * * 1"
 #    timezone: Europe/Madrid
 #    notify: [infra-alerts]
+#  key_rotation:                          # remind to rotate the GitHub App key (see github.privateKeyNext)
+#    every_days: 90
+#    remind_every_days: 7                 # repeat until the key changes (default 7)
+#    notify: [infra-alerts]
 
 dashboard:
   # Sign-in methods; turn on any mix. Viewers read; admins can unlock, run drift checks and revoke
@@ -144,6 +166,16 @@ dashboard:
     groupsClaim: groups
     adminGroups: []             # e.g. [teriac-admins]
     allowedGroups: []           # if set, only these groups (and admins) may sign in
+  # Sign in with GitHub (the App's client ID and secret above). People see only the repos they
+  # can see on GitHub; they may release their own locks, or any lock in a repo where they have
+  # maintain/admin. Access is re-checked with GitHub every 10 minutes; sessions last at most 8 hours.
+  # Add <publicUrl>/auth/github/callback as a callback URL on the App's settings page.
+  github:
+    enabled: false
+    adminUsers: []              # GitHub logins that are dashboard admins
+    adminTeams: []              # e.g. [acme/platform-admins]
+    allowedTeams: []            # if set, only these teams (and admins) may sign in
+  passwordLogin: true           # false: turn off username/password sign-in (users below are ignored)
   # Username/password users. Hash with: node packages/server/src/hash-password.ts
   users: []
   #  - { username: ada, password_hash: "scrypt$16384$8$1$...", role: admin, name: Ada Lovelace }

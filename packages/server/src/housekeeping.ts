@@ -1,0 +1,160 @@
+// Jobs that run every few minutes:
+// - log_retention_days: a PR's run logs are cleared that many days after its last apply
+//   (summaries, risk, people, times, metrics and the PR's comments stay);
+// - remind_unmerged: a PR that was applied but is still open after `after_hours` gets one
+//   reminder, as a comment to whoever applied and/or in chat;
+// - key_rotation: when the GitHub App key in use is `every_days` old, a reminder with the
+//   steps, then every `remind_every_days` (default 7) until the key changes.
+import type { ServerConfig, RepoPolicy } from './config.ts';
+import type { Store, Run } from './store.ts';
+import type { Repo, VcsAdapter } from './vcs/types.ts';
+import { matchGlob } from './glob.ts';
+import { notifyText } from './notify.ts';
+import { repoLinks, platformForHost } from './links.ts';
+import { log } from './log.ts';
+
+const TICK_MS = 10 * 60_000;
+const HOUR = 3_600_000;
+
+export interface HousekeepingDeps {
+  config: ServerConfig;
+  store: Store;
+  adapterFor: (host: string) => VcsAdapter | undefined;
+  env?: NodeJS.ProcessEnv;
+  fetchImpl?: typeof fetch;
+  appKey?: () => { fingerprint: string; next: boolean } | null;
+  appSettingsUrl?: () => Promise<string | null>;
+}
+
+const DAY = 24 * HOUR;
+
+const policyOf = (config: ServerConfig, repoKey: string): RepoPolicy | undefined => config.repos.find(p => matchGlob(p.id, repoKey));
+
+const repoOf = (repoKey: string, platform: Repo['platform']): Repo => {
+  const [host, owner, ...rest] = repoKey.split('/');
+  const name = rest.join('/');
+  return { platform, host, owner, name, fullName: `${owner}/${name}`, cloneUrl: '' };
+};
+
+export class Housekeeper {
+  private timer: NodeJS.Timeout | null = null;
+  private d: HousekeepingDeps;
+  constructor(d: HousekeepingDeps) { this.d = d; }
+
+  start() {
+    const tick = () => { void this.tick().catch(err => log.warn('housekeeping failed', { err: (err as Error).message })); };
+    tick();
+    this.timer = setInterval(tick, TICK_MS);
+    this.timer.unref?.();
+  }
+  stop() { if (this.timer) clearInterval(this.timer); }
+
+  async tick(now = new Date()) {
+    return { expired: this.expireLogs(now), reminded: await this.remind(now), rotation: await this.keyRotation(now) };
+  }
+
+  // The age of a key counts from when teriac first saw it (GitHub doesn't say when it was made).
+  async keyRotation(now: Date): Promise<boolean> {
+    const cfg = this.d.config.keyRotation;
+    const key = this.d.appKey?.();
+    if (!cfg || !key) return false;
+    const seenKey = `key_seen:${key.fingerprint}`;
+    const seen = this.d.store.getSetting(seenKey) as string | null;
+    if (!seen) { this.d.store.setSetting(seenKey, now.toISOString()); return false; }
+    const age = Math.floor((now.getTime() - Date.parse(seen)) / DAY);
+    if (age < cfg.every_days) return false;
+    const lastKey = `key_reminded:${key.fingerprint}`;
+    const last = this.d.store.getSetting(lastKey) as string | null;
+    if (last && now.getTime() - Date.parse(last) < cfg.remind_every_days * DAY) return false;
+    const settings = await this.d.appSettingsUrl?.().catch(() => null) ?? null;
+    const dashboard = `${this.d.config.publicUrl}/#runs?status=running`;
+    const appSettings = settings ? `[App settings](${settings})` : 'App settings (GitHub → Settings → Developer settings → GitHub Apps)';
+    const sent = await notifyText(cfg.notify, this.d.config.channels, {
+      title: '🔑 Time to rotate the teriac GitHub App key',
+      lines: [
+        `The key is **${age} days old**. Your rotation cycle is ${cfg.every_days} days.`,
+        '',
+        `**1.** In the ${appSettings}, generate a new private key.`,
+        '**2.** Add it to the teriac GitHub Secret as `private-key-next`.',
+        `**3.** Wait an hour, [check nothing is running](${dashboard}), then delete the old key in GitHub.`,
+        '**4.** Move the new key to `private-key` and remove `private-key-next`.',
+        '',
+        `_No restart needed. Reminds again in ${cfg.remind_every_days} day${cfg.remind_every_days === 1 ? '' : 's'} until the key changes._`,
+      ],
+      buttons: [...(settings ? [{ title: 'Open App settings', url: settings }] : []), { title: 'Check running jobs', url: dashboard }],
+      event: 'teriac.key_rotation',
+      data: { ageDays: age, everyDays: cfg.every_days, remindEveryDays: cfg.remind_every_days, keyFingerprint: key.fingerprint, settingsUrl: settings, dashboardUrl: dashboard },
+    }, { people: this.d.config.people, env: this.d.env ?? process.env, fetchImpl: this.d.fetchImpl });
+    if (!sent.some(r => r.ok)) return false;      // try again next tick
+    this.d.store.setSetting(lastKey, now.toISOString());
+    log.info('key rotation reminder sent', { ageDays: age, key: key.fingerprint });
+    return true;
+  }
+
+  // Days to keep a repo's logs after its last apply: the repo's own setting, else the server's.
+  private retention(repoKey: string): number | undefined {
+    return policyOf(this.d.config, repoKey)?.log_retention_days ?? this.d.config.logRetentionDays;
+  }
+
+  expireLogs(now: Date): number {
+    const all = [this.d.config.logRetentionDays, ...this.d.config.repos.map(r => r.log_retention_days)].filter((d): d is number => typeof d === 'number');
+    if (!all.length) return 0;
+    let expired = 0;
+    const earliest = new Date(now.getTime() - Math.min(...all) * 24 * HOUR).toISOString();
+    for (const c of this.d.store.prsWithLogsAppliedBefore(earliest)) {
+      const days = this.retention(c.repo);
+      if (days === undefined || Date.parse(c.appliedAt) > now.getTime() - days * 24 * HOUR) continue;
+      const n = this.d.store.expireOutputs(c.repo, c.pr, now.toISOString());
+      if (n) log.info('logs expired', { repo: c.repo, pr: c.pr, runs: n, days });
+      expired += n;
+    }
+    return expired;
+  }
+
+  async remind(now: Date): Promise<number> {
+    const hours = this.d.config.repos.map(r => r.remind_unmerged?.after_hours).filter((h): h is number => typeof h === 'number');
+    if (!hours.length) return 0;
+    let sent = 0;
+    for (const run of this.d.store.appliesStillOpen(new Date(now.getTime() - Math.min(...hours) * HOUR).toISOString())) {
+      const r = policyOf(this.d.config, run.repo)?.remind_unmerged;
+      if (!r || Date.parse(run.finishedAt!) > now.getTime() - r.after_hours * HOUR) continue;
+      const key = `reminded:${run.repo}#${run.pr}:${run.id}`;
+      if (this.d.store.getSetting(key)) continue;
+      // Check with the platform: a merge we missed the event for shouldn't be reminded.
+      const host = run.repo.split('/')[0];
+      const adapter = this.d.adapterFor(host);
+      if (adapter) {
+        const pr = await adapter.getPullRequest(repoOf(run.repo, adapter.platform), run.pr).catch(() => null);
+        if (pr && !pr.open) { this.d.store.markPrClosed(run.repo, run.pr, false); continue; }
+      }
+      this.d.store.setSetting(key, now.toISOString());
+      await this.send(run, r, now);
+      sent++;
+    }
+    return sent;
+  }
+
+  // One short message: who applied what, how long ago, and what to do.
+  private async send(run: Run, r: NonNullable<RepoPolicy['remind_unmerged']>, now: Date) {
+    const host = run.repo.split('/')[0];
+    const adapter = this.d.adapterFor(host);
+    const platform = adapter?.platform ?? platformForHost(host, {});
+    const repo = repoOf(run.repo, platform);
+    const ago = Math.floor((now.getTime() - Date.parse(run.finishedAt!)) / HOUR);
+    const prUrl = repoLinks(run.repo, platform).pr(run.pr);
+    if (r.comment !== false && adapter) {
+      await adapter.comment(repo, run.pr, `⏰ @${run.user} applied \`${run.project}\` ${ago} hours ago, but this pull request isn't merged yet. `
+        + 'Until it is, the base branch doesn\'t match what\'s deployed. Merge it, or revert the change and apply again.')
+        .catch(err => log.warn('reminder comment failed', { repo: run.repo, pr: run.pr, err: (err as Error).message }));
+    }
+    if (r.notify?.length) {
+      await notifyText(r.notify, this.d.config.channels, {
+        title: `⏰ Applied but not merged: ${repo.fullName} #${run.pr}`,
+        lines: [`\`${run.project}\` applied by ${run.user} ${ago} hours ago · [open the PR](${prUrl})`],
+        event: 'teriac.unmerged', url: prUrl,
+        data: { repo: run.repo, pr: run.pr, project: run.project, user: run.user, appliedAt: run.finishedAt, hours: ago },
+      }, { people: this.d.config.people, env: this.d.env ?? process.env, fetchImpl: this.d.fetchImpl })
+        .catch(err => log.warn('reminder notice failed', { err: (err as Error).message }));
+    }
+  }
+}

@@ -417,6 +417,18 @@ export const discoverProjects = (root: string, repoConfig: RepoConfig): Project[
   }
 
   const projects = [...found.values()].sort((a, b) => a.name.localeCompare(b.name));
+  // depends_on: other projects (by name or dir) this one is applied after, like a
+  // Terragrunt dependency. A change to one of them plans this one too.
+  for (const pc of repoConfig.projects) {
+    if (!pc.depends_on?.length) continue;
+    const me = found.get(`${pc.dir}::${pc.workspace ?? 'default'}`)!;
+    for (const d of pc.depends_on) {
+      const dep = projects.find(p => p.name === d) ?? projects.find(p => p.dir === d);
+      if (!dep) throw new Error(`teriac.yaml: project "${me.name}" depends on "${d}", which is not a project here`);
+      if (dep === me) throw new Error(`teriac.yaml: project "${me.name}" depends on itself`);
+      if (!me.deps.includes(dep.dir)) me.deps.push(dep.dir);
+    }
+  }
   const names = new Set<string>();
   for (const p of projects) {
     if (names.has(p.name)) throw new Error(`two projects are named "${p.name}"; give them unique names in teriac.yaml`);

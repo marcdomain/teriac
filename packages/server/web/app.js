@@ -67,6 +67,19 @@
   const PAST = { create: 'created', update: 'changed', delete: 'deleted', replace: 'replaced' };
   const SYMBOL = { create: '+', update: '~', delete: '-', replace: '-/+', import: '←', forget: '⊘', move: '→' };
   const LINE = { create: 'l-add', update: 'l-chg', delete: 'l-del', replace: 'l-del' };
+  // Terraform output coloured like the PR comments (GitHub's diff colours): + green, - red,
+  // ~ and -/+ orange; plus errors, warnings, the commands teriac ran and summary lines.
+  const logLineClass = (line) => {
+    const m = /^\s*(-\/\+|\+\/-|[+~-])( |$)/.exec(line);
+    if (m) return m[1] === '+' ? 'l-add' : m[1] === '-' ? 'l-del' : 'l-chg';
+    if (/^\s*(│\s*)?Error[:\s]|^\s*\[teriac\].*(failed|refused|withheld)/.test(line)) return 'l-err';
+    if (/^\s*(│\s*)?Warning[:\s]/.test(line)) return 'l-warn';
+    if (/^\$ /.test(line)) return 'l-cmd';
+    if (/^(Plan:|Apply complete!|No changes\.|Destroy complete!|Changes to Outputs:)/.test(line)) return 'l-sum';
+    return '';
+  };
+  const logLine = (line) => { const c = logLineClass(line); return c ? `<span class="${c}">${esc(line)}</span>` : esc(line); };
+  const colorLog = (text) => String(text).split('\n').map(logLine).join('\n');
   const changeLines = (list) => list.map(c =>
     `<span class="${LINE[c.action] || ''}">${esc((SYMBOL[c.action] || '?').padEnd(3))} ${esc(c.address)}${c.reason ? `   # ${esc(c.reason)}` : ''}</span>`).join('\n');
 
@@ -382,10 +395,18 @@
     </tr>`;
   };
 
+  // "All applies paused" (the dashboard's emergency stop): who, when, why, and Resume for admins.
+  const pauseBanner = (a) => (a?.paused
+    ? `<div class="banner stop"><div><b>⏸ All applies are paused</b> by ${esc(a.paused.by)} ${esc(ago(a.paused.at))}: ${esc(a.paused.reason)}
+        <div class="muted small">Plans still run. Every apply and state change is refused until someone resumes.</div></div>
+        ${a.canChange ? '<button type="button" class="small" data-resume-applies>Resume applies</button>' : ''}</div>`
+    : '');
+
   const views = {
     async overview() {
-      const [runs, locks, drift, schedules, safety] = await Promise.all([
+      const [runs, locks, drift, schedules, safety, applies] = await Promise.all([
         api('/api/runs?limit=100'), api('/api/locks'), api('/api/drift'), api('/api/drift/schedules'), api('/api/safety').catch(() => null),
+        api('/api/applies').catch(() => null),
       ]);
       const frozen = (safety?.freezes || []).filter(w => w.until);
       const day = Date.now() - 86400e3;
@@ -399,7 +420,12 @@
       const failed = today.filter(r => r.status === 'failed');
       const nextRun = schedules.map(s => s.next).filter(Boolean).sort()[0];
       return `
-        <div class="page-head"><h1>Overview</h1><span class="muted">Everything teriac did across your repos</span></div>
+        <div class="ov-hero">
+          <span class="hero-chip"><b>${applies?.paused ? '⏸ Applies paused' : today.some(r => r.status === 'running' || r.status === 'queued') ? '<span class="dot"></span>Running' : 'All quiet'}</b>${esc(today.length)} run${today.length === 1 ? '' : 's'} today · ${esc(locks.length)} locked</span>
+          <h1>Your infrastructure, <span class="grad">at a glance.</span></h1>
+          <p class="muted">Every plan and apply teriac ran across your repos: what changed, who approved it, and what's still waiting.</p>
+        </div>
+        ${pauseBanner(applies)}
         ${frozen.length ? `<div class="banner"><b>Change freeze on:</b> ${frozen.map(w => `${esc(w.name)} until ${esc(w.until)}`).join(', ')} · <a href="#guardrails">Guardrails</a></div>` : ''}
         <div class="tiles">
           <a class="tile" href="${listLink('runs', { range: '24h' })}"><span class="n">${today.length}</span><span class="k">runs in the last 24 hours</span></a>
@@ -514,7 +540,9 @@
           ? `<div class="card"><div class="card-head"><h2>Output</h2><span class="inline"><span class="pill run live"><span class="dot"></span> live</span>
               <label class="small follow"><input type="checkbox" id="live-follow" checked> Follow</label></span></div>
               <pre class="log" id="live-log" data-run="${r.id}"><span class="muted">Waiting for output…</span></pre></div>`
-          : `<div class="card"><div class="card-head"><h2>Output</h2><span class="muted small">secrets redacted</span></div><pre class="log">${esc(r.output || '')}</pre></div>`}`;
+          : r.outputExpiredAt
+            ? `<div class="card"><div class="card-head"><h2>Output</h2></div><div class="empty">This log was cleared on ${esc(when(r.outputExpiredAt))}, as set by <code>log_retention_days</code>. The plan summary and everything else on this page stay.</div></div>`
+            : `<div class="card"><div class="card-head"><h2>Output</h2><span class="muted small">secrets redacted</span></div><pre class="log">${colorLog(r.output || '')}</pre></div>`}`;
     },
 
     async locks() {
@@ -526,13 +554,13 @@
             <td class="mono">${esc(l.project)}</td><td class="mono muted">${esc(l.workspace)}</td>
             <td>${prLink(l)}</td>
             <td>${who(l.user, l.links?.user, null, l.links?.userAvatar)}</td><td class="muted" title="${esc(when(l.createdAt))}">${ago(l.createdAt)}</td>
-            <td>${adminButton('Unlock', `data-unlock='${esc(JSON.stringify({ repo: l.repo, project: l.project, workspace: l.workspace, pr: l.pr, user: l.user, createdAt: l.createdAt, prUrl: l.links?.pr ?? null }))}'`)}</td>
+            <td>${l.canUnlock ? `<button class="ghost small" type="button" data-unlock=${`'${esc(JSON.stringify({ repo: l.repo, project: l.project, workspace: l.workspace, pr: l.pr, user: l.user, createdAt: l.createdAt, prUrl: l.links?.pr ?? null }))}'`}>Unlock</button>` : adminButton('Unlock', `data-unlock='${esc(JSON.stringify({ repo: l.repo, project: l.project, workspace: l.workspace, pr: l.pr, user: l.user, createdAt: l.createdAt, prUrl: l.links?.pr ?? null }))}'`)}</td>
           </tr>`;
         }), 'No projects are locked.')}</div>`;
     },
 
     async guardrails() {
-      const [g, b] = await Promise.all([api('/api/safety'), api('/api/backups').catch(() => ({ enabled: false }))]);
+      const [g, b, applies] = await Promise.all([api('/api/safety'), api('/api/backups').catch(() => ({ enabled: false })), api('/api/applies').catch(() => null)]);
       if (g.error) return `<div class="page-head"><h1>Guardrails</h1></div><div class="card"><div class="empty">Not available on this server.</div></div>`;
       const people = (list) => (list.length ? list.map(p => `<span class="pill">${esc(p)}</span>`).join(' ') : '<span class="muted">nobody</span>');
       const globs = (list) => (list.length ? list.map(x => `<code>${esc(x)}</code>`).join(', ') : '<span class="muted">all projects</span>');
@@ -542,6 +570,10 @@
       const r = g.risk || {};
       return `
         <div class="page-head"><h1>Guardrails</h1><span class="muted">What stops a risky apply, from repos.yaml</span></div>
+        ${pauseBanner(applies)}
+        ${applies && !applies.paused ? `<div class="card"><div class="card-head"><h2>Emergency stop</h2><span class="muted small">for an incident; planned windows belong in change freezes</span></div>
+          <div class="stop-row"><p class="muted">Pause every apply and state change in every repo, at once. Running applies finish; plans still run.</p>
+          ${applies.canChange ? '<button type="button" class="danger" data-pause-applies>Pause all applies</button>' : '<button type="button" class="ghost" disabled title="Admins only">Pause all applies</button>'}</div></div>` : ''}
         ${on.length ? `<div class="banner"><b>${on.length} change freeze${on.length === 1 ? ' is' : 's are'} on now:</b> ${on.map(w => `${esc(w.name)} (until ${esc(w.until)})`).join(', ')}</div>` : ''}
         <div class="card"><div class="card-head"><h2>Change freezes</h2><span class="muted small">no applies or state edits; plans still run</span></div>
           ${table(['Name', 'Status', 'When', 'Projects', 'Applies to', 'Can override'], g.freezes.map(w => `<tr>
@@ -1032,7 +1064,9 @@
     let count = 0;
     const append = (lines) => {
       if (first) { pre.textContent = ''; first = false; }
-      pre.append(document.createTextNode(lines.join('\n') + '\n'));
+      const chunk = document.createElement('span');
+      chunk.innerHTML = lines.map(logLine).join('\n') + '\n';
+      pre.append(chunk);
       count += lines.length;
       // Keep the page light: very long logs keep their last 20,000 lines here.
       while (count > 20000 && pre.firstChild) { count -= (pre.firstChild.textContent.match(/\n/g) || []).length; pre.firstChild.remove(); }
@@ -1228,6 +1262,35 @@
       location.hash = `#metrics?${params}`;
       return;
     }
+    if (e.target.closest('button[data-pause-applies]')) {
+      const ok = await confirmDialog({
+        title: 'Pause all applies?',
+        body: `<ul>
+            <li>Every apply and state change, in every repo, is refused until someone resumes.</li>
+            <li>Applies already running finish. Plans keep running.</li>
+            <li>The reason is shown on every refused apply and recorded in the audit log.</li>
+          </ul>
+          <label class="field"><span>Reason</span><input id="pause-reason" maxlength="200" placeholder="e.g. incident INC-142: database failover" required></label>`,
+        ok: 'Pause all applies', danger: true,
+      });
+      const reason = $('#pause-reason')?.value.trim();
+      if (!ok) return;
+      if (!reason) return toast('Say why applies are paused; nothing was changed.', true);
+      try {
+        await api('/api/applies/pause', { method: 'POST', body: JSON.stringify({ reason }) });
+        toast('All applies are paused.');
+      } catch (err) { toast(`Could not pause: ${err.message}`, true); }
+      return route();
+    }
+    if (e.target.closest('button[data-resume-applies]')) {
+      const ok = await confirmDialog({ title: 'Resume applies?', body: '<p>Applies and state changes are allowed again, under the usual rules and approvals.</p>', ok: 'Resume applies' });
+      if (!ok) return;
+      try {
+        await api('/api/applies/resume', { method: 'POST' });
+        toast('Applies are allowed again.');
+      } catch (err) { toast(`Could not resume: ${err.message}`, true); }
+      return route();
+    }
     const unlock = e.target.closest('button[data-unlock]');
     if (unlock) {
       const l = JSON.parse(unlock.dataset.unlock);
@@ -1344,7 +1407,7 @@
     $('#signout').hidden = false;
     const el = $('#me');
     el.hidden = false;
-    el.innerHTML = `${avatar(who.name)}<span class="who-name"><b>${esc(who.name)}</b><span class="muted small">${esc(who.role)} · ${esc(who.via || '')}</span></span>`;
+    el.innerHTML = `${avatar(who.name)}<span class="who-name"><b>${esc(who.name)}</b><span class="muted small">${esc(who.role)} · ${esc(who.via === 'github' ? 'GitHub' : who.via || '')}${who.repos != null ? ` · ${who.repos} repo${who.repos === 1 ? '' : 's'}` : ''}</span></span>`;
     $('#version').textContent = who.version ? `v${who.version}` : '';
     const conn = $('#connected');
     const ps = who.platforms || [];
@@ -1369,11 +1432,12 @@
     const sso = $('#sso');
     sso.hidden = !cfg.oidc;
     if (cfg.oidc) sso.textContent = `Sign in with ${cfg.oidc.name}`;
+    $('#github-signin').hidden = !cfg.github;
     $('#password-form').hidden = !cfg.password;
-    $('#or').hidden = !(cfg.oidc && cfg.password);
+    $('#or').hidden = !((cfg.oidc || cfg.github) && cfg.password);
     $('#token-box').hidden = !cfg.token;
-    $('#token-box').open = cfg.token && !cfg.oidc && !cfg.password;
-    $('#no-auth').hidden = !!(cfg.oidc || cfg.password || cfg.token);
+    $('#token-box').open = cfg.token && !cfg.oidc && !cfg.github && !cfg.password;
+    $('#no-auth').hidden = !!(cfg.oidc || cfg.github || cfg.password || cfg.token);
     (cfg.password ? $('#username') : null)?.focus();
   }
 

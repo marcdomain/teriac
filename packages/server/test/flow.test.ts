@@ -207,7 +207,7 @@ test('4. Apply button on prod: a platform-admin applies after a team approval', 
   assert.equal(gh.checks.get('teriac: envs/prod')!.title, 'Applied');
 });
 
-test('5. a second PR is blocked by the lock, and unblocked after merge', async () => {
+test('5. a second PR is blocked by the lock (applied, not merged), and unblocked after merge', async () => {
   gh.prs.set(2, pr(2, 'carol'));
   gh.files.set(2, ['envs/dev/main.tf']);
   await app.handle(gh, { kind: 'pr_opened', repo, pr: pr(2, 'carol') });

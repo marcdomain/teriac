@@ -245,3 +245,11 @@ test('rclone errors are cut down to the message from the storage service', () =>
   assert.equal(rcloneError('2026/11/11 19:50:01 CRITICAL: Failed to create file system: didn\'t find section in config file\n'), "Failed to create file system: didn't find section in config file");
   assert.equal(rcloneError(''), '');
 });
+
+test('rclone gives up on an unreachable bucket quickly (connect timeout, few retries); RCLONE_* can change it', () => {
+  const cfg = parseBackup(base)!;
+  const e = rcloneEnv(cfg);
+  assert.deepEqual([e.RCLONE_CONTIMEOUT, e.RCLONE_TIMEOUT, e.RCLONE_RETRIES, e.RCLONE_LOW_LEVEL_RETRIES], ['10s', '60s', '2', '3']);
+  process.env.RCLONE_CONTIMEOUT = '2s';
+  try { assert.equal(rcloneEnv(cfg).RCLONE_CONTIMEOUT, '2s'); } finally { delete process.env.RCLONE_CONTIMEOUT; }
+});

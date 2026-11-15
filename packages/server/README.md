@@ -58,8 +58,14 @@ Set up the GitHub App like this:
 | `teriac apply` | Apply every ready project (can be turned off, see below) |
 | `teriac apply -p <project>` | Apply one project. The Apply button does the same |
 | `teriac unlock` | Release this PR's locks and delete its saved plans and live output (`-p <project>` for one). Closing or merging the PR does the same |
+| `teriac cancel` | Stop this PR's running plans and drop its queued work. The PR author, or anyone with write access or more |
 
-Apply always uses the saved plan, so what runs is exactly what was reviewed.
+`-p` and `-d` take a name or a glob: `teriac plan -p 'live/prod/*'`. A repo that applies one
+project at a time refuses an apply whose glob matches more than one.
+
+Apply always uses the saved plan, so what runs is exactly what was reviewed. A plan is applied
+once: after an apply, successful or not, its plan file is deleted, and applying again needs a
+new `teriac plan`.
 
 **Terraform commands** run on one project (`-p <project>`):
 
@@ -109,6 +115,10 @@ copied one into an attribute Terraform doesn't mark.
 | `TERIAC_MODULE_AUTH` | `true` | A read-only App token for Terraform's `git::https://` module downloads; see [Module sources](#settings) |
 | `TERIAC_VERIFY_SIGNATURES` | `true` | Check the vendor's signature on downloaded Terraform, OpenTofu and Terragrunt. `false` for mirrors that don't copy `.sig` files |
 | `TERIAC_BACKUP_ENABLED` | `false` | Scheduled database backups; see [Backups](#backups) for the `TERIAC_BACKUP_*` settings |
+| `TERIAC_LOG_RETENTION_DAYS` | | Clear run logs this many days after a PR's last apply. Summaries, metrics and PR comments stay. Per repo: `log_retention_days` |
+| `TERIAC_GITHUB_CLIENT_ID` | | The App's client ID: names the App when teriac signs in to GitHub, and enables "Sign in with GitHub" with the secret below |
+| `TERIAC_GITHUB_CLIENT_SECRET` | | Turns on "Sign in with GitHub" for the dashboard; see [Dashboard](#dashboard) |
+| `TERIAC_GITHUB_PRIVATE_KEY_NEXT`, `TERIAC_GITHUB_WEBHOOK_SECRET_NEXT` | | A new App key or webhook secret during a rotation; see [Rotating the GitHub App key](#rotating-the-github-app-key) |
 
 `TERIAC_*` values are never passed to Terraform. Each secret can also be read from a file:
 `<NAME>_FILE` (for example `TERIAC_SESSION_SECRET_FILE`).
@@ -186,6 +196,49 @@ project needs only its own approvals.
 A repo's `teriac.yaml` can name projects, pin versions, and add stricter rules, but never looser
 ones. It's read from the base branch, so a PR can't change its own rules.
 
+### More repo settings
+
+```yaml
+repos:
+  - id: github.com/acme/infra
+    allow_fork_prs: false        # default: PRs from forks are refused (they'd run outside code with your credentials)
+    checkout: merge              # plan the PR merged into its base branch; default "branch" (the PR's own commit)
+    automerge: { method: squash, delete_branch: true }   # or true (merge commit)
+    unlock_after_apply: false    # default: an applied project stays locked to its PR until it merges or closes
+    notify_applies: [infra-alerts]                       # every apply here, done or failed
+    log_retention_days: 30       # clear this repo's run logs 30 days after a PR's last apply
+    remind_unmerged: { after_hours: 24, notify: [infra-alerts], comment: true }
+    hooks:                       # server config only; a repo can't add hooks
+      pre_plan:   [{ name: lint, run: "tflint" }]
+      post_plan:  [{ name: scan, run: "checkov -f \"$PLAN_JSON\"" }]
+      pre_apply:  [{ name: gate, run: "./scripts/change-window.sh" }]
+      post_apply: [{ name: notify, run: "./scripts/announce.sh" }]
+```
+
+- **Fork PRs** are refused unless `allow_fork_prs: true`; teriac says so on the PR.
+- **`checkout: merge`** plans GitHub's test merge of this exact commit into the base branch, so
+  the plan includes what's on the base branch now. A PR with conflicts fails with a clear message.
+- **`automerge`** merges the whole PR (all its files, not just applied projects) once every
+  project with planned changes at the current commit is applied and nothing failed. Only that
+  commit is merged: a newer push makes GitHub refuse it. Branch protection still applies; a
+  refused merge is reported with GitHub's reason.
+- **`unlock_after_apply`.** Unlock, merge and close always free a project and delete its saved
+  plan and live output. Apply is different: by default the project stays locked to its PR until
+  it merges or closes, so another PR can't undo an apply that was never merged. `true` frees each
+  project once it's applied. A failed apply always keeps the lock.
+- **`remind_unmerged`**: one reminder, mentioning whoever applied, when a PR is applied but still
+  open after `after_hours`. `comment: false` sends it to chat only.
+- **`hooks`** run with `sh` in the project folder, and their output goes to the log and live view.
+  `post_plan` hooks get `PLAN_FILE` and `PLAN_JSON`. A failing `pre_plan`, `post_plan` or
+  `pre_apply` hook fails the run (the plan can't be applied); a failing `post_apply` hook is
+  reported, and the apply stands.
+
+**Pause all applies** (an emergency stop, for incidents; planned windows belong in
+[change freezes](#change-freezes-and-protected-resources)): admins pause and resume from the
+dashboard's Guardrails page, or with `POST /api/applies/pause` (`{"reason": "…"}`) and
+`POST /api/applies/resume`. While paused, every apply and state change in every repo is refused
+with the reason; running applies finish and plans still run.
+
 ## What gets planned
 
 teriac finds Terraform, OpenTofu and Terragrunt projects on its own and plans the ones a PR
@@ -232,6 +285,21 @@ teriac never applies a dependency for you, and never applies a plan built on wro
   "re-plan first".
 - **Order.** Several units applied in one command go in dependency order, and independent ones
   run in parallel.
+
+**Plain Terraform and OpenTofu** have no dependency blocks, so declare the order in `teriac.yaml`:
+
+```yaml
+projects:
+  - dir: network
+  - dir: app
+    depends_on: [network]     # names or dirs
+```
+
+Then `app` is planned whenever `network` changes, applied after it in the same command, skipped if
+`network` fails to apply, and re-planned after `network` is applied (for you to review). teriac
+doesn't pass outputs between them: `app` reads `network`'s values itself, for example with a
+`terraform_remote_state` data source. This is not Terraform's own `depends_on`, which orders
+resources inside one project.
 
 ## Policy checks
 
@@ -462,6 +530,32 @@ It sends:
 - the slowest projects and the most active people;
 - policy findings, refused actions, and emergency access given.
 
+## Rotating the GitHub App key
+
+The key stays with you: teriac never creates or deletes GitHub keys (GitHub has no API for
+that). It only reminds you when it's time, and switches to the new key without a restart.
+
+```yaml
+key_rotation:                           # in repos.yaml; off unless set
+  every_days: 90
+  remind_every_days: 7                  # default 7
+  notify: [infra-alerts]
+```
+
+When the key teriac uses is `every_days` old (counted from when teriac first saw it), it sends
+a message with the steps, and again every `remind_every_days` until the key changes. Check the
+dashboard (the message links to running jobs) before deleting the old key:
+
+1. On the App's settings page (linked in the message), **Generate a private key**.
+2. Add it to teriac's GitHub Secret as `private-key-next` (Helm: `github.privateKeyNext`). The
+   Secret is mounted as files, so teriac sees it without a restart.
+3. After an hour (older tokens have expired by then), delete the old key in GitHub. GitHub
+   refuses it, and teriac signs in with the new one by itself.
+4. Move the new key to `private-key` and remove `private-key-next`.
+
+The webhook secret rotates the same way, with `webhook-secret-next`: while both are set, webhooks
+signed with either are accepted.
+
 ## Drift checks
 
 ```yaml
@@ -549,7 +643,9 @@ that matters to you.
 **Watching it.** The dashboard's **Guardrails** page shows the destination, the next
 backup, the latest results and a **Back up now** button for admins (audited).
 `/metrics` has `teriac_backup_last_ok` and `teriac_backup_last_success_timestamp_seconds`,
-for an alert such as "no good backup in 26 hours". A backup needs free space on the
+for an alert such as "no good backup in 26 hours". A bucket that can't be reached fails the backup in about a minute (rclone's
+`RCLONE_CONTIMEOUT`, `RCLONE_TIMEOUT`, `RCLONE_RETRIES` and `RCLONE_LOW_LEVEL_RETRIES` can be set on the
+server to change that). A backup needs free space on the
 volume about the size of the database while it runs.
 
 Docker:
@@ -580,6 +676,7 @@ Open the server's URL in a browser. It shows:
 - locks, with an Unlock button;
 - drift schedules, findings, and who last changed each resource;
 - the audit log;
+- an **All applies paused** banner, with Resume for admins, and an Emergency stop on Guardrails;
 - **Guardrails**: change freezes (and whether one is on now), protected resources, risk,
   policy and secret-scan settings, each repo entry's approval settings, and database
   backups with a **Back up now** button (see [Backups](#backups));
@@ -587,14 +684,21 @@ Open the server's URL in a browser. It shows:
 - **Metrics**: runs, timings, resource use, and delivery: PR to applied, failed applies, time to
   fix, applies per week.
 
-It has light and dark themes. Viewers can see everything; admins can also unlock, start drift
-checks and start a backup.
+Logs are coloured like the PR comments. It has light and dark themes. Viewers can see everything;
+admins can also unlock, pause applies, start drift checks and start a backup.
 
 | Sign-in | Settings |
 |---|---|
 | Okta or any OIDC provider | `TERIAC_OIDC_ISSUER`, `TERIAC_OIDC_CLIENT_ID`, `TERIAC_OIDC_CLIENT_SECRET`, `TERIAC_OIDC_ADMIN_GROUPS`, `TERIAC_OIDC_ALLOWED_GROUPS`; optional `TERIAC_OIDC_NAME` (button label), `TERIAC_OIDC_SCOPES` (default `openid,profile,email,groups`), `TERIAC_OIDC_GROUPS_CLAIM` (default `groups`). Redirect URI: `<public url>/auth/oidc/callback` |
-| Username and password | `dashboard.users` in `repos.yaml`, or `TERIAC_DASHBOARD_USERS_FILE`. Hash passwords with `node packages/server/src/hash-password.ts` |
+| GitHub | `TERIAC_GITHUB_CLIENT_ID`, `TERIAC_GITHUB_CLIENT_SECRET` (the App's, from its settings page), `TERIAC_GITHUB_ADMIN_USERS`, `TERIAC_GITHUB_ADMIN_TEAMS` (`org/slug`), optional `TERIAC_GITHUB_ALLOWED_TEAMS`. Callback URL on the App: `<public url>/auth/github/callback` |
+| Username and password | `dashboard.users` in `repos.yaml`, or `TERIAC_DASHBOARD_USERS_FILE`. Hash passwords with `node packages/server/src/hash-password.ts`. `TERIAC_DASHBOARD_PASSWORD_LOGIN=false` turns it off (and ends password sessions) |
 | API token | `TERIAC_API_TOKEN` (admin) |
+
+**Signed in with GitHub**, people see only the repos that both they and the App can see on
+GitHub (runs, live output, locks, audit, metrics, drift). They can release their own locks, and any
+lock in a repo where they have maintain or admin; other actions are for admins. teriac checks with
+GitHub again every 10 minutes, so lost access or leaving an admin team takes effect within that time;
+these sessions last at most 8 hours.
 
 Sessions are signed, HttpOnly cookies. Login attempts are rate limited, and the page loads nothing
 from third parties.
@@ -612,5 +716,18 @@ These need a dashboard session or `Authorization: Bearer $TERIAC_API_TOKEN`:
 - `GET /api/safety` (the Guardrails page)
 - `GET /api/backups`
 - `POST /api/backups/run` (admin)
+- `GET /api/applies`, `POST /api/applies/pause` and `/resume` (admin)
+- `POST /api/commands`: run a PR command from outside GitHub (below)
+
+```bash
+curl -X POST https://teriac.acme.com/api/commands \
+  -H "Authorization: Bearer $TERIAC_API_TOKEN" -H 'Content-Type: application/json' \
+  -d '{"repo": "github.com/acme/infra", "pr": 42, "command": "apply -p envs/dev", "as": "alice"}'
+```
+
+It runs `plan`, `apply`, `unlock` or `cancel` as a GitHub login: the one in `as` with the API
+token, or yourself when signed in with GitHub (password and SSO users can't). That person's
+permissions and the PR's approvals, locks and freezes apply, as for a comment. The answer is
+`202 Accepted`; teriac posts the result on the PR, saying it came from the API and for whom.
 
 `/healthz`, `/readyz` and `/metrics` (Prometheus) are open.

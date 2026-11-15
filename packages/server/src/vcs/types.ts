@@ -39,6 +39,8 @@ export type VcsEvent =
   // Someone else edited or deleted a comment written by teriac.
   | { kind: 'bot_comment_changed'; repo: Repo; prNumber: number; commentId: string; by: string; change: 'edited' | 'deleted'; body: string }
   | { kind: 'apply_button'; repo: Repo; prNumber: number; project: string; user: string }
+  // A command from teriac's API (POST /api/commands): run as `user`, a GitHub login.
+  | { kind: 'api_command'; repo: Repo; prNumber: number; user: string; text: string; via: string }
   | { kind: 'ignored'; reason: string };
 
 // Repo permission levels, lowest to highest.
@@ -136,4 +138,7 @@ export interface VcsAdapter {
   // Commits `files` to a new branch from `base` and opens a PR. Returns its URL,
   // or null if the branch already exists (a PR for it is open or was handled).
   openPullRequest?(repo: Repo, pr: { base: string; branch: string; title: string; body: string; files: { path: string; content: string }[] }): Promise<string | null>;
+  // Automerge: merge the PR (refused merges return ok: false with the platform's reason), delete a branch.
+  mergePullRequest?(repo: Repo, number: number, method: 'merge' | 'squash' | 'rebase', sha: string): Promise<{ ok: boolean; message: string }>;
+  deleteBranch?(repo: Repo, branch: string): Promise<boolean>;
 }
