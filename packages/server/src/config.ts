@@ -55,6 +55,7 @@ export interface RepoPolicy {
   automerge?: boolean | { method?: 'merge' | 'squash' | 'rebase'; delete_branch?: boolean }; // merge the PR once everything planned is applied
   log_retention_days?: number;                // clear this repo's run logs this many days after a PR's last apply
   remind_unmerged?: { after_hours: number; notify?: string[]; comment?: boolean }; // applied but not merged after this long: remind
+  hooks?: Partial<Record<'pre_plan' | 'post_plan' | 'pre_apply' | 'post_apply', { name: string; run: string }[]>>; // server-only commands around plans and applies
   autoplan?: boolean;                         // default true
   plan_drafts?: boolean;                      // default false
   allow_repo_schedules?: boolean;             // drift schedules from teriac.yaml (default true)
@@ -321,6 +322,14 @@ export const parseReposYaml = (text: string): RepoPolicy[] => {
     validateBool(repo.verify_plan, `${at}.verify_plan`);
     validateBool(repo.allow_fork_prs, `${at}.allow_fork_prs`);
     if (repo.checkout !== undefined && !['branch', 'merge'].includes(repo.checkout)) throw new Error(`${at}.checkout must be branch or merge`);
+    if (repo.hooks !== undefined) {
+      if (typeof repo.hooks !== 'object' || repo.hooks === null) throw new Error(`${at}.hooks must be { pre_plan, post_plan, pre_apply, post_apply }`);
+      for (const [stage, list] of Object.entries(repo.hooks)) {
+        if (!['pre_plan', 'post_plan', 'pre_apply', 'post_apply'].includes(stage)) throw new Error(`${at}.hooks: unknown stage "${stage}" (pre_plan, post_plan, pre_apply, post_apply)`);
+        if (!Array.isArray(list)) throw new Error(`${at}.hooks.${stage} must be a list of { name, run }`);
+        for (const [j, h] of list.entries()) if (!h || typeof h.name !== 'string' || typeof h.run !== 'string' || !h.run.trim()) throw new Error(`${at}.hooks.${stage}[${j}] needs a name and a run command`);
+      }
+    }
     if (repo.log_retention_days !== undefined && !(Number.isInteger(repo.log_retention_days) && repo.log_retention_days >= 1)) throw new Error(`${at}.log_retention_days must be a whole number of days, 1 or more`);
     if (repo.remind_unmerged !== undefined) {
       const r = repo.remind_unmerged as Record<string, any>;

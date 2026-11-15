@@ -157,6 +157,10 @@ CREATE TABLE IF NOT EXISTS grants (
   created_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT, revoked_by TEXT, used_at TEXT,
   expiry_noted INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS closed_prs (
+  repo TEXT NOT NULL, pr INTEGER NOT NULL, at TEXT NOT NULL, merged INTEGER NOT NULL DEFAULT 0,
+  PRIMARY KEY (repo, pr)
+);
 CREATE TABLE IF NOT EXISTS settings (
   key TEXT PRIMARY KEY, value TEXT NOT NULL
 );
@@ -249,13 +253,21 @@ export class Store {
     return Number(this.db.prepare(`UPDATE runs SET output = '', output_expired_at = ? WHERE repo = ? AND pr = ? AND output_expired_at IS NULL AND status != 'running'`).run(at, repo, pr).changes);
   }
 
-  // Successful applies of PRs that still hold locks (not merged or closed yet), finished before `before`.
+  // PRs closed or merged (from the platform's events); reopening forgets it.
+  markPrClosed(repo: string, pr: number, merged: boolean, at = new Date().toISOString()): void {
+    this.db.prepare('INSERT INTO closed_prs (repo, pr, at, merged) VALUES (?, ?, ?, ?) ON CONFLICT(repo, pr) DO UPDATE SET at = excluded.at, merged = excluded.merged').run(repo, pr, at, merged ? 1 : 0);
+  }
+  markPrOpen(repo: string, pr: number): void {
+    this.db.prepare('DELETE FROM closed_prs WHERE repo = ? AND pr = ?').run(repo, pr);
+  }
+
+  // The last successful apply of each PR not known to be closed, finished before `before`.
   appliesStillOpen(before: string): Run[] {
     return (this.db.prepare(`
       SELECT r.* FROM runs r
       WHERE r.kind = 'apply' AND r.status = 'success' AND r.finished_at < ?
         AND r.id = (SELECT MAX(id) FROM runs x WHERE x.repo = r.repo AND x.pr = r.pr AND x.kind = 'apply' AND x.status = 'success')
-        AND EXISTS (SELECT 1 FROM locks l WHERE l.repo = r.repo AND l.pr = r.pr)
+        AND NOT EXISTS (SELECT 1 FROM closed_prs c WHERE c.repo = r.repo AND c.pr = r.pr)
     `).all(before) as Record<string, any>[]).map(toRun);
   }
 

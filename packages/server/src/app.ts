@@ -381,8 +381,10 @@ export class App {
     return this.queue.run(key, async () => {
       try {
         switch (event.kind) {
-          case 'pr_opened': case 'pr_updated': return await this.autoplan(adapter, policy, event.repo, number);
-          case 'pr_closed': return await this.closed(event.repo, number);
+          case 'pr_opened': case 'pr_updated':
+            this.deps.store.markPrOpen(this.repoKey(event.repo), number);
+            return await this.autoplan(adapter, policy, event.repo, number);
+          case 'pr_closed': return await this.closed(event.repo, number, event.merged);
           case 'bot_comment_changed': return await this.commentChanged(adapter, event);
           case 'comment': return await this.onComment(adapter, policy, event.repo, number, event.author, event.body, event.commentId);
           case 'apply_button': {
@@ -661,7 +663,8 @@ export class App {
     await this.respond(reply, () => this.plans(ctx, allowedTargets, ctx.pr.author, {}, notes, reply));
   }
 
-  private async closed(repo: Repo, number: number) {
+  private async closed(repo: Repo, number: number, merged = false) {
+    this.deps.store.markPrClosed(this.repoKey(repo), number, merged);
     const released = this.deps.store.releasePrLocks(this.repoKey(repo), number);
     this.deps.store.forgetPrComments(this.repoKey(repo), number);
     this.forgetPlans(this.repoKey(repo), number);
@@ -938,6 +941,7 @@ export class App {
       const r = await runPlan({
         root: ctx.root, project, tools, planPath, env: this.env(ctx, project, user), timeoutMs: config.runTimeoutMs,
         onOutput: live.write, onSensitive: live.sensitive, signal: abort.signal,
+        hooks: { pre: ctx.policy.hooks?.pre_plan, post: ctx.policy.hooks?.post_plan },
       }, opts);
       const destroys = r.summary ? r.summary.destroy + r.summary.replace : 0;
       let policy: PolicyResult | null = null;
@@ -1380,7 +1384,7 @@ export class App {
       let sensitive: string[] = [];
       try { sensitive = sensitiveValues(JSON.parse(readFileSync(`${plan.planPath}.json`, 'utf-8'))); } catch { /* no saved plan JSON */ }
       live.sensitive(sensitive);
-      const r = await runApply({ root: ctx.root, project, tools, planPath: plan.planPath!, env: this.env(ctx, project, user), timeoutMs: config.runTimeoutMs, onOutput: live.write, onSensitive: live.sensitive, sensitive });
+      const r = await runApply({ root: ctx.root, project, tools, planPath: plan.planPath!, env: this.env(ctx, project, user), timeoutMs: config.runTimeoutMs, onOutput: live.write, onSensitive: live.sensitive, sensitive, hooks: { pre: ctx.policy.hooks?.pre_apply, post: ctx.policy.hooks?.post_apply } });
       // The apply already happened, so "fail" mode can only hide the output here.
       const scanned = this.scan(ctx, r.output);
       this.auditSecrets(ctx, user, project, scanned.found, 'apply');
@@ -1389,7 +1393,12 @@ export class App {
       this.notifyApply(ctx, project, user, store.getRun(runId)!);
       // An applied plan can't be applied again (Terraform calls it stale): free its space.
       // Its run and output stay; the apply's live output stays for anyone still watching.
-      if (r.ok) this.forgetPlans(ctx.repoKey, ctx.pr.number, project.name, { keepLive: true });
+      if (r.ok) {
+        this.forgetPlans(ctx.repoKey, ctx.pr.number, project.name, { keepLive: true });
+        // Applied: the project is free for other PRs again (a failed apply keeps the lock).
+        const lock = store.getLock(ctx.repoKey, project.name, project.workspace);
+        if (lock?.pr === ctx.pr.number) store.releaseLock(ctx.repoKey, project.name, project.workspace);
+      }
     } catch (err) {
       store.finishRun(runId, { status: 'failed', engine, output: `teriac could not apply this project: ${(err as Error).message}` });
     } finally {

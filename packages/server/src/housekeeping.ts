@@ -76,6 +76,13 @@ export class Housekeeper {
       if (!r || Date.parse(run.finishedAt!) > now.getTime() - r.after_hours * HOUR) continue;
       const key = `reminded:${run.repo}#${run.pr}:${run.id}`;
       if (this.d.store.getSetting(key)) continue;
+      // Check with the platform: a merge we missed the event for shouldn't be reminded.
+      const host = run.repo.split('/')[0];
+      const adapter = this.d.adapterFor(host);
+      if (adapter) {
+        const pr = await adapter.getPullRequest(repoOf(run.repo, adapter.platform), run.pr).catch(() => null);
+        if (pr && !pr.open) { this.d.store.markPrClosed(run.repo, run.pr, false); continue; }
+      }
       this.d.store.setSetting(key, now.toISOString());
       await this.send(run, r, now);
       sent++;

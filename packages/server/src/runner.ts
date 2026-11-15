@@ -152,7 +152,11 @@ export interface RunContext {
   onSensitive?: (values: string[]) => void; // sensitive values found while running
   signal?: AbortSignal;                     // `teriac cancel`: stop this run
   sensitive?: string[];                     // values to hide from the start (apply: from its plan)
+  hooks?: { pre?: Hook[]; post?: Hook[] };   // repos.yaml hooks around this plan or apply
 }
+
+// A command run around a plan or apply (server config only), in the project's folder.
+export interface Hook { name: string; run: string }
 
 export interface PlanResult {
   ok: boolean;
@@ -215,6 +219,19 @@ const steps = (ctx: RunContext) => {
     try { learn(sensitiveValues(JSON.parse(r.stdout.slice(r.stdout.indexOf('{'))))); } catch { /* no state */ }
   };
   const hide = (text: string) => hideValues(text, [...hidden].sort((a, b) => b.length - a.length));
+  // Hooks run with sh in the project folder; output goes to the log and the live view.
+  const hooks = async (list: Hook[] | undefined, log: string[], extra: Record<string, string> = {}): Promise<boolean> => {
+    for (const h of list ?? []) {
+      const line = `$ hook ${h.name}: ${h.run}`;
+      log.push(line);
+      live(`${line}\n`);
+      const r = await exec('sh', ['-c', h.run], cwd, { ...env, ...extra }, { timeoutMs: ctx.timeoutMs, onOutput: live, signal: ctx.signal });
+      flush();
+      if (r.output.trim()) log.push(tidy(r.output.trimEnd()));
+      if (r.code !== 0) { log.push(`[teriac] hook ${h.name} failed (exit ${r.code})`); return false; }
+    }
+    return true;
+  };
   const prepare = async (log: string[]) => {
     // Terragrunt runs init itself.
     if (!tools.terragrunt) {
@@ -227,7 +244,7 @@ const steps = (ctx: RunContext) => {
     }
     return true;
   };
-  return { run, prepare, usage: () => usage, learn, learnState, hide };
+  return { run, prepare, usage: () => usage, learn, learnState, hide, hooks };
 };
 
 // `terraform output` prints a sensitive output in plain text when it's asked for by name,
@@ -247,13 +264,14 @@ export const renderOutputs = (json: string, name?: string): { ok: boolean; text:
 
 export const plan = async (ctx: RunContext, opts: { destroy?: boolean; targets?: string[]; extraArgs?: string[]; refreshOnly?: boolean; replace?: string[]; noLock?: boolean } = {}): Promise<PlanResult> => {
   const log: string[] = [];
-  const { run, prepare, usage, learn, learnState, hide } = steps(ctx);
+  const { run, prepare, usage, learn, learnState, hide, hooks } = steps(ctx);
   mkdirSync(dirname(ctx.planPath), { recursive: true });
   if (existsSync(ctx.planPath)) rmSync(ctx.planPath);
   for (const f of [`${ctx.planPath}.json`]) if (existsSync(f)) rmSync(f);
 
   if (!(await prepare(log))) return { ok: false, output: hide(log.join('\n')), summary: null, hasChanges: false, usage: usage() };
   await learnState();
+  if (!(await hooks(ctx.hooks?.pre, log))) return { ok: false, output: hide(log.join('\n')), summary: null, hasChanges: false, usage: usage() };
 
   const args = ['plan', '-input=false', '-no-color', '-detailed-exitcode', `-out=${ctx.planPath}`];
   if (opts.destroy) args.push('-destroy');
@@ -284,15 +302,22 @@ export const plan = async (ctx: RunContext, opts: { destroy?: boolean; targets?:
     log.push('[teriac] could not read the plan as JSON; showing raw output only');
   }
   const hasChanges = summary ? !summary.noChanges : p.code === 2;
+  // post_plan hooks see the plan (PLAN_FILE, PLAN_JSON); one that fails makes the plan unappliable.
+  if (!(await hooks(ctx.hooks?.post, log, { PLAN_FILE: ctx.planPath, PLAN_JSON: planJsonPath ?? '' }))) {
+    return { ok: false, output: hide(log.join('\n')), summary, hasChanges, plan: parsed, planJsonPath, usage: usage(), sensitive: parsed ? sensitiveValues(parsed) : [] };
+  }
   return { ok: true, output: hide(log.join('\n')), summary, hasChanges, plan: parsed, planJsonPath, usage: usage(), sensitive: parsed ? sensitiveValues(parsed) : [] };
 };
 
 export const apply = async (ctx: RunContext): Promise<{ ok: boolean; output: string; usage?: Usage | null }> => {
   const log: string[] = [];
-  const { run, prepare, usage, hide } = steps(ctx);
+  const { run, prepare, usage, hide, hooks } = steps(ctx);
   if (!existsSync(ctx.planPath)) return { ok: false, output: 'The saved plan is gone; run plan again.' };
   if (!(await prepare(log))) return { ok: false, output: hide(log.join('\n')), usage: usage() };
+  if (!(await hooks(ctx.hooks?.pre, log, { PLAN_FILE: ctx.planPath }))) return { ok: false, output: hide(log.join('\n')), usage: usage() };
   const r = await run(['apply', '-input=false', '-no-color', ctx.planPath], log);
+  // post_apply hooks run after a successful apply; a failure is reported, the apply stands.
+  if (r.code === 0 && !(await hooks(ctx.hooks?.post, log))) log.push('[teriac] the apply succeeded, but a post_apply hook failed');
   return { ok: r.code === 0, output: hide(log.join('\n')), usage: usage() };
 };
 

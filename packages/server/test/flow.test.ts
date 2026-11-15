@@ -207,17 +207,21 @@ test('4. Apply button on prod: a platform-admin applies after a team approval', 
   assert.equal(gh.checks.get('teriac: envs/prod')!.title, 'Applied');
 });
 
-test('5. a second PR is blocked by the lock, and unblocked after merge', async () => {
+test('5. applying frees a project; a PR still planning holds it until it merges', async () => {
+  // PR #1 applied both its projects: their locks are free, so PR #2 plans at once.
+  assert.equal(store.locksForPr('github.com/acme/infra', 1).length, 0, 'applied projects are released');
   gh.prs.set(2, pr(2, 'carol'));
   gh.files.set(2, ['envs/dev/main.tf']);
   await app.handle(gh, { kind: 'pr_opened', repo, pr: pr(2, 'carol') });
-  assert.match(gh.sticky.get(2)!, /locked by #1 \(bob\)/);
-
-  await app.handle(gh, { kind: 'pr_closed', repo, pr: pr(1, 'bob'), merged: true });
-  assert.equal(store.locksForPr('github.com/acme/infra', 1).length, 0);
-
-  await comment(2, 'carol', 'teriac plan');
   assert.match(gh.sticky.get(2)!, /\| \[`envs\/dev`\]\([^)]+\) \| terraform 1\.9\.8 \| terraform \(built-in\) \| ⚠️/);
+
+  // PR #2 holds envs/dev now (planned, not applied): another PR is blocked.
+  gh.prs.set(4, pr(4, 'bob'));
+  gh.files.set(4, ['envs/dev/main.tf']);
+  await app.handle(gh, { kind: 'pr_opened', repo, pr: pr(4, 'bob') });
+  assert.match(gh.sticky.get(4)!, /locked by #2 \(carol\)/);
+  await app.handle(gh, { kind: 'pr_closed', repo, pr: pr(4, 'bob'), merged: false });
+  await app.handle(gh, { kind: 'pr_closed', repo, pr: pr(1, 'bob'), merged: true });
 });
 
 test('6. read-only users cannot run code; fork-style autoplan is held', async () => {

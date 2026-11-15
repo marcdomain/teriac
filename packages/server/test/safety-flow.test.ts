@@ -821,3 +821,32 @@ describe('automerge', () => {
     assert.equal(off.gh.merges.length, 0);
   });
 });
+
+// ---------------------------------------------------------------------------
+describe('hooks (server config only)', () => {
+  test('run around plan and apply; post_plan sees the plan; a failing pre_apply stops the apply', async () => {
+    const { gh, say, open, store } = setup([
+      '    hooks:',
+      '      pre_plan: [{ name: lint, run: "echo linted" }]',
+      '      post_plan: [{ name: check, run: "test -f \\"$PLAN_FILE\\" && echo saw the plan" }]',
+      '      pre_apply: [{ name: gate, run: "echo no deploys today; exit 3" }]',
+      '',
+    ].join('\n'));
+    await open();
+    const plan = store.latestRuns('github.com/acme/infra', 1, 'plan')[0];
+    assert.match(plan.output, /\$ hook lint: echo linted\nlinted/);
+    assert.match(plan.output, /saw the plan/);
+    gh.reviewsByPr.set(1, [{ user: 'carol', state: 'approved', commitSha: head }, { user: 'alice', state: 'approved', commitSha: head }]);
+    await say('alice', 'teriac apply -p envs/dev');
+    const apply = store.latestRuns('github.com/acme/infra', 1, 'apply')[0];
+    assert.equal(apply.status, 'failed');
+    assert.match(apply.output, /no deploys today\n\[teriac\] hook gate failed \(exit 3\)/);
+    assert.doesNotMatch(apply.output, /Apply complete/);
+  });
+
+  test('bad hooks are refused at start-up', async () => {
+    const { parseServerPolicy } = await import('../src/config.ts');
+    assert.throws(() => parseServerPolicy('repos:\n  - id: github.com/a/b\n    hooks: { pre_deploy: [] }\n'), /unknown stage "pre_deploy"/);
+    assert.throws(() => parseServerPolicy('repos:\n  - id: github.com/a/b\n    hooks: { pre_plan: [{ name: x }] }\n'), /needs a name and a run command/);
+  });
+});

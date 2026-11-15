@@ -45,14 +45,18 @@ test('logs are cleared N days after the PR\'s last apply; everything else stays'
 test('applied but not merged after N hours: one short comment to whoever applied, and chat', async () => {
   const now = new Date('2026-11-20T12:00:00Z');
   const store = new Store(':memory:');
-  seed(store, 1, 30, now);
-  store.acquireLock(REPO, 'envs/dev', 'default', 1, 'bob');     // still open (holds its lock)
-  seed(store, 2, 30, now);                                      // merged: no locks left
-  seed(store, 3, 2, now);
-  store.acquireLock(REPO, 'envs/prod', 'default', 3, 'bob');    // open, but applied only 2 hours ago
+  seed(store, 1, 30, now);                                      // still open
+  seed(store, 2, 30, now);
+  store.markPrClosed(REPO, 2, true);                            // merged (its event arrived)
+  seed(store, 3, 2, now);                                       // open, but applied only 2 hours ago
+  seed(store, 4, 30, now);                                      // merged, but the event was missed
   const comments: { pr: number; body: string }[] = [];
   const sent: any[] = [];
-  const adapter = { platform: 'github', comment: async (_r: any, pr: number, body: string) => { comments.push({ pr, body }); return '1'; } } as any;
+  const adapter = {
+    platform: 'github',
+    comment: async (_r: any, pr: number, body: string) => { comments.push({ pr, body }); return '1'; },
+    getPullRequest: async (_r: any, pr: number) => ({ number: pr, open: pr !== 4 }),
+  } as any;
   const fetchImpl = (async (_u: string, init: RequestInit) => { sent.push(JSON.parse(String(init.body))); return new Response('ok'); }) as typeof fetch;
   const hk = new Housekeeper({ config: config({ remind_unmerged: { after_hours: 24, notify: ['ops'] } }), store, adapterFor: () => adapter, env: { HOOK: 'https://hook.test' }, fetchImpl });
   assert.equal((await hk.tick(now)).reminded, 1);
