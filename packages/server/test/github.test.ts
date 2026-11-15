@@ -193,3 +193,91 @@ test('git settings for module downloads: header for the host only; your own sett
   assert.deepEqual(gitAuthEnv({}, { url: 'https://ghe.acme.dev/api/v3', extraHeader: 'h' }).GIT_CONFIG_KEY_0, 'http.https://ghe.acme.dev/.extraheader');
   assert.deepEqual(gitAuthEnv({}, { url: 'git://x/y', extraHeader: 'h' }), {});
 });
+
+// ---- key rotation ----------------------------------------------------------------
+const second = generateKeyPairSync('rsa', { modulusLength: 2048 });
+const pemNext = second.privateKey.export({ type: 'pkcs1', format: 'pem' }).toString();
+const signedBy = (auth: string, pub: typeof publicKey) => {
+  const [h, p, s] = auth.replace('Bearer ', '').split('.');
+  return !!s && createVerify('RSA-SHA256').update(`${h}.${p}`).verify(pub, Buffer.from(s, 'base64url'));
+};
+
+test('rotation: when GitHub refuses the current key, the next one signs in, and is used first from then on', async () => {
+  let accept = publicKey;           // GitHub has both keys; then the old one is deleted
+  const calls: string[] = [];
+  let n = 0;
+  const fetchImpl = (async (url: string, init: RequestInit) => {
+    const auth = String((init.headers as Record<string, string>).Authorization);
+    if (url.includes('/access_tokens')) {
+      const ok = signedBy(auth, accept);
+      calls.push(signedBy(auth, publicKey) ? 'old' : 'next');
+      return ok ? Response.json({ token: `ghs_${++n}`, expires_at: new Date(Date.now() + 3_600_000).toISOString() }, { status: 201 }) : new Response('{"message":"bad credentials"}', { status: 401 });
+    }
+    return Response.json({ ok: true, auth });
+  }) as typeof fetch;
+  const a = new GitHubAdapter({ ...cfg, secrets: () => ({ keys: [pem, pemNext], webhookSecrets: [cfg.webhookSecret] }) }, fetchImpl);
+  const repo = { platform: 'github', host: 'github.com', owner: 'acme', name: 'infra', fullName: 'acme/infra', cloneUrl: '', installationId: 9 } as any;
+  await (a as any).installationToken(repo);
+  assert.deepEqual(calls, ['old']);
+  accept = second.publicKey;        // the old key is deleted in GitHub
+  (a as any).tokens.clear();
+  const t = await (a as any).installationToken(repo, { metadata: 'read' });
+  assert.equal(t, 'ghs_2');
+  assert.deepEqual(calls, ['old', 'old', 'next']);
+  (a as any).tokens.clear();
+  await (a as any).installationToken(repo);
+  assert.deepEqual(calls.slice(3), ['next'], 'the key that worked is tried first');
+});
+
+test('rotation: a running job whose token is refused gets a fresh one and carries on', async () => {
+  let n = 0;
+  const seen: string[] = [];
+  const fetchImpl = (async (url: string, init: RequestInit) => {
+    if (url.includes('/access_tokens')) return Response.json({ token: `ghs_${++n}`, expires_at: new Date(Date.now() + 3_600_000).toISOString() }, { status: 201 });
+    const auth = String((init.headers as Record<string, string>).Authorization);
+    seen.push(auth);
+    return auth === 'Bearer ghs_1' ? new Response('{"message":"Bad credentials"}', { status: 401 }) : Response.json({ id: 1 });
+  }) as typeof fetch;
+  const a = new GitHubAdapter(cfg, fetchImpl);
+  const repo = { platform: 'github', host: 'github.com', owner: 'acme', name: 'infra', fullName: 'acme/infra', cloneUrl: '', installationId: 9 } as any;
+  const id = await a.comment(repo, 7, 'hello');
+  assert.equal(id, '1');
+  assert.deepEqual(seen, ['Bearer ghs_1', 'Bearer ghs_2']);
+});
+
+test('rotation: webhooks signed with either secret are accepted; the JWT names the client ID when set', () => {
+  const a = new GitHubAdapter({ ...cfg, clientId: 'Iv23liABC', secrets: () => ({ keys: [pem], webhookSecrets: ['old-secret', 'new-secret'] }) });
+  const body = Buffer.from('{}');
+  const sig = (s: string) => `sha256=${createHmac('sha256', s).update(body).digest('hex')}`;
+  assert.equal(a.verify({ 'x-hub-signature-256': sig('old-secret') }, body), true);
+  assert.equal(a.verify({ 'x-hub-signature-256': sig('new-secret') }, body), true);
+  assert.equal(a.verify({ 'x-hub-signature-256': sig('other') }, body), false);
+});
+
+test('rotation: key files are re-read when they change, without a restart', async () => {
+  const { mkdtempSync, writeFileSync, rmSync, utimesSync } = await import('node:fs');
+  const { join } = await import('node:path');
+  const { tmpdir } = await import('node:os');
+  const { loadConfig } = await import('../src/config.ts');
+  const dir = mkdtempSync(join(tmpdir(), 'teriac-keys-'));
+  try {
+    writeFileSync(join(dir, 'key'), pem);
+    writeFileSync(join(dir, 'hook'), 'old-secret');
+    const c = loadConfig({
+      TERIAC_GITHUB_APP_ID: '1', TERIAC_GITHUB_PRIVATE_KEY_FILE: join(dir, 'key'), TERIAC_GITHUB_PRIVATE_KEY_NEXT_FILE: join(dir, 'key-next'),
+      TERIAC_GITHUB_WEBHOOK_SECRET_FILE: join(dir, 'hook'), TERIAC_GITHUB_WEBHOOK_SECRET_NEXT_FILE: join(dir, 'hook-next'),
+      TERIAC_REPO_ALLOWLIST: 'github.com/acme/*', TERIAC_DATA_DIR: dir,
+    });
+    assert.deepEqual(c.github!.secrets!(), { keys: [pem.trim()], webhookSecrets: ['old-secret'] }, 'no next files yet: fine');
+    writeFileSync(join(dir, 'key-next'), pemNext);
+    writeFileSync(join(dir, 'hook-next'), 'new-secret');
+    assert.deepEqual(c.github!.secrets!(), { keys: [pem.trim(), pemNext.trim()], webhookSecrets: ['old-secret', 'new-secret'] });
+    // Rotation done: the next key becomes the key.
+    writeFileSync(join(dir, 'key'), pemNext);
+    utimesSync(join(dir, 'key'), new Date(), new Date(Date.now() + 5000));
+    rmSync(join(dir, 'key-next'));
+    assert.deepEqual(c.github!.secrets!().keys, [pemNext.trim()]);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});

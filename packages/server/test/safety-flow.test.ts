@@ -920,3 +920,26 @@ describe('the end of a project in a PR: apply, unlock, merge, close', () => {
     for (const p of paths) assert.equal(existsSync(p), false);
   });
 });
+
+describe('a plan is applied once', () => {
+  test('after a failed apply the plan is deleted; applying again asks for a new plan', async () => {
+    const { gh, say, open, store } = setup();
+    await open();
+    gh.reviewsByPr.set(1, [{ user: 'carol', state: 'approved', commitSha: head }, { user: 'alice', state: 'approved', commitSha: head }]);
+    const path = store.latestRuns('github.com/acme/infra', 1, 'plan').find(r => r.project === 'envs/dev')!.planPath!;
+    const flag = join(dirname(fakeTf), 'apply-fail');
+    writeFileSync(flag, '');
+    try { await say('alice', 'teriac apply -p envs/dev'); } finally { rmSync(flag, { force: true }); }
+    assert.equal(existsSync(path), false, 'the plan file is gone');
+    assert.match(gh.comments.map(c => c.body).join('\n'), /❌ The plan for `envs\/dev` was used up by the failed apply\. Fix the problem, then comment `teriac plan -p envs\/dev` and apply the new plan\./);
+    const before = store.latestRuns('github.com/acme/infra', 1, 'apply').length;
+    await say('alice', 'teriac apply -p envs/dev');
+    assert.equal(store.latestRuns('github.com/acme/infra', 1, 'apply').filter(r => r.status === 'success').length, 0, 'nothing applied without a new plan');
+    assert.equal(store.latestRuns('github.com/acme/infra', 1, 'apply').length, before);
+    assert.match(gh.lastReply(), /`envs\/dev`: no plan at the current commit; run `teriac plan` first/);
+    // A new plan, then the apply works.
+    await say('alice', 'teriac plan -p envs/dev');
+    await say('alice', 'teriac apply -p envs/dev');
+    assert.equal(store.latestRuns('github.com/acme/infra', 1, 'apply').find(r => r.project === 'envs/dev')!.status, 'success');
+  });
+});

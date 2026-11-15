@@ -1,6 +1,6 @@
 // Server configuration: environment variables plus the server-side repos.yaml
 // policy file. The repo-side teriac.yaml is in repoConfig.ts.
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, statSync } from 'node:fs';
 import { join, resolve } from 'node:path';
 import YAML from 'yaml';
 import { parseCron, validTimeZone } from './cron.ts';
@@ -136,6 +136,11 @@ export interface GitHubConfig {
   webhookSecret: string;
   apiUrl: string;
   host: string;
+  clientId?: string;      // TERIAC_GITHUB_CLIENT_ID: the App's client ID (JWT issuer; GitHub sign-in)
+  clientSecret?: string;  // TERIAC_GITHUB_CLIENT_SECRET: for "Sign in with GitHub" on the dashboard
+  // Key rotation: the keys and webhook secrets in force now, current first. Files are
+  // re-read when they change, so a rotated Kubernetes Secret applies without a restart.
+  secrets?: () => { keys: string[]; webhookSecrets: string[] };
 }
 
 export interface ServerConfig {
@@ -168,6 +173,24 @@ export interface ServerConfig {
   summary?: SummaryConfig;
   backup?: BackupConfig;                  // scheduled database backups (TERIAC_BACKUP_*)
 }
+
+// A secret that may change while the server runs: re-read from its file when the file
+// changes (a missing or empty file means "not set").
+const liveSecret = (env: NodeJS.ProcessEnv, name: string): (() => string | undefined) => {
+  const file = env[`${name}_FILE`];
+  if (!file) { const v = env[name]?.trim(); return () => v || undefined; }
+  let seen = -1;
+  let value: string | undefined;
+  return () => {
+    let m = 0;
+    try { m = statSync(file).mtimeMs; } catch { seen = -1; return (value = undefined); }
+    if (m !== seen) {
+      seen = m;
+      try { value = readFileSync(file, 'utf-8').trim() || undefined; } catch { value = undefined; }
+    }
+    return value;
+  };
+};
 
 const readSecret = (env: NodeJS.ProcessEnv, name: string): string | undefined => {
   const file = env[`${name}_FILE`];
@@ -425,7 +448,21 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): ServerConfig =
     }
     const apiUrl = (env.TERIAC_GITHUB_API_URL || 'https://api.github.com').replace(/\/+$/, '');
     const host = apiUrl === 'https://api.github.com' ? 'github.com' : new URL(apiUrl).host;
-    github = { appId, privateKey: privateKey.replace(/\\n/g, '\n'), webhookSecret, apiUrl, host };
+    const pem = (v: string | undefined) => v?.replace(/\\n/g, '\n');
+    const key = liveSecret(env, 'TERIAC_GITHUB_PRIVATE_KEY');
+    const keyNext = liveSecret(env, 'TERIAC_GITHUB_PRIVATE_KEY_NEXT');
+    const hook = liveSecret(env, 'TERIAC_GITHUB_WEBHOOK_SECRET');
+    const hookNext = liveSecret(env, 'TERIAC_GITHUB_WEBHOOK_SECRET_NEXT');
+    const clientSecret = readSecret(env, 'TERIAC_GITHUB_CLIENT_SECRET');
+    if (clientSecret && !env.TERIAC_GITHUB_CLIENT_ID) throw new Error('TERIAC_GITHUB_CLIENT_SECRET needs TERIAC_GITHUB_CLIENT_ID (the App\'s client ID, on its settings page)');
+    github = {
+      appId, privateKey: pem(privateKey)!, webhookSecret, apiUrl, host,
+      clientId: env.TERIAC_GITHUB_CLIENT_ID || undefined, clientSecret: clientSecret || undefined,
+      secrets: () => ({
+        keys: [...new Set([pem(key()) ?? pem(privateKey)!, pem(keyNext())].filter((k): k is string => !!k))],
+        webhookSecrets: [...new Set([hook() ?? webhookSecret, hookNext()].filter((k): k is string => !!k))],
+      }),
+    };
   }
   if (!github) throw new Error('No source-control platform configured (set TERIAC_GITHUB_APP_ID and friends)');
 

@@ -1,6 +1,6 @@
 // GitHub (github.com and GitHub Enterprise Server) via a GitHub App.
 // No SDK: App JWTs are signed with node:crypto and the REST API is plain fetch.
-import { createHmac, createSign, timingSafeEqual } from 'node:crypto';
+import { createHash, createHmac, createSign, timingSafeEqual } from 'node:crypto';
 import type {
   CheckRun, CloneAuth, Comparison, Permission, PullRequest, PullRequestState, Reaction, Repo, Review, VcsAdapter, VcsEvent,
 } from './types.ts';
@@ -62,9 +62,47 @@ export class GitHubAdapter implements VcsAdapter {
     this.cfg = cfg;
     this.fetchImpl = fetchImpl;
     addSecret(cfg.webhookSecret);
+    addSecret(cfg.clientSecret);
+    this.secrets();
   }
 
   // ---- auth ----
+
+  // The keys and webhook secrets in force (rotation: current first, then "next").
+  private secrets(): { keys: string[]; webhookSecrets: string[] } {
+    const s = this.cfg.secrets?.() ?? { keys: [this.cfg.privateKey], webhookSecrets: [this.cfg.webhookSecret] };
+    for (const v of [...s.keys, ...s.webhookSecrets]) addSecret(v);
+    return s.keys.length ? s : { ...s, keys: [this.cfg.privateKey] };
+  }
+
+  private goodKey: string | null = null; // fingerprint of the key GitHub last accepted
+
+  // A request signed as the App. Tries the key that worked last, then the others: during a
+  // rotation GitHub accepts both, and once the old key is deleted the next one takes over
+  // with no restart. Running jobs keep their installation tokens either way.
+  private async appFetch(url: string, init: RequestInit = {}): Promise<Response> {
+    const fp = (k: string) => createHash('sha256').update(k).digest('hex').slice(0, 12);
+    const keys = this.secrets().keys;
+    const ordered = [...keys].sort((a, b) => Number(fp(b) === this.goodKey) - Number(fp(a) === this.goodKey));
+    let res: Response | null = null;
+    for (const [i, key] of ordered.entries()) {
+      res = await this.fetchImpl(url, {
+        ...init,
+        headers: { ...(init.headers as Record<string, string> ?? {}), Authorization: `Bearer ${appJwt(this.cfg.clientId || this.cfg.appId, key)}`, Accept: 'application/vnd.github+json', 'User-Agent': 'teriac-server' },
+      });
+      if (res.status !== 401) {
+        if (this.goodKey !== fp(key)) {
+          if (this.goodKey !== null || key !== keys[0]) {
+            log.warn(key === keys[0] ? 'GitHub accepted the current private key again' : 'GitHub refused the current private key; signed in with private-key-next. Make it the current key and remove the old one', { key: fp(key) });
+          }
+          this.goodKey = fp(key);
+        }
+        return res;
+      }
+      if (i < ordered.length - 1) log.warn('GitHub refused a private key; trying the next one', { key: fp(key) });
+    }
+    return res!;
+  }
 
   // Which installation of the App covers a repo. Webhooks carry it; for work that
   // starts elsewhere (the dashboard, schedules) it's looked up once and remembered.
@@ -76,9 +114,7 @@ export class GitHubAdapter implements VcsAdapter {
     }
     const known = this.installationIds.get(repo.fullName.toLowerCase());
     if (known) return known;
-    const res = await this.fetchImpl(`${this.cfg.apiUrl}/repos/${repo.fullName}/installation`, {
-      headers: { Authorization: `Bearer ${appJwt(this.cfg.appId, this.cfg.privateKey)}`, Accept: 'application/vnd.github+json', 'User-Agent': 'teriac-server' },
-    });
+    const res = await this.appFetch(`${this.cfg.apiUrl}/repos/${repo.fullName}/installation`);
     if (!res.ok) throw new Error(`no GitHub App installation for ${repo.fullName} (HTTP ${res.status}); is the App installed on it?`);
     const id = (await res.json() as { id: number }).id;
     this.installationIds.set(repo.fullName.toLowerCase(), id);
@@ -89,9 +125,7 @@ export class GitHubAdapter implements VcsAdapter {
   // the App will do. Only for github.com; a GitHub Enterprise App can't sign in there.
   async downloadToken(): Promise<string | null> {
     if (this.cfg.host !== 'github.com') return null;
-    const res = await this.fetchImpl(`${this.cfg.apiUrl}/app/installations?per_page=1`, {
-      headers: { Authorization: `Bearer ${appJwt(this.cfg.appId, this.cfg.privateKey)}`, Accept: 'application/vnd.github+json', 'User-Agent': 'teriac-server' },
-    });
+    const res = await this.appFetch(`${this.cfg.apiUrl}/app/installations?per_page=1`);
     if (!res.ok) return null;
     const [first] = await res.json() as { id: number; account?: { login?: string } }[];
     if (!first) return null;
@@ -107,9 +141,9 @@ export class GitHubAdapter implements VcsAdapter {
     const key = `${id}:${permissions ? JSON.stringify(permissions) : 'all'}`;
     const cached = this.tokens.get(key);
     if (cached && cached.expires - 5 * 60_000 > Date.now()) return cached.token;
-    const res = await this.fetchImpl(`${this.cfg.apiUrl}/app/installations/${id}/access_tokens`, {
+    const res = await this.appFetch(`${this.cfg.apiUrl}/app/installations/${id}/access_tokens`, {
       method: 'POST',
-      headers: { Authorization: `Bearer ${appJwt(this.cfg.appId, this.cfg.privateKey)}`, Accept: 'application/vnd.github+json', 'User-Agent': 'teriac-server', ...(permissions ? { 'Content-Type': 'application/json' } : {}) },
+      headers: permissions ? { 'Content-Type': 'application/json' } : {},
       ...(permissions ? { body: JSON.stringify({ permissions }) } : {}),
     });
     if (!res.ok) throw new Error(`GitHub App token request failed: HTTP ${res.status}`);
@@ -129,7 +163,7 @@ export class GitHubAdapter implements VcsAdapter {
     return { url: `https://${this.cfg.host}/`, extraHeader: `Authorization: Basic ${basic}` };
   }
 
-  private async api<T = any>(repo: Repo, method: string, path: string, body?: unknown, okStatuses: number[] = []): Promise<{ status: number; data: T; next: string | null }> {
+  private async api<T = any>(repo: Repo, method: string, path: string, body?: unknown, okStatuses: number[] = [], retried = false): Promise<{ status: number; data: T; next: string | null }> {
     const token = await this.installationToken(repo);
     const url = path.startsWith('http') ? path : `${this.cfg.apiUrl}${path}`;
     const res = await this.fetchImpl(url, {
@@ -144,6 +178,12 @@ export class GitHubAdapter implements VcsAdapter {
       body: body ? JSON.stringify(body) : undefined,
     });
     const text = await res.text();
+    // A token GitHub no longer accepts (revoked, or its key rotated away): get a new one
+    // and try once more, so a running job carries on.
+    if (res.status === 401 && !retried) {
+      for (const k of this.tokens.keys()) if (this.tokens.get(k)!.token === token) this.tokens.delete(k);
+      return this.api<T>(repo, method, path, body, okStatuses, true);
+    }
     if (!res.ok && !okStatuses.includes(res.status)) {
       throw new Error(`GitHub ${method} ${path}: HTTP ${res.status} ${text.slice(0, 200)}`);
     }
@@ -165,7 +205,9 @@ export class GitHubAdapter implements VcsAdapter {
   // ---- webhooks ----
 
   verify(headers: Headers, rawBody: Buffer): boolean {
-    return verifySignature(this.cfg.webhookSecret, rawBody, header(headers, 'x-hub-signature-256'));
+    // Either webhook secret, while it's being rotated.
+    const sig = header(headers, 'x-hub-signature-256');
+    return this.secrets().webhookSecrets.some(s => verifySignature(s, rawBody, sig));
   }
 
   private repoFrom(payload: any): Repo {
@@ -186,8 +228,7 @@ export class GitHubAdapter implements VcsAdapter {
   }
 
   async listRepos(): Promise<Repo[]> {
-    const headers = { Authorization: `Bearer ${appJwt(this.cfg.appId, this.cfg.privateKey)}`, Accept: 'application/vnd.github+json', 'User-Agent': 'teriac-server' };
-    const res = await this.fetchImpl(`${this.cfg.apiUrl}/app/installations?per_page=100`, { headers });
+    const res = await this.appFetch(`${this.cfg.apiUrl}/app/installations?per_page=100`);
     if (!res.ok) throw new Error(`GitHub: listing installations failed (HTTP ${res.status})`);
     const installations = await res.json() as { id: number }[];
     const repos: Repo[] = [];

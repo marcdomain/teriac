@@ -1316,6 +1316,11 @@ export class App {
       if (replanned.length) await this.refreshComment(ctx, new Map(), new Set(replanned), reply);
     }
     for (const n of staleNotes) reply.say(n);
+    const failedApplies = applied.filter(r => r.status === 'failed').map(r => r.project);
+    if (failedApplies.length) {
+      const cmd = this.deps.config.commandNames[0];
+      reply.say(`❌ The plan${failedApplies.length === 1 ? '' : 's'} for ${failedApplies.map(p => `\`${p}\``).join(', ')} ${failedApplies.length === 1 ? 'was' : 'were'} used up by the failed apply. Fix the problem, then comment ${failedApplies.map(p => `\`${cmd} plan -p ${p}\``).join(', ')} and apply the new plan.`);
+    }
     const stillLocked = applied.filter(r => r.status === 'success' && this.deps.store.getLock(ctx.repoKey, r.project, r.workspace)?.pr === ctx.pr.number).map(r => r.project);
     if (stillLocked.length && !ctx.policy.automerge) {
       reply.say(`🔒 ${stillLocked.map(p => `\`${p}\``).join(', ')} ${stillLocked.length === 1 ? 'stays' : 'stay'} locked to this PR until it's merged or closed. To free ${stillLocked.length === 1 ? 'it' : 'them'} sooner, comment \`${this.deps.config.commandNames[0]} unlock${stillLocked.length === 1 ? ` -p ${stillLocked[0]}` : ''}\`.`);
@@ -1395,10 +1400,7 @@ export class App {
       // The counts are saved now, so the Metrics page never has to read logs.
       store.finishRun(runId, { status: r.ok ? 'success' : 'failed', engine, output: scanned.text, summary: plan.summary, usage: r.usage ?? null, applied: parseApplyResult(r.output), secrets: scanned.found });
       this.notifyApply(ctx, project, user, store.getRun(runId)!);
-      // An applied plan can't be applied again (Terraform calls it stale): free its space.
-      // Its run and output stay; the apply's live output stays for anyone still watching.
       if (r.ok) {
-        this.forgetPlans(ctx.repoKey, ctx.pr.number, project.name, { keepLive: true });
         // unlock_after_apply: free the project for other PRs now. By default the lock stays
         // until the PR is merged or closed, so another PR can't undo an unmerged apply.
         // A failed apply always keeps it.
@@ -1409,6 +1411,10 @@ export class App {
       store.finishRun(runId, { status: 'failed', engine, output: `teriac could not apply this project: ${(err as Error).message}` });
     } finally {
       live.end();
+      // A plan is applied once, whatever the outcome: after a failed apply the state has
+      // moved on and the plan is stale. Delete it; applying again needs a new plan. The
+      // run, its output and the apply's live output stay.
+      this.forgetPlans(ctx.repoKey, ctx.pr.number, project.name, { keepLive: true });
     }
     metrics.observeRun('apply', store.getRun(runId)!.status, Date.now() - started);
     await this.publishCheck(ctx, project, store.getRun(runId)!);
