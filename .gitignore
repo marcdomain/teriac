@@ -3,3 +3,7 @@ node_modules
 
 # Local end-to-end tests (personal accounts and secrets; never committed or shipped)
 local-test/
+
+# Local settings and secrets (keep them in local-test/.env.local); never committed
+.env.local
+.env.*.local
