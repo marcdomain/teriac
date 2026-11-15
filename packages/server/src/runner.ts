@@ -71,7 +71,7 @@ interface ExecResult { code: number; output: string; stdout: string; usage?: Usa
 
 export const exec = (
   binary: string, args: string[], cwd: string, env: NodeJS.ProcessEnv,
-  opts: { timeoutMs: number; captureStdout?: boolean; onOutput?: (chunk: string) => void; measure?: boolean },
+  opts: { timeoutMs: number; captureStdout?: boolean; onOutput?: (chunk: string) => void; measure?: boolean; signal?: AbortSignal },
 ): Promise<ExecResult> => new Promise((resolve) => {
   const child = spawn(binary, args, { cwd, env, stdio: ['ignore', 'pipe', 'pipe'] });
   const sampler = opts.measure && child.pid ? new UsageSampler(child.pid) : null;
@@ -87,6 +87,13 @@ export const exec = (
   };
   child.stdout.on('data', c => add(c, true));
   child.stderr.on('data', c => add(c, false));
+  // Cancelled: SIGINT, like Ctrl-C, so Terraform stops cleanly and releases its state lock.
+  const stop = () => {
+    output += '\n[teriac] cancelled; stopping\n';
+    child.kill('SIGINT');
+    setTimeout(() => child.kill('SIGTERM'), 30_000).unref();
+  };
+  if (opts.signal?.aborted) stop(); else opts.signal?.addEventListener('abort', stop, { once: true });
   const timer = setTimeout(() => {
     output += `\n[teriac] timed out after ${Math.round(opts.timeoutMs / 1000)}s; stopping\n`;
     child.kill('SIGTERM');
@@ -143,6 +150,7 @@ export interface RunContext {
   timeoutMs: number;
   onOutput?: (chunk: string) => void;       // live output, raw (whole lines, paths tidied)
   onSensitive?: (values: string[]) => void; // sensitive values found while running
+  signal?: AbortSignal;                     // `teriac cancel`: stop this run
   sensitive?: string[];                     // values to hide from the start (apply: from its plan)
 }
 
@@ -193,7 +201,8 @@ const steps = (ctx: RunContext) => {
     const line = tidy(`$ ${tools.terragrunt ? 'terragrunt' : tools.tool.provider === 'opentofu' ? 'tofu' : 'terraform'} ${args.join(' ')}`);
     log.push(line);
     if (!quiet) live(`${line}\n`);
-    const r = await exec(bin, args, cwd, env, { timeoutMs: ctx.timeoutMs, captureStdout, onOutput: quiet ? undefined : live, measure: true });
+    if (ctx.signal?.aborted) return { code: 130, output: '[teriac] cancelled', stdout: '' };
+    const r = await exec(bin, args, cwd, env, { timeoutMs: ctx.timeoutMs, captureStdout, onOutput: quiet ? undefined : live, measure: true, signal: ctx.signal });
     if (!quiet) flush();
     usage = combineUsage(usage, r.usage ?? null);
     if (r.output.trim()) log.push(tidy(r.output.trimEnd()));

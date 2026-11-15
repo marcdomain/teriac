@@ -369,6 +369,28 @@ export const createHttpServer = (deps: HttpDeps): Server => {
         return send(res, run.ok ? 200 : 502, run);
       }
 
+      // ---- pause all applies (an emergency stop; freezes in repos.yaml are for planned ones) ----
+      if (url.pathname === '/api/applies' && req.method === 'GET') {
+        return send(res, 200, { paused: deps.app.appliesPaused?.() ?? null, canChange: need('admin') });
+      }
+      if (url.pathname === '/api/applies/pause' && req.method === 'POST') {
+        if (!need('admin')) return send(res, 403, { error: 'Only admins can pause applies.' });
+        const body = JSON.parse((await readBody(req)).toString('utf-8') || '{}');
+        const reason = String(body.reason ?? '').trim().slice(0, 200);
+        if (!reason) return send(res, 400, { error: 'Say why applies are paused (it is shown on every blocked apply).' });
+        const p = { by: who.name, via: who.via, at: new Date().toISOString(), reason };
+        deps.app.pauseApplies(p);
+        deps.store.audit({ repo: '*', pr: 0, user: who.name, action: 'applies_paused', project: '*', allowed: true, reason });
+        return send(res, 200, { paused: p });
+      }
+      if (url.pathname === '/api/applies/resume' && req.method === 'POST') {
+        if (!need('admin')) return send(res, 403, { error: 'Only admins can resume applies.' });
+        const was = deps.app.appliesPaused();
+        deps.app.resumeApplies();
+        deps.store.audit({ repo: '*', pr: 0, user: who.name, action: 'applies_resumed', project: '*', allowed: true, reason: was ? `paused by ${was.by}: ${was.reason}` : 'was not paused' });
+        return send(res, 200, { paused: null });
+      }
+
       if (req.method === 'POST' && url.pathname === '/api/drift/run') {
         if (!need('admin')) return send(res, 403, { error: 'Only admins can start drift checks.' });
         const entry = deps.drift?.schedules.find(e => e.key === url.searchParams.get('key'));

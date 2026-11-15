@@ -156,6 +156,9 @@ CREATE TABLE IF NOT EXISTS grants (
   created_at TEXT NOT NULL, expires_at TEXT NOT NULL, revoked_at TEXT, revoked_by TEXT, used_at TEXT,
   expiry_noted INTEGER NOT NULL DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS settings (
+  key TEXT PRIMARY KEY, value TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS backups (
   id INTEGER PRIMARY KEY AUTOINCREMENT, at TEXT NOT NULL, trigger TEXT NOT NULL, ok INTEGER NOT NULL,
   name TEXT, bytes INTEGER, seconds REAL NOT NULL, error TEXT
@@ -224,6 +227,19 @@ export class Store {
   }
 
   close() { this.db.close(); }
+
+  // ---- settings changed from the dashboard (JSON values) ----
+
+  getSetting<T>(key: string): T | null {
+    const row = this.db.prepare('SELECT value FROM settings WHERE key = ?').get(key) as { value: string } | undefined;
+    return row ? JSON.parse(row.value) as T : null;
+  }
+  setSetting(key: string, value: unknown): void {
+    this.db.prepare('INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value = excluded.value').run(key, JSON.stringify(value));
+  }
+  deleteSetting(key: string): void {
+    this.db.prepare('DELETE FROM settings WHERE key = ?').run(key);
+  }
 
   // ---- backups ----
 

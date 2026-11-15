@@ -11,9 +11,9 @@
 
 import type { CommandAction } from './config.ts';
 
-export type Verb = 'plan' | 'apply' | 'unlock' | 'help'
+export type Verb = 'plan' | 'apply' | 'unlock' | 'help' | 'cancel'
   | 'state' | 'output' | 'show' | 'validate' | 'providers' | 'fmt' | 'import' | 'taint' | 'untaint' | 'force-unlock';
-const VERBS: Verb[] = ['plan', 'apply', 'unlock', 'help', 'state', 'output', 'show', 'validate', 'providers', 'fmt', 'import', 'taint', 'untaint', 'force-unlock'];
+const VERBS: Verb[] = ['plan', 'apply', 'unlock', 'help', 'cancel', 'state', 'output', 'show', 'validate', 'providers', 'fmt', 'import', 'taint', 'untaint', 'force-unlock'];
 
 // Terraform commands teriac runs for a single project. Nothing else is passed through:
 // commands like `console` or flags like `-chdir` could reach beyond the project.
@@ -86,7 +86,7 @@ export const parseCommand = (body: string, names: string[]): ParseResult => {
     if (!STATE_SUBS.includes(sub)) return { ok: false, error: `\`${name} state\` needs one of: ${STATE_SUBS.join(', ')}` };
     command.tool = `state ${sub}` as ToolCommand;
     first = 3;
-  } else if (!['plan', 'apply', 'unlock', 'help'].includes(verb)) {
+  } else if (!['plan', 'apply', 'unlock', 'help', 'cancel'].includes(verb)) {
     command.tool = verb as ToolCommand;
   }
   const positional: string[] = [];
@@ -245,6 +245,7 @@ export const helpText = (name = 'teriac', oneProjectPerApply = false): string =>
   ...(oneProjectPerApply ? [] : [`| \`${name} apply\` | Apply every planned project whose requirements are met |`]),
   `| \`${name} apply -p <project>\` | Apply one project${oneProjectPerApply ? ' (this server applies one project at a time)' : ''} |`,
   `| \`${name} unlock\` | Release this PR's locks and discard its plans |`,
+  `| \`${name} cancel\` | Drop this PR's queued plans and applies, and stop running plans (running applies finish) |`,
   `| \`${name} state list -p <project> [address]\` | Resources in the state |`,
   `| \`${name} state show -p <project> <address>\` | One resource's attributes (sensitive values hidden) |`,
   `| \`${name} output -p <project> [name]\` | Output values (sensitive values hidden) |`,

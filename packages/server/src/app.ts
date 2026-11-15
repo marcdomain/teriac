@@ -74,7 +74,7 @@ export class FairScheduler {
   private perGroup: number;
   private active = 0;
   private running = new Map<string, number>();
-  private waiting: { group: string; go: () => void }[] = [];
+  private waiting: { group: string; go: () => void; drop: (e: Error) => void }[] = [];
 
   constructor(max: number, perGroup: number) {
     this.max = Math.max(1, max);
@@ -102,7 +102,7 @@ export class FairScheduler {
 
   async use<T>(group: string, fn: () => Promise<T>): Promise<T> {
     if (this.fits(group) && !this.waiting.length) this.take(group);
-    else await new Promise<void>(go => { this.waiting.push({ group, go }); this.pump(); });
+    else await new Promise<void>((go, drop) => { this.waiting.push({ group, go, drop }); this.pump(); });
     try {
       return await fn();
     } finally {
@@ -113,8 +113,18 @@ export class FairScheduler {
     }
   }
 
+  // Drops a group's waiting work (`teriac cancel`); returns how many were dropped.
+  cancel(group: string): number {
+    const dropped = this.waiting.filter(w => w.group === group);
+    this.waiting = this.waiting.filter(w => w.group !== group);
+    for (const w of dropped) w.drop(new Cancelled());
+    return dropped.length;
+  }
+
   get stats() { return { active: this.active, waiting: this.waiting.length, groups: Object.fromEntries(this.running) }; }
 }
+
+export class Cancelled extends Error { constructor() { super('cancelled'); } }
 
 // One reply per command, right under it. In "loading" mode it appears at once
 // as "⏳ Running …" and is edited into the outcome when the command finishes.
@@ -186,6 +196,10 @@ export const varFileEscape = (root: string, project: Project, args: string[]): s
   }
   return null;
 };
+
+export interface AppliesPause { by: string; via: string; at: string; reason: string }
+const PAUSE_KEY = 'applies_paused';
+const pausedText = (p: AppliesPause) => `applies are paused from the teriac dashboard by ${p.by} since ${p.at.slice(0, 16).replace('T', ' ')} UTC (${p.reason})`;
 
 interface PrContext {
   adapter: VcsAdapter;
@@ -259,6 +273,7 @@ export class App {
   private deps: AppDeps;
   private checkout: typeof gitCheckout;
   readonly live: LiveLogs;
+  private runningPlans = new Map<string, Set<AbortController>>();
 
   constructor(deps: AppDeps) {
     this.deps = deps;
@@ -351,6 +366,16 @@ export class App {
     }
     const number = 'pr' in event ? event.pr.number : event.prNumber;
     const key = `${event.repo.host}/${event.repo.fullName}#${number}`;
+    // `cancel` must not wait behind the work it cancels: it skips the PR's event queue.
+    if (event.kind === 'comment') {
+      const c = parseCommand(event.body, this.deps.config.commandNames);
+      if (c?.ok && c.command.verb === 'cancel') {
+        const reply = new Reply(adapter, event.repo, number, null);
+        const ack = this.ack(policy);
+        if (ack !== 'none') await adapter.react(event.repo, number, event.commentId, ack).catch(() => {});
+        return this.respond(reply, () => this.cancel(adapter, event.repo, number, event.author, reply));
+      }
+    }
     if (event.kind === 'pr_opened' || event.kind === 'pr_updated') this.latestHead.set(key, event.pr.headSha);
     if (event.kind === 'pr_closed') this.latestHead.delete(key);
     return this.queue.run(key, async () => {
@@ -519,6 +544,60 @@ export class App {
       + 'Push the branch to this repository instead, or ask an admin to allow forks for this repo (`allow_fork_prs: true` in repos.yaml).';
   }
 
+  // Runs `fn` in this PR's turn; false when `teriac cancel` dropped it before it started.
+  private async inTurn(ctx: PrContext, fn: () => Promise<unknown>): Promise<boolean> {
+    try {
+      await this.sched.use(`${ctx.repoKey}#${ctx.pr.number}`, fn);
+      return true;
+    } catch (err) {
+      if (err instanceof Cancelled) return false;
+      throw err;
+    }
+  }
+
+  // `teriac cancel`: drops the PR's queued work and stops its running plans. Running
+  // applies finish: stopping one halfway would leave the infrastructure half changed.
+  private async cancel(adapter: VcsAdapter, repo: Repo, number: number, user: string, reply: Reply) {
+    const pr = await adapter.getPullRequest(repo, number);
+    const perm = await adapter.userPermission(repo, user);
+    if (user.toLowerCase() !== pr.author.toLowerCase() && !['write', 'maintain', 'admin'].includes(perm)) {
+      return reply.say('🚫 Only the PR\'s author or people who can write to this repo can cancel its runs.');
+    }
+    const group = `${this.repoKey(repo)}#${number}`;
+    const dropped = this.sched.cancel(group);
+    const running = [...(this.runningPlans.get(group) ?? [])];
+    for (const a of running) a.abort();
+    this.deps.store.audit({ repo: this.repoKey(repo), pr: number, user, action: 'cancel', project: '*', allowed: true, reason: `${dropped} queued dropped, ${running.length} running plans stopped` });
+    reply.say(dropped || running.length
+      ? `⏹️ Cancelled: ${dropped} queued ${dropped === 1 ? 'run' : 'runs'} dropped, ${running.length} running ${running.length === 1 ? 'plan' : 'plans'} stopped. Applies already running finish on their own.`
+      : 'Nothing to cancel: this PR has no queued runs or running plans.');
+  }
+
+  // A chat message per apply, for repos with `notify_applies` (best effort, never blocks).
+  private notifyApply(ctx: PrContext, project: Project, user: string, run: Run) {
+    const names = ctx.policy.notify_applies ?? [];
+    if (!names.length) return;
+    const { config } = this.deps;
+    const ok = run.status === 'success';
+    const a = run.applied as { added?: number; changed?: number; destroyed?: number } | null;
+    const counts = a ? `${a.added ?? 0} added · ${a.changed ?? 0} changed · ${a.destroyed ?? 0} destroyed` : '';
+    const prUrl = repoLinks(ctx.repoKey, platformForHost(ctx.repo.host, { [ctx.repo.host]: ctx.repo.platform })).pr(ctx.pr.number);
+    notifyText(names, config.channels, {
+      title: `${ok ? '✅' : '❌'} ${ok ? 'Applied' : 'Apply failed:'} ${project.name}`,
+      lines: [
+        `**${ctx.repo.fullName}** [#${ctx.pr.number}](${prUrl}) · by ${user} · ${run.engine}`,
+        ...(counts ? [counts] : []),
+      ],
+      event: 'teriac.apply', url: this.commentLinks(ctx).run!(run.id),
+      data: { repo: ctx.repoKey, pr: ctx.pr.number, project: project.name, workspace: project.workspace, user, ok, applied: a, run: run.id },
+    }, { people: config.people, env: this.deps.env ?? process.env }).catch(err => log.warn('apply notice failed', { err: (err as Error).message }));
+  }
+
+  // Applies paused from the dashboard ("stop all applies"): like a freeze, everywhere at once.
+  appliesPaused(): AppliesPause | null { return this.deps.store.getSetting<AppliesPause>(PAUSE_KEY); }
+  pauseApplies(p: AppliesPause) { this.deps.store.setSetting(PAUSE_KEY, p); }
+  resumeApplies() { this.deps.store.deleteSetting(PAUSE_KEY); }
+
   // Live output of one run, cleaned with the repo's secret scan settings.
   private liveFor(ctx: PrContext, project: Project, runId: number): LiveWriter {
     const s = this.safety(ctx);
@@ -629,9 +708,15 @@ export class App {
 
   private select(ctx: PrContext, cmd: Command, fallback: Project[]): Project[] | string {
     if (!cmd.project && !cmd.dir && !cmd.workspace) return fallback;
+    // -p and -d take a name or a glob: `-p 'live/prod/*'`, `-d 'stacks/**'`.
+    const pick = (want: string | undefined, have: string) => {
+      if (!want) return true;
+      const w = want.replace(/^['"]|['"]$/g, '');
+      return /[*?[]/.test(w) ? matchGlob(w, have) : w === have;
+    };
     const hits = ctx.projects.filter(p =>
-      (!cmd.project || p.name === cmd.project)
-      && (!cmd.dir || p.dir === cmd.dir)
+      pick(cmd.project, p.name)
+      && pick(cmd.dir, p.dir)
       && (!cmd.workspace || p.workspace === cmd.workspace));
     if (!hits.length) {
       const what = [cmd.project && `project \`${cmd.project}\``, cmd.dir && `dir \`${cmd.dir}\``, cmd.workspace && `workspace \`${cmd.workspace}\``].filter(Boolean).join(', ');
@@ -709,6 +794,8 @@ export class App {
       const blockers = await applyBlockers(project, this.rules(ctx, project), ctx.pr, await this.approvers(ctx), ctx.lookup);
       const grant = this.grantFor(ctx, user, project);
       if (!grant?.bypass.includes('freeze')) {
+        const paused = this.appliesPaused();
+        if (paused) blockers.push(pausedText(paused));
         for (const f of activeFreezes(this.safety(ctx).freezes, project)) blockers.push(`change freeze \`${f.name}\` is on until ${f.until}`);
       }
       if (blockers.length) {
@@ -722,12 +809,14 @@ export class App {
       if (!lock.ok) return reply.say(`🔒 \`${project.name}\` is locked by #${lock.heldBy.pr} (${lock.heldBy.user}); apply or unlock it there first.`);
     }
 
-    const raw = await this.sched.use(`${ctx.repoKey}#${ctx.pr.number}`, async () => {
+    let raw: Awaited<ReturnType<typeof runTool>> | undefined;
+    const ran = await this.inTurn(ctx, async () => {
       const tools = await this.tools(ctx, project);
-      return runTool({
+      raw = await runTool({
         root: ctx.root, project, tools, planPath: this.planPath(ctx, project), env: this.env(ctx, project, user), timeoutMs: this.deps.config.runTimeoutMs,
       }, toolArgs(cmd));
     });
+    if (!ran || !raw) return reply.say(`⏹️ \`${text}\` was cancelled before it started.`);
     // `state show` and `output` print values: hide anything that looks like a secret.
     const scanned = this.scan(ctx, raw.output);
     this.auditSecrets(ctx, user, project, scanned.found, tool);
@@ -776,7 +865,7 @@ export class App {
 
   private async plans(ctx: PrContext, targets: Project[], user: string, opts: PlanOpts, notes: Map<string, string>, reply?: Reply) {
     const { store } = this.deps;
-    await Promise.all(targets.map(project => this.sched.use(`${ctx.repoKey}#${ctx.pr.number}`, async () => {
+    await Promise.all(targets.map(project => this.inTurn(ctx, async () => {
       // A newer commit was pushed while this waited: its own plans are on the way.
       if (this.outdated(ctx)) { notes.set(project.name, '⏭️ skipped: a newer commit was pushed'); return; }
       const lock = store.acquireLock(ctx.repoKey, project.name, project.workspace, ctx.pr.number, user);
@@ -785,7 +874,7 @@ export class App {
         return;
       }
       await this.planProject(ctx, project, user, opts);
-    })));
+    }).then(ran => { if (!ran) notes.set(project.name, '⏹️ cancelled'); })));
     // Nothing to report for a commit that's already been replaced.
     if (this.outdated(ctx)) return;
     await this.refreshComment(ctx, notes, new Set([...targets.map(t => t.name), ...notes.keys()]), reply);
@@ -829,6 +918,11 @@ export class App {
     const runId = store.startRun({ repo: ctx.repoKey, pr: ctx.pr.number, project: project.name, workspace: project.workspace, kind: 'plan', headSha: ctx.pr.headSha, user, targets: opts.targets, prAuthor: ctx.pr.author, dir: project.dir });
     // Live output exists from the moment the run does, so a viewer never finds it missing.
     const live = this.liveFor(ctx, project, runId);
+    // `teriac cancel` stops a running plan (never a running apply).
+    const abort = new AbortController();
+    const group = `${ctx.repoKey}#${ctx.pr.number}`;
+    if (!this.runningPlans.has(group)) this.runningPlans.set(group, new Set());
+    this.runningPlans.get(group)!.add(abort);
     // The check's "Details" link opens the live output while it runs.
     const liveUrl = this.commentLinks(ctx).run!(runId);
     await this.check(ctx, { name: checkName, headSha: ctx.pr.headSha, externalId: project.name, status: 'in_progress', title: 'Planning…', summary: `Planning \`${project.name}\`\n\n▶ [Watch the live output](${liveUrl})`, detailsUrl: liveUrl });
@@ -842,7 +936,7 @@ export class App {
       if (escape) throw new Error(escape);
       const r = await runPlan({
         root: ctx.root, project, tools, planPath, env: this.env(ctx, project, user), timeoutMs: config.runTimeoutMs,
-        onOutput: live.write, onSensitive: live.sensitive,
+        onOutput: live.write, onSensitive: live.sensitive, signal: abort.signal,
       }, opts);
       const destroys = r.summary ? r.summary.destroy + r.summary.replace : 0;
       let policy: PolicyResult | null = null;
@@ -891,6 +985,7 @@ export class App {
       store.finishRun(runId, { status: 'failed', engine, output: `teriac could not run this project: ${(err as Error).message}` });
     } finally {
       live.end();
+      this.runningPlans.get(group)?.delete(abort);
     }
     metrics.observeRun('plan', store.getRun(runId)!.status, Date.now() - started);
     await this.publishCheck(ctx, project, store.getRun(runId)!);
@@ -983,6 +1078,8 @@ export class App {
       if (stale) out.push(stale);
     }
     if (!skip.has('freeze')) {
+      const paused = this.appliesPaused();
+      if (paused) out.push(pausedText(paused));
       for (const f of activeFreezes(s.freezes, project)) {
         if (await mayOverride(f.override)) { opts.skipped?.push(`change freeze ${f.name}`); continue; }
         out.push(`change freeze \`${f.name}\` is on until ${f.until}${by(f.override)}`);
@@ -1081,6 +1178,9 @@ export class App {
 
     const selected = this.select(ctx, cmd, planned);
     if (typeof selected === 'string') return reply.say(`❌ ${selected}`);
+    if (this.oneAtATime(ctx) && selected.length > 1) {
+      return reply.say(`This server applies one project at a time, and \`${cmd.project ?? cmd.dir}\` matches ${selected.length}: ${selected.map(p => `\`${p.name}\``).join(', ')}. Apply them one by one.`);
+    }
     if (!selected.length) {
       return reply.say('Nothing to apply: no project has a successful plan with changes at the current commit. Run `teriac plan` first.');
     }
@@ -1162,7 +1262,7 @@ export class App {
         // real ones and let people review that, instead of applying a stale plan.
         const changedDeps = approved.map(a => a.project).filter(q => project.deps.includes(q.dir) && appliedNow.has(q.name));
         if (changedDeps.length) {
-          await this.sched.use(`${ctx.repoKey}#${ctx.pr.number}`, () => this.planProject(ctx, project, user, {}));
+          if (!(await this.inTurn(ctx, () => this.planProject(ctx, project, user, {})))) { notes.set(project.name, '⏹️ cancelled'); held.add(project.name); return; }
           replanned.push(project.name);
           notes.set(project.name, `🔁 re-planned after ${changedDeps.map(q => `\`${q.name}\``).join(', ')} applied (its outputs feed this project). Review the new plan, then comment \`${this.deps.config.commandNames[0]} apply -p ${project.name}\``);
           held.add(project.name); // its own dependents wait too
@@ -1170,7 +1270,7 @@ export class App {
         }
         const { plan } = approved.find(a => a.project.name === project.name)!;
         attempted.add(project.name);
-        await this.sched.use(`${ctx.repoKey}#${ctx.pr.number}`, () => this.applyProject(ctx, project, user, plan));
+        if (!(await this.inTurn(ctx, () => this.applyProject(ctx, project, user, plan)))) { attempted.delete(project.name); notes.set(project.name, '⏹️ cancelled before it started'); return; }
         if (this.deps.store.latestRuns(ctx.repoKey, ctx.pr.number, 'apply').find(r => r.project === project.name)?.status !== 'success') failed.add(project.name);
         else appliedNow.add(project.name);
       }));
@@ -1182,12 +1282,12 @@ export class App {
     const headPlans = new Set(this.deps.store.latestRuns(ctx.repoKey, ctx.pr.number, 'plan').filter(r => r.headSha === ctx.pr.headSha).map(r => r.project));
     const dependents = ctx.projects.filter(p => !appliedNow.has(p.name) && !replanned.includes(p.name)
       && headPlans.has(p.name) && p.deps.some(d => appliedDirs.includes(d)));
-    await Promise.all(dependents.map(p => this.sched.use(`${ctx.repoKey}#${ctx.pr.number}`, async () => {
+    await Promise.all(dependents.map(p => this.inTurn(ctx, async () => {
       await this.planProject(ctx, p, user, {});
       replanned.push(p.name);
       const from = ctx.projects.filter(q => appliedNow.has(q.name) && p.deps.includes(q.dir)).map(q => `\`${q.name}\``).join(', ');
       notes.set(p.name, `🔁 re-planned with the new outputs of ${from}. Review it, then comment \`${this.deps.config.commandNames[0]} apply -p ${p.name}\``);
-    })));
+    }).then(ran => { if (!ran) notes.set(p.name, '⏹️ cancelled'); })));
 
     const applied = this.deps.store.latestRuns(ctx.repoKey, ctx.pr.number, 'apply')
       .filter(r => r.headSha === ctx.pr.headSha && attempted.has(r.project));
@@ -1259,6 +1359,7 @@ export class App {
       this.auditSecrets(ctx, user, project, scanned.found, 'apply');
       // The counts are saved now, so the Metrics page never has to read logs.
       store.finishRun(runId, { status: r.ok ? 'success' : 'failed', engine, output: scanned.text, summary: plan.summary, usage: r.usage ?? null, applied: parseApplyResult(r.output), secrets: scanned.found });
+      this.notifyApply(ctx, project, user, store.getRun(runId)!);
       // An applied plan can't be applied again (Terraform calls it stale): free its space.
       // Its run and output stay; the apply's live output stays for anyone still watching.
       if (r.ok) this.forgetPlans(ctx.repoKey, ctx.pr.number, project.name, { keepLive: true });

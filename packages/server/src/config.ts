@@ -50,6 +50,7 @@ export interface RepoPolicy {
   allow_repo_config?: boolean;                // read the repo's teriac.yaml (default true)
   allow_extra_args?: boolean;                 // `teriac plan -- -var=x` (default false)
   allow_fork_prs?: boolean;                   // plan and apply PRs from forks (default false: their code would run with this server's credentials)
+  notify_applies?: string[];                  // channels told about every apply in this repo (done or failed)
   autoplan?: boolean;                         // default true
   plan_drafts?: boolean;                      // default false
   allow_repo_schedules?: boolean;             // drift schedules from teriac.yaml (default true)
@@ -236,6 +237,11 @@ export const parseServerPolicy = (text: string): ServerPolicy => {
   }
   const policies = validatePolicies(doc.policies, 'policies');
   for (const [i, r] of repos.entries()) r.policies = validatePolicies(r.policies, `repos[${i}].policies`);
+  for (const [i, r] of repos.entries()) {
+    if (r.notify_applies === undefined) continue;
+    if (!Array.isArray(r.notify_applies) || r.notify_applies.some(c => typeof c !== 'string')) throw new Error(`repos[${i}].notify_applies must be a list of channel names`);
+    for (const c of r.notify_applies) if (!channels[c]) throw new Error(`repos[${i}].notify_applies: no channel named "${c}" in repos.yaml`);
+  }
   return {
     repos, channels, people, users, policies,
     secretScan: validateSecretScan(doc.secret_scan, 'secret_scan'),

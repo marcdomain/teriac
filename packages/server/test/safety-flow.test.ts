@@ -30,7 +30,7 @@ const fs = require('fs'); const path = require('path');
 const F = ${JSON.stringify(F)};
 const [cmd, ...rest] = process.argv.slice(2);
 if (cmd === 'init') { console.log('Terraform has been successfully initialized!'); process.exit(0); }
-if (cmd === 'plan') {
+const plan = () => {
   fs.writeFileSync('GIT_ENV', JSON.stringify(Object.fromEntries(Object.entries(process.env).filter(([k]) => k.startsWith('GIT_CONFIG')))));
   const out = rest.find(a => a.startsWith('-out=')).slice(5);
   fs.writeFileSync(out, fs.existsSync('SECURITY') ? 'security' : 'changes');
@@ -38,6 +38,13 @@ if (cmd === 'plan') {
   if (fs.existsSync('LEAK')) { process.stdout.write('  + tags = { owner_key = "AKIAIOSF'); process.stdout.write('ODNN7EXAMPLE" }\\n'); }
   if (fs.existsSync('SENSITIVE')) console.log('      - output = { password = "hunter2-SUPERSECRET" }');
   process.exit(2);
+};
+if (cmd === 'plan') {
+  // SLOW: a long plan, for cancel; SIGINT stops it, as it does Terraform.
+  if (fs.existsSync('SLOW')) {
+    process.on('SIGINT', () => { console.log('Interrupt received. Gracefully shutting down...'); process.exit(1); });
+    setTimeout(plan, 8000);
+  } else plan();
 }
 if (cmd === 'show' && rest[rest.length - 1] === '-json') {
   // The state: with a sensitive value when the project has a SENSITIVE marker.
@@ -51,7 +58,7 @@ if (cmd === 'show') {
 }
 if (cmd === 'apply') { console.log('Apply complete! Resources: 3 added, 1 changed, 2 destroyed.'); process.exit(0); }
 if (cmd === 'state' && rest[0] === 'list') { console.log('terraform_data.app'); process.exit(0); }
-process.exit(1);
+if (cmd !== 'plan') process.exit(1);
 `;
 
 const PERMS: Record<string, Permission> = { bob: 'write', carol: 'write', erin: 'maintain', alice: 'admin', mallory: 'none' };
@@ -693,4 +700,90 @@ test('after a successful apply its plan file is deleted; the runs, output and co
   const kept = store.getRun(plan.id)!;
   assert.ok(kept.output.length > 0 && kept.summary, 'the plan run keeps its output and summary');
   assert.ok(gh.comments.length > comments && gh.sticky.get(1), 'comments are added, never removed');
+});
+
+// ---------------------------------------------------------------------------
+describe('project globs, pause all applies, apply notifications, cancel', () => {
+  test('-p takes a glob', async () => {
+    const { store, say, open } = setup();
+    await open();
+    const before = store.latestRuns('github.com/acme/infra', 1, 'plan').map(r => r.id);
+    await say('bob', "teriac plan -p 'envs/*'");
+    const after = store.latestRuns('github.com/acme/infra', 1, 'plan').filter(r => !before.includes(r.id)).map(r => r.project).sort();
+    assert.deepEqual(after, ['envs/dev', 'envs/prod']);
+  });
+
+  test('a glob can\'t apply several projects where applies are one at a time', async () => {
+    const { gh, say, open } = setup('', { requireApplyProject: true });
+    await open();
+    gh.reviewsByPr.set(1, [{ user: 'carol', state: 'approved', commitSha: head }]);
+    await say('alice', 'teriac apply -p envs/*');
+    assert.match(gh.lastReply(), /applies one project at a time, and `envs\/\*` matches 2/);
+  });
+
+  test('pausing all applies blocks them everywhere until resumed', async () => {
+    const { app, gh, store, say, open } = setup();
+    await open();
+    gh.reviewsByPr.set(1, [{ user: 'carol', state: 'approved', commitSha: head }]);
+    app.pauseApplies({ by: 'ada', via: 'okta', at: '2026-11-15T10:00:00.000Z', reason: 'cloud provider incident' });
+    await say('erin', 'teriac apply -p envs/dev');
+    assert.match(gh.lastReply(), /applies are paused from the teriac dashboard by ada since 2026-11-15 10:00 UTC \(cloud provider incident\)/);
+    assert.equal(store.latestRuns('github.com/acme/infra', 1, 'apply').length, 0);
+    app.resumeApplies();
+    await say('erin', 'teriac apply -p envs/dev');
+    assert.equal(store.latestRuns('github.com/acme/infra', 1, 'apply').find(r => r.project === 'envs/dev')?.status, 'success');
+  });
+
+  test('notify_applies: one message per apply, with the counts and a link', async () => {
+    const { createServer } = await import('node:http');
+    const got: any[] = [];
+    const hook = createServer((req, res) => { let b = ''; req.on('data', d => { b += d; }).on('end', () => { got.push(JSON.parse(b)); res.end('ok'); }); });
+    await new Promise<void>(r => hook.listen(0, '127.0.0.1', () => r()));
+    process.env.TEST_APPLY_HOOK = `http://127.0.0.1:${(hook.address() as any).port}/`;
+    try {
+      const { gh, say, open } = setup('    notify_applies: [ops]\n', { channels: { ops: { type: 'webhook', webhook_url_env: 'TEST_APPLY_HOOK' } } as any });
+      await open();
+      gh.reviewsByPr.set(1, [{ user: 'carol', state: 'approved', commitSha: head }]);
+      await say('erin', 'teriac apply -p envs/dev');
+      for (let i = 0; i < 40 && !got.length; i++) await new Promise(r => setTimeout(r, 50));
+      assert.equal(got.length, 1);
+      assert.equal(got[0].event, 'teriac.apply');
+      assert.match(got[0].title, /Applied envs\/dev/);
+      assert.match(JSON.stringify(got[0]), /#runs\/acme\/infra\/pull\/1\/\d+/);
+    } finally {
+      delete process.env.TEST_APPLY_HOOK;
+      hook.close();
+    }
+  });
+
+  test('cancel: drops queued plans and stops the running one (it skips the PR\'s queue)', async () => {
+    const f = join(origin, 'envs/dev/SLOW'); const g = join(origin, 'envs/prod/SLOW');
+    writeFileSync(f, ''); writeFileSync(g, '');
+    sh(origin, '-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '-A');
+    sh(origin, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'slow');
+    head = sh(origin, 'rev-parse', 'HEAD');
+    try {
+      const { app, gh, store, say, open } = setup('', { parallelism: 2, prParallelism: 1 });
+      const planning = open();
+      for (let i = 0; i < 100 && !store.latestRuns('github.com/acme/infra', 1, 'plan').some(r => r.status === 'running'); i++) await new Promise(r => setTimeout(r, 50));
+      await new Promise(r => setTimeout(r, 500));
+      const started = Date.now();
+      await say('bob', 'teriac cancel');
+      assert.match(gh.lastReply(), /Cancelled: 1 queued run dropped, 1 running plan stopped/);
+      await planning;
+      assert.ok(Date.now() - started < 6000, 'the slow plan was stopped, not waited for');
+      const runs = store.latestRuns('github.com/acme/infra', 1, 'plan');
+      assert.equal(runs.length, 1, 'the queued one never started');
+      assert.equal(runs[0].status, 'failed');
+      assert.match(runs[0].output, /cancelled/);
+      assert.ok(store.auditLog(5).some(a => a.action === 'cancel'));
+      await say('mallory', 'teriac cancel');
+      assert.match(gh.lastReply(), /Only the PR's author or people who can write/);
+    } finally {
+      rmSync(f, { force: true }); rmSync(g, { force: true });
+      sh(origin, '-c', 'user.email=t@t', '-c', 'user.name=t', 'add', '-A');
+      sh(origin, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'not slow');
+      head = sh(origin, 'rev-parse', 'HEAD');
+    }
+  });
 });
