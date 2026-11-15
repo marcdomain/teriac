@@ -136,4 +136,7 @@ export interface VcsAdapter {
   // Commits `files` to a new branch from `base` and opens a PR. Returns its URL,
   // or null if the branch already exists (a PR for it is open or was handled).
   openPullRequest?(repo: Repo, pr: { base: string; branch: string; title: string; body: string; files: { path: string; content: string }[] }): Promise<string | null>;
+  // Automerge: merge the PR (refused merges return ok: false with the platform's reason), delete a branch.
+  mergePullRequest?(repo: Repo, number: number, method: 'merge' | 'squash' | 'rebase', sha: string): Promise<{ ok: boolean; message: string }>;
+  deleteBranch?(repo: Repo, branch: string): Promise<boolean>;
 }

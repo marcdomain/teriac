@@ -45,6 +45,7 @@ export interface Run {
   planSha: string | null;     // sha256 of the plan file when it was made (applied only if unchanged)
   risk: { level: string; reasons: string[] } | null;
   secrets: string[];          // kinds of possible secrets found (and handled) in the output
+  outputExpiredAt: string | null; // the log was cleared then (log_retention_days); the rest stays
 }
 
 // Emergency access: a time-limited permission given from the dashboard.
@@ -186,6 +187,7 @@ const toRun = (r: Record<string, any>): Run => ({
   planSha: r.plan_sha ?? null,
   risk: r.risk ? JSON.parse(r.risk) : null,
   secrets: r.secrets ? JSON.parse(r.secrets) : [],
+  outputExpiredAt: r.output_expired_at ?? null,
 });
 
 const toGrant = (r: Record<string, any>): Grant => ({
@@ -218,6 +220,7 @@ export class Store {
     if (!cols.includes('providers')) this.db.exec('ALTER TABLE runs ADD COLUMN providers TEXT');
     if (!cols.includes('usage')) this.db.exec('ALTER TABLE runs ADD COLUMN usage TEXT');
     if (!cols.includes('applied')) this.db.exec('ALTER TABLE runs ADD COLUMN applied TEXT');
+    if (!cols.includes('output_expired_at')) this.db.exec('ALTER TABLE runs ADD COLUMN output_expired_at TEXT');
     if (!cols.includes('plan_sha')) this.db.exec('ALTER TABLE runs ADD COLUMN plan_sha TEXT');
     if (!cols.includes('risk')) this.db.exec('ALTER TABLE runs ADD COLUMN risk TEXT');
     if (!cols.includes('secrets')) this.db.exec('ALTER TABLE runs ADD COLUMN secrets TEXT');
@@ -227,6 +230,34 @@ export class Store {
   }
 
   close() { this.db.close(); }
+
+  // ---- housekeeping ----
+
+  // PRs whose last successful apply finished before `before` and still have logs.
+  prsWithLogsAppliedBefore(before: string): { repo: string; pr: number; appliedAt: string }[] {
+    return this.db.prepare(`
+      SELECT a.repo, a.pr, MAX(a.finished_at) AS appliedAt FROM runs a
+      WHERE a.kind = 'apply' AND a.status = 'success'
+      GROUP BY a.repo, a.pr
+      HAVING MAX(a.finished_at) < ?
+        AND EXISTS (SELECT 1 FROM runs r WHERE r.repo = a.repo AND r.pr = a.pr AND r.output_expired_at IS NULL AND r.output != '')
+    `).all(before) as { repo: string; pr: number; appliedAt: string }[];
+  }
+
+  // Clears the logs of a PR's runs; summaries, risk, people, times and metrics stay.
+  expireOutputs(repo: string, pr: number, at = new Date().toISOString()): number {
+    return Number(this.db.prepare(`UPDATE runs SET output = '', output_expired_at = ? WHERE repo = ? AND pr = ? AND output_expired_at IS NULL AND status != 'running'`).run(at, repo, pr).changes);
+  }
+
+  // Successful applies of PRs that still hold locks (not merged or closed yet), finished before `before`.
+  appliesStillOpen(before: string): Run[] {
+    return (this.db.prepare(`
+      SELECT r.* FROM runs r
+      WHERE r.kind = 'apply' AND r.status = 'success' AND r.finished_at < ?
+        AND r.id = (SELECT MAX(id) FROM runs x WHERE x.repo = r.repo AND x.pr = r.pr AND x.kind = 'apply' AND x.status = 'success')
+        AND EXISTS (SELECT 1 FROM locks l WHERE l.repo = r.repo AND l.pr = r.pr)
+    `).all(before) as Record<string, any>[]).map(toRun);
+  }
 
   // ---- settings changed from the dashboard (JSON values) ----
 

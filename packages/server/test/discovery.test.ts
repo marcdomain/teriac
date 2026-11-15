@@ -119,3 +119,20 @@ test('symlinks are not followed', () => {
     rmSync(outside, { recursive: true, force: true });
   }
 });
+
+test('depends_on in teriac.yaml: applied after, and planned when the dependency changes', async () => {
+  const { parseRepoConfig } = await import('../src/repoConfig.ts') as any;
+  const loadRepoConfigFrom = (text: string) => parseRepoConfig('teriac.yaml', text);
+  const r = mkdtempSync(join(tmpdir(), 'teriac-dep-'));
+  for (const [f, body] of [['network/main.tf', 'resource "terraform_data" "vpc" {}\n'], ['app/main.tf', 'resource "terraform_data" "app" {}\n'], ['db/main.tf', 'resource "terraform_data" "db" {}\n']]) {
+    mkdirSync(join(r, dirname(f)), { recursive: true });
+    writeFileSync(join(r, f), body);
+  }
+  const cfg = loadRepoConfigFrom(`projects:\n  - dir: app\n    depends_on: [network, db]\n  - dir: db\n    depends_on: network\n`);
+  const byName = new Map(discoverProjects(r, cfg).map(p => [p.name, p]));
+  assert.ok(byName.get('app')!.deps.includes('network') && byName.get('app')!.deps.includes('db'));
+  assert.ok(byName.get('db')!.deps.includes('network'));
+  assert.deepEqual(affectedProjects([...byName.values()], ['network/main.tf']).map(p => p.name).sort(), ['app', 'db', 'network']);
+  assert.throws(() => discoverProjects(r, loadRepoConfigFrom('projects:\n  - dir: app\n    depends_on: [nope]\n')), /depends on "nope", which is not a project here/);
+  rmSync(r, { recursive: true, force: true });
+});

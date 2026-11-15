@@ -514,7 +514,9 @@
           ? `<div class="card"><div class="card-head"><h2>Output</h2><span class="inline"><span class="pill run live"><span class="dot"></span> live</span>
               <label class="small follow"><input type="checkbox" id="live-follow" checked> Follow</label></span></div>
               <pre class="log" id="live-log" data-run="${r.id}"><span class="muted">Waiting for output…</span></pre></div>`
-          : `<div class="card"><div class="card-head"><h2>Output</h2><span class="muted small">secrets redacted</span></div><pre class="log">${esc(r.output || '')}</pre></div>`}`;
+          : r.outputExpiredAt
+            ? `<div class="card"><div class="card-head"><h2>Output</h2></div><div class="empty">This log was cleared on ${esc(when(r.outputExpiredAt))}, as set by <code>log_retention_days</code>. The plan summary and everything else on this page stay.</div></div>`
+            : `<div class="card"><div class="card-head"><h2>Output</h2><span class="muted small">secrets redacted</span></div><pre class="log">${esc(r.output || '')}</pre></div>`}`;
     },
 
     async locks() {

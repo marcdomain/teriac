@@ -18,6 +18,7 @@ export interface ProjectConfig {
   terragrunt_version?: string;
   autoplan?: boolean;
   watch?: string[];               // extra files that should replan this project (globs; added to automatic detection)
+  depends_on?: string[];          // projects (names or dirs) applied before this one; their changes replan it
   approvals?: ApprovalRule[];
   permissions?: Partial<Record<Action, Principal[]>>;
   apply_requirements?: Requirement[];
@@ -64,6 +65,7 @@ const parseConfig = (doc: Record<string, any>): RepoConfig => {
       version: p.version != null ? String(p.version) : undefined,
       terragrunt_version: p.terragrunt_version != null ? String(p.terragrunt_version) : undefined,
       autoplan: p.autoplan, watch: Array.isArray(p.watch) ? p.watch.map(String) : undefined,
+      depends_on: p.depends_on === undefined ? undefined : (Array.isArray(p.depends_on) ? p.depends_on : [p.depends_on]).map((d: unknown) => String(d).replace(/^\.\/|\/+$/g, '')),
       approvals: p.approvals, permissions: p.permissions,
       apply_requirements: requirements(p.apply_requirements, `projects[${i}]`, warnings),
     };

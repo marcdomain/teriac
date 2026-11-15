@@ -414,7 +414,8 @@ export class App {
   private async context(adapter: VcsAdapter, policy: RepoPolicy, repo: Repo, number: number): Promise<PrContext> {
     const pr = await adapter.getPullRequest(repo, number);
     const root = this.workDir(repo, number);
-    await this.checkout(root, await adapter.cloneAuth(repo), pr.headSha, `refs/pull/${number}/head`);
+    // checkout: merge plans the PR merged into its base branch (GitHub's refs/pull/N/merge).
+    await this.checkout(root, await adapter.cloneAuth(repo), pr.headSha, `refs/pull/${number}/head`, policy.checkout === 'merge' ? `refs/pull/${number}/merge` : undefined);
     const moduleAuth = await this.moduleAuth(adapter, repo);
 
     const allowRepoConfig = policy.allow_repo_config !== false;
@@ -1324,6 +1325,32 @@ export class App {
     for (const p of replanned) next.push(`${name} apply -p ${p}`);
     const unique = [...new Set(next)].filter(c => !attempted.has(c.slice(`${name} apply -p `.length)) || replanned.includes(c.slice(`${name} apply -p `.length)));
     if (unique.length) reply.say(['**Next, comment:**', ...unique.flatMap(c => [...cmdBlock(c), ''])].join('\n').trim());
+    await this.automerge(ctx, user, reply);
+  }
+
+  // automerge: once every project with planned changes at this commit is applied (and
+  // none failed), merge the PR. Only that commit is merged: a newer push stops it.
+  private async automerge(ctx: PrContext, user: string, reply: Reply) {
+    const am = ctx.policy.automerge;
+    if (!am || !ctx.adapter.mergePullRequest) return;
+    const { store } = this.deps;
+    const plans = store.latestRuns(ctx.repoKey, ctx.pr.number, 'plan').filter(r => r.headSha === ctx.pr.headSha);
+    const applies = store.latestRuns(ctx.repoKey, ctx.pr.number, 'apply').filter(r => r.headSha === ctx.pr.headSha);
+    if (!plans.length || plans.some(r => r.status === 'failed')) return;
+    const toApply = plans.filter(r => r.hasChanges);
+    if (!toApply.length) return;
+    const appliedOk = (p: Run) => applies.some(a => a.project === p.project && a.workspace === p.workspace && a.status === 'success' && a.id > p.id);
+    if (!toApply.every(appliedOk)) return;
+    const method = typeof am === 'object' ? am.method ?? 'merge' : 'merge';
+    const r = await ctx.adapter.mergePullRequest(ctx.repo, ctx.pr.number, method, ctx.pr.headSha)
+      .catch(err => ({ ok: false, message: (err as Error).message }));
+    store.audit({ repo: ctx.repoKey, pr: ctx.pr.number, user, action: 'automerge', project: '*', allowed: r.ok, reason: r.ok ? `merged (${method})` : r.message });
+    if (!r.ok) return reply.say(`⚠️ Everything is applied, but teriac couldn't merge this PR: ${r.message}. Merge it yourself.`);
+    let deleted = false;
+    if (typeof am === 'object' && am.delete_branch && !ctx.pr.fromFork && ctx.adapter.deleteBranch) {
+      deleted = await ctx.adapter.deleteBranch(ctx.repo, ctx.pr.headRef).catch(() => false);
+    }
+    reply.say(`🔀 Everything planned is applied, so teriac merged this PR (${method})${deleted ? ` and deleted \`${ctx.pr.headRef}\`` : ''}.`);
   }
 
   private async applyProject(ctx: PrContext, project: Project, user: string, plan: Run) {

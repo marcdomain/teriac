@@ -80,6 +80,11 @@ class FakeGitHub implements VcsAdapter {
   prFiles = new Map<string, Comparison>();
   baseChanges: Comparison | null = null;
   moduleAuth?: (r: Repo) => Promise<{ url: string; extraHeader?: string } | null>;
+  merges: { method: string; sha: string }[] = [];
+  mergeResult = { ok: true, message: 'Pull Request successfully merged' };
+  deleted: string[] = [];
+  async mergePullRequest(_r: Repo, _n: number, method: string, sha: string) { this.merges.push({ method, sha }); return this.mergeResult; }
+  async deleteBranch(_r: Repo, branch: string) { this.deleted.push(branch); return true; }
 
   verify() { return true; }
   parse(): VcsEvent { return { kind: 'ignored', reason: 'test' }; }
@@ -785,5 +790,34 @@ describe('project globs, pause all applies, apply notifications, cancel', () => 
       sh(origin, '-c', 'user.email=t@t', '-c', 'user.name=t', 'commit', '-q', '-m', 'not slow');
       head = sh(origin, 'rev-parse', 'HEAD');
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+describe('automerge', () => {
+  test('merges once every planned change is applied, not before; deletes the branch if asked', async () => {
+    const { gh, say, open } = setup('    automerge: { method: squash, delete_branch: true }\n');
+    await open();
+    gh.reviewsByPr.set(1, [{ user: 'carol', state: 'approved', commitSha: head }, { user: 'alice', state: 'approved', commitSha: head }]);
+    await say('erin', 'teriac apply -p envs/dev');
+    assert.equal(gh.merges.length, 0, 'envs/prod still has changes to apply');
+    await say('alice', 'teriac apply -p envs/prod');
+    assert.deepEqual(gh.merges, [{ method: 'squash', sha: head }], 'that exact commit, squashed');
+    assert.deepEqual(gh.deleted, ['feat']);
+    assert.match(gh.lastReply(), /teriac merged this PR \(squash\) and deleted `feat`/);
+  });
+
+  test('a refused merge says why; off by default', async () => {
+    const on = setup('    automerge: true\n');
+    await on.open();
+    on.gh.reviewsByPr.set(1, [{ user: 'carol', state: 'approved', commitSha: head }, { user: 'alice', state: 'approved', commitSha: head }]);
+    on.gh.mergeResult = { ok: false, message: 'Required status check "ci" is expected' };
+    await on.say('alice', 'teriac apply');
+    assert.match(on.gh.lastReply(), /couldn't merge this PR: Required status check "ci" is expected/);
+    const off = setup();
+    await off.open();
+    off.gh.reviewsByPr.set(1, [{ user: 'carol', state: 'approved', commitSha: head }, { user: 'alice', state: 'approved', commitSha: head }]);
+    await off.say('alice', 'teriac apply');
+    assert.equal(off.gh.merges.length, 0);
   });
 });

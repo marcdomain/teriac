@@ -31,10 +31,27 @@ const ensureOrigin = async (dir: string, url: string) => {
  * Makes `dir` a clean checkout of `sha`. Keeps .terraform, .terragrunt-cache
  * and local state between runs of the same PR.
  */
-export const checkout = async (dir: string, auth: CloneAuth, sha: string, prRef?: string): Promise<void> => {
+export const checkout = async (dir: string, auth: CloneAuth, sha: string, prRef?: string, mergeRef?: string, mergeTries = 4): Promise<void> => {
   mkdirSync(dir, { recursive: true });
   if (!existsSync(join(dir, '.git'))) await git(dir, ['init', '-q']);
   await ensureOrigin(dir, auth.url);
+  // Merge checkout: the platform's test merge of the PR into its base branch, so the plan
+  // includes what's on the base branch now. It must be the merge of this exact commit.
+  if (mergeRef) {
+    let merged = '';
+    for (let i = 0; i < mergeTries && !merged; i++) {
+      try {
+        await git(dir, ['fetch', '-q', '--depth=2', '--no-tags', 'origin', `+${mergeRef}:refs/teriac/merge`], auth);
+        const parents = (await git(dir, ['rev-list', '--parents', '-n', '1', 'refs/teriac/merge'])).trim().split(' ');
+        if (parents.slice(1).includes(sha)) merged = parents[0];
+      } catch { /* not there yet, or not mergeable */ }
+      if (!merged && i < mergeTries - 1) await new Promise(r => setTimeout(r, 1500)); // the platform updates it shortly after a push
+    }
+    if (!merged) throw new Error('this pull request can\'t be merged into its base branch cleanly (or the merge isn\'t ready yet). Resolve the conflicts, or plan again in a moment');
+    await git(dir, ['checkout', '-q', '--force', '--detach', merged]);
+    await git(dir, ['clean', '-q', '-ffdx', '-e', '.terraform', '-e', '.terragrunt-cache', '-e', 'terraform.tfstate', '-e', 'terraform.tfstate.backup', '-e', 'terraform.tfstate.d']);
+    return;
+  }
   try {
     await git(dir, ['fetch', '-q', '--depth=1', '--no-tags', 'origin', sha], auth);
   } catch (err) {

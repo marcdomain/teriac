@@ -55,3 +55,39 @@ test('a PR checkout keeps local state files between runs, but removes other left
     rmSync(tmp, { recursive: true, force: true });
   }
 });
+
+test('merge checkout: the PR merged into its base branch, only for this exact commit', async () => {
+  const tmp = mkdtempSync(join(tmpdir(), 'teriac-merge-'));
+  try {
+    const origin = join(tmp, 'origin');
+    mkdirSync(origin);
+    const g = (...a: string[]) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@t', ...a], { cwd: origin, encoding: 'utf-8' }).trim();
+    g('init', '-q', '-b', 'main');
+    g('config', 'uploadpack.allowAnySHA1InWant', 'true');
+    writeFileSync(join(origin, 'main.tf'), 'v1\n');
+    g('add', '-A'); g('commit', '-qm', 'v1');
+    g('checkout', '-q', '-b', 'feature');
+    writeFileSync(join(origin, 'app.tf'), 'feature\n');
+    g('add', '-A'); g('commit', '-qm', 'feature');
+    const head = g('rev-parse', 'HEAD');
+    g('checkout', '-q', 'main');
+    writeFileSync(join(origin, 'network.tf'), 'added on main later\n');
+    g('add', '-A'); g('commit', '-qm', 'main moved on');
+    // What GitHub prepares: refs/pull/1/head and a test merge in refs/pull/1/merge.
+    g('update-ref', 'refs/pull/1/head', head);
+    g('merge', '-q', '--no-ff', '--no-edit', 'feature');
+    g('update-ref', 'refs/pull/1/merge', g('rev-parse', 'HEAD'));
+    g('reset', '-q', '--hard', 'HEAD~1');
+
+    const work = join(tmp, 'work');
+    await checkout(work, { url: origin }, head, 'refs/pull/1/head', 'refs/pull/1/merge');
+    assert.equal(readFileSync(join(work, 'app.tf'), 'utf-8'), 'feature\n', 'the PR\'s change');
+    assert.equal(readFileSync(join(work, 'network.tf'), 'utf-8'), 'added on main later\n', 'and what main has now');
+
+    // A merge of an older commit (GitHub hasn't caught up) or no merge at all is refused.
+    await assert.rejects(checkout(join(tmp, 'w2'), { url: origin }, 'f'.repeat(40), undefined, 'refs/pull/1/merge', 1), /can't be merged into its base branch cleanly/);
+    await assert.rejects(checkout(join(tmp, 'w3'), { url: origin }, head, undefined, 'refs/pull/9/merge', 1), /can't be merged/);
+  } finally {
+    rmSync(tmp, { recursive: true, force: true });
+  }
+});

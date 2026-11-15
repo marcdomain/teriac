@@ -32,6 +32,7 @@ const { Oidc } = await import('./auth.ts');
 const { Avatars } = await import('./avatars.ts');
 const { GrantWatcher } = await import('./grants.ts');
 const { SummaryScheduler } = await import('./summary.ts');
+const { Housekeeper } = await import('./housekeeping.ts');
 
 const { BackupScheduler, cleanLeftovers, destination, rcloneRemote, restoreLatest } = await import('./backup.ts');
 const { notifyText } = await import('./notify.ts');
@@ -83,6 +84,7 @@ const chat = { channels: config.channels, people: config.people, env: process.en
 const grantNotices = { store, cfg: config.breakGlass, ...chat };
 const grants = new GrantWatcher(grantNotices);
 const summary = new SummaryScheduler({ store, cfg: config.summary, ...chat });
+const housekeeping = new Housekeeper({ config, store, adapterFor: host => (config.github && host === config.github.host ? adapters.github : undefined) });
 const backups = config.backup && remote ? new BackupScheduler({
   cfg: config.backup, store, remote, dataDir: config.dataDir,
   notify: config.backup.notify.length
@@ -115,6 +117,7 @@ server.listen(config.port, () => {
   grants.start();
   summary.start();
   backups?.start();
+  housekeeping.start();
   log.info('teriac-server listening', { port: config.port, dataDir: config.dataDir, repos: config.repos.map(r => r.id) });
 });
 
@@ -138,6 +141,7 @@ const shutdown = async (signal: string) => {
   grants.stop();
   summary.stop();
   backups?.stop();
+  housekeeping.stop();
   await Promise.all([app.idle(), drift.idle(), backups?.idle()]);
   store.close();
   process.exit(0);

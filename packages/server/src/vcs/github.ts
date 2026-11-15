@@ -411,6 +411,17 @@ export class GitHubAdapter implements VcsAdapter {
     return opened?.html_url ?? null;
   }
 
+  // Merges only the commit that was applied (`sha`): a newer push makes GitHub refuse it.
+  async mergePullRequest(repo: Repo, number: number, method: 'merge' | 'squash' | 'rebase', sha: string): Promise<{ ok: boolean; message: string }> {
+    const { status, data } = await this.api(repo, 'PUT', `/repos/${repo.fullName}/pulls/${number}/merge`, { merge_method: method, sha }, [405, 409, 422]);
+    return { ok: status === 200 && data?.merged !== false, message: data?.message ?? `HTTP ${status}` };
+  }
+
+  async deleteBranch(repo: Repo, branch: string): Promise<boolean> {
+    const { status } = await this.api(repo, 'DELETE', `/repos/${repo.fullName}/git/refs/heads/${branch.split('/').map(encodeURIComponent).join('/')}`, undefined, [404, 422]);
+    return status === 204;
+  }
+
   async fileAt(repo: Repo, path: string, ref: string): Promise<string | null> {
     const { status, data } = await this.api(repo, 'GET',
       `/repos/${repo.fullName}/contents/${path.split('/').map(encodeURIComponent).join('/')}?ref=${encodeURIComponent(ref)}`, undefined, [404]);

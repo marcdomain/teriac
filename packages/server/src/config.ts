@@ -51,6 +51,10 @@ export interface RepoPolicy {
   allow_extra_args?: boolean;                 // `teriac plan -- -var=x` (default false)
   allow_fork_prs?: boolean;                   // plan and apply PRs from forks (default false: their code would run with this server's credentials)
   notify_applies?: string[];                  // channels told about every apply in this repo (done or failed)
+  checkout?: 'branch' | 'merge';              // plan the PR's own commit (default) or its merge into the base branch
+  automerge?: boolean | { method?: 'merge' | 'squash' | 'rebase'; delete_branch?: boolean }; // merge the PR once everything planned is applied
+  log_retention_days?: number;                // clear this repo's run logs this many days after a PR's last apply
+  remind_unmerged?: { after_hours: number; notify?: string[]; comment?: boolean }; // applied but not merged after this long: remind
   autoplan?: boolean;                         // default true
   plan_drafts?: boolean;                      // default false
   allow_repo_schedules?: boolean;             // drift schedules from teriac.yaml (default true)
@@ -146,6 +150,7 @@ export interface ServerConfig {
   progressReply: boolean;                     // TERIAC_PROGRESS_REPLY: spinning "Running…" reply, edited into the result (default off)
   commentMode: 'new' | 'update';              // TERIAC_COMMENT_MODE: a new comment per plan (default) or one updated comment
   moduleAuth?: boolean;                       // TERIAC_MODULE_AUTH: read-only App token for git module downloads (default on)
+  logRetentionDays?: number;                  // TERIAC_LOG_RETENTION_DAYS: clear run logs this many days after a PR's last apply
   spinnerUrl: string | null;                  // animated icon GitHub can load; null → fall back to 👀
   github?: GitHubConfig;
   repos: RepoPolicy[];
@@ -242,6 +247,9 @@ export const parseServerPolicy = (text: string): ServerPolicy => {
     if (!Array.isArray(r.notify_applies) || r.notify_applies.some(c => typeof c !== 'string')) throw new Error(`repos[${i}].notify_applies must be a list of channel names`);
     for (const c of r.notify_applies) if (!channels[c]) throw new Error(`repos[${i}].notify_applies: no channel named "${c}" in repos.yaml`);
   }
+  for (const [i, r] of repos.entries()) {
+    for (const c of r.remind_unmerged?.notify ?? []) if (!channels[c]) throw new Error(`repos[${i}].remind_unmerged.notify: no channel named "${c}" in repos.yaml`);
+  }
   return {
     repos, channels, people, users, policies,
     secretScan: validateSecretScan(doc.secret_scan, 'secret_scan'),
@@ -312,6 +320,21 @@ export const parseReposYaml = (text: string): RepoPolicy[] => {
     validateBool(repo.keep_approval_on_rebase, `${at}.keep_approval_on_rebase`);
     validateBool(repo.verify_plan, `${at}.verify_plan`);
     validateBool(repo.allow_fork_prs, `${at}.allow_fork_prs`);
+    if (repo.checkout !== undefined && !['branch', 'merge'].includes(repo.checkout)) throw new Error(`${at}.checkout must be branch or merge`);
+    if (repo.log_retention_days !== undefined && !(Number.isInteger(repo.log_retention_days) && repo.log_retention_days >= 1)) throw new Error(`${at}.log_retention_days must be a whole number of days, 1 or more`);
+    if (repo.remind_unmerged !== undefined) {
+      const r = repo.remind_unmerged as Record<string, any>;
+      if (!r || typeof r !== 'object' || !(typeof r.after_hours === 'number' && r.after_hours > 0)) throw new Error(`${at}.remind_unmerged needs after_hours (a number above 0)`);
+      if (r.notify !== undefined && (!Array.isArray(r.notify) || r.notify.some((c: unknown) => typeof c !== 'string'))) throw new Error(`${at}.remind_unmerged.notify must be a list of channel names`);
+      validateBool(r.comment, `${at}.remind_unmerged.comment`);
+      if (r.comment === false && !r.notify?.length) throw new Error(`${at}.remind_unmerged: with comment: false, set notify (or nobody is reminded)`);
+    }
+    if (repo.automerge !== undefined && typeof repo.automerge !== 'boolean') {
+      const am = repo.automerge as Record<string, unknown>;
+      if (typeof am !== 'object' || am === null) throw new Error(`${at}.automerge must be true, false or { method, delete_branch }`);
+      if (am.method !== undefined && !['merge', 'squash', 'rebase'].includes(am.method as string)) throw new Error(`${at}.automerge.method must be merge, squash or rebase`);
+      validateBool(am.delete_branch, `${at}.automerge.delete_branch`);
+    }
     validateStaleBase(repo.stale_base, `${at}.stale_base`);
     if (repo.secret_scan !== undefined) {
       // `secret_scan: fail`, or `{ mode, patterns }`: the repo's patterns add to the server's.
@@ -335,6 +358,13 @@ export const parseReposYaml = (text: string): RepoPolicy[] => {
     }
   }
   return repos;
+};
+
+const parseDays = (v: string | undefined): number | undefined => {
+  if (!v?.trim()) return undefined;
+  const n = Number(v);
+  if (!Number.isInteger(n) || n < 1) throw new Error(`TERIAC_LOG_RETENTION_DAYS must be a whole number of days, 1 or more, not "${v}"`);
+  return n;
 };
 
 const parseBool = (v: string | undefined, name: string): boolean | undefined => {
@@ -405,6 +435,7 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): ServerConfig =
     progressReply: env.TERIAC_PROGRESS_REPLY === 'true',
     commentMode: parseCommentMode(env.TERIAC_COMMENT_MODE, 'TERIAC_COMMENT_MODE') ?? 'new',
     moduleAuth: parseBool(env.TERIAC_MODULE_AUTH, 'TERIAC_MODULE_AUTH') ?? true,
+    logRetentionDays: parseDays(env.TERIAC_LOG_RETENTION_DAYS),
     spinnerUrl: spinnerUrlFor(publicUrl),
     github,
     repos,
