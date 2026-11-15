@@ -26,7 +26,7 @@ RUN set -eu; \
     install -m 0755 /tmp/rclone/*/rclone /usr/local/bin/rclone; \
     /usr/local/bin/rclone version | head -1
 
-FROM node:26-trixie-slim
+FROM node:26-trixie-slim AS rootfs
 # Security updates released since the base image was built, and git for clones and Terraform
 # module sources (over https).
 RUN apt-get update \
@@ -54,6 +54,11 @@ RUN rm -rf /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/corepack 
              /bin/ls /bin/cp /bin/mv /bin/sed /bin/grep /bin/tar /bin/gzip /usr/bin/find /usr/bin/env; do \
       if ldd "$b" | grep -q "not found"; then echo "$b is missing a library:"; ldd "$b" | grep "not found"; exit 1; fi; \
     done
+# Only the files left after the purge are shipped: the base image's layers still hold npm,
+# perl and the packages replaced by the upgrade, so the filesystem is copied into an empty image.
+FROM scratch
+COPY --from=rootfs / /
+ENV PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 WORKDIR /app
 COPY --from=rclone /usr/local/bin/rclone /usr/local/bin/rclone
 COPY --from=deps /app/node_modules ./node_modules
