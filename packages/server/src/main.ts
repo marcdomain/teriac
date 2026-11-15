@@ -85,7 +85,12 @@ const chat = { channels: config.channels, people: config.people, env: process.en
 const grantNotices = { store, cfg: config.breakGlass, ...chat };
 const grants = new GrantWatcher(grantNotices);
 const summary = new SummaryScheduler({ store, cfg: config.summary, ...chat });
-const housekeeping = new Housekeeper({ config, store, adapterFor: host => (config.github && host === config.github.host ? adapters.github : undefined) });
+const housekeeping = new Housekeeper({
+  config, store, adapterFor: host => (config.github && host === config.github.host ? adapters.github : undefined),
+  busy: () => { const q = app.runQueue; return q.active > 0 || q.waiting > 0; },
+  appKey: () => adapters.github?.keyInUse() ?? null,
+  appSettingsUrl: () => adapters.github?.appSettingsUrl() ?? Promise.resolve(null),
+});
 const backups = config.backup && remote ? new BackupScheduler({
   cfg: config.backup, store, remote, dataDir: config.dataDir,
   notify: config.backup.notify.length

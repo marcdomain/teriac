@@ -77,6 +77,27 @@ export class GitHubAdapter implements VcsAdapter {
 
   private goodKey: string | null = null; // fingerprint of the key GitHub last accepted
 
+  // The key in use: the one GitHub last accepted, else the current one. Its fingerprint
+  // (not the key) is what key_rotation remembers, to know how old it is.
+  keyInUse(): { fingerprint: string; next: boolean } {
+    const fp = (k: string) => createHash('sha256').update(k).digest('hex').slice(0, 12);
+    const keys = this.secrets().keys;
+    const used = keys.find(k => fp(k) === this.goodKey) ?? keys[0];
+    return { fingerprint: fp(used), next: used !== keys[0] };
+  }
+
+  // Where the App's keys are managed (its settings page).
+  async appSettingsUrl(): Promise<string | null> {
+    const res = await this.appFetch(`${this.cfg.apiUrl}/app`).catch(() => null);
+    if (!res?.ok) return null;
+    const app = await res.json() as { slug?: string; owner?: { login?: string; type?: string } };
+    if (!app.slug) return null;
+    const web = this.cfg.host === 'github.com' ? 'https://github.com' : `https://${this.cfg.host}`;
+    return app.owner?.type === 'Organization'
+      ? `${web}/organizations/${app.owner.login}/settings/apps/${app.slug}`
+      : `${web}/settings/apps/${app.slug}`;
+  }
+
   // A request signed as the App. Tries the key that worked last, then the others: during a
   // rotation GitHub accepts both, and once the old key is deleted the next one takes over
   // with no restart. Running jobs keep their installation tokens either way.

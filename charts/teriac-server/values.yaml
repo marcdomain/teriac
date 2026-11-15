@@ -134,6 +134,9 @@ repos: {}
 #    schedule: "0 9 * * 1"
 #    timezone: Europe/Madrid
 #    notify: [infra-alerts]
+#  key_rotation:                          # remind to rotate the GitHub App key (see github.privateKeyNext)
+#    every_days: 90
+#    notify: [infra-alerts]
 
 dashboard:
   # Sign-in methods; turn on any mix. Viewers read; admins can unlock, run drift checks and revoke

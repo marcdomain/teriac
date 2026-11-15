@@ -128,7 +128,11 @@ export interface ServerPolicy {
   protected?: ProtectedConfig;
   breakGlass?: BreakGlassConfig;
   summary?: SummaryConfig;
+  keyRotation?: KeyRotationConfig;
 }
+
+// key_rotation in repos.yaml: remind people to rotate the GitHub App key every N days.
+export interface KeyRotationConfig { every_days: number; notify: string[] }
 
 export interface GitHubConfig {
   appId: string;
@@ -171,6 +175,7 @@ export interface ServerConfig {
   protected?: ProtectedConfig;
   breakGlass?: BreakGlassConfig;
   summary?: SummaryConfig;
+  keyRotation?: KeyRotationConfig;        // key_rotation in repos.yaml
   backup?: BackupConfig;                  // scheduled database backups (TERIAC_BACKUP_*)
 }
 
@@ -283,7 +288,17 @@ export const parseServerPolicy = (text: string): ServerPolicy => {
     protected: validateProtected(doc.protected, 'protected'),
     breakGlass: validateBreakGlass(doc.break_glass, 'break_glass', channels),
     summary: validateSummary(doc.summary, 'summary', channels),
+    keyRotation: validateKeyRotation(doc.key_rotation, channels),
   };
+};
+
+const validateKeyRotation = (v: unknown, channels: Record<string, ChannelConfig>): KeyRotationConfig | undefined => {
+  if (v === undefined || v === null) return undefined;
+  const r = v as Record<string, unknown>;
+  if (typeof r !== 'object' || !(Number.isInteger(r.every_days) && (r.every_days as number) >= 1)) throw new Error('key_rotation.every_days must be a whole number of days, 1 or more');
+  if (!Array.isArray(r.notify) || !r.notify.length || r.notify.some(c => typeof c !== 'string')) throw new Error('key_rotation.notify must list one or more channels');
+  for (const c of r.notify as string[]) if (!channels[c]) throw new Error(`key_rotation.notify: no channel named "${c}" in repos.yaml`);
+  return { every_days: r.every_days as number, notify: r.notify as string[] };
 };
 
 export const parseUsers = (list: unknown, where: string): DashboardUser[] => {
@@ -511,6 +526,7 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): ServerConfig =
     protected: policy.protected,
     breakGlass: policy.breakGlass,
     summary: policy.summary,
+    keyRotation: policy.keyRotation,
     backup: parseBackup({ ...env, TERIAC_BACKUP_AZURE_KEY: readSecret(env, 'TERIAC_BACKUP_AZURE_KEY') }, policy.channels),
     auth: loadAuth(env, publicUrl, policy.users),
   };

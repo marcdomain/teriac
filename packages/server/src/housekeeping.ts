@@ -2,7 +2,9 @@
 // - log_retention_days: a PR's run logs are cleared that many days after its last apply
 //   (summaries, risk, people, times, metrics and the PR's comments stay);
 // - remind_unmerged: a PR that was applied but is still open after `after_hours` gets one
-//   reminder, as a comment to whoever applied and/or in chat.
+//   reminder, as a comment to whoever applied and/or in chat;
+// - key_rotation: when the GitHub App key in use is `every_days` old, a reminder with the
+//   steps, sent while no plan or apply is running, then weekly until the key changes.
 import type { ServerConfig, RepoPolicy } from './config.ts';
 import type { Store, Run } from './store.ts';
 import type { Repo, VcsAdapter } from './vcs/types.ts';
@@ -20,7 +22,13 @@ export interface HousekeepingDeps {
   adapterFor: (host: string) => VcsAdapter | undefined;
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
+  busy?: () => boolean;                       // plans or applies running or queued
+  appKey?: () => { fingerprint: string; next: boolean } | null;
+  appSettingsUrl?: () => Promise<string | null>;
 }
+
+const DAY = 24 * HOUR;
+const REMIND_AGAIN_DAYS = 7;
 
 const policyOf = (config: ServerConfig, repoKey: string): RepoPolicy | undefined => config.repos.find(p => matchGlob(p.id, repoKey));
 
@@ -44,7 +52,41 @@ export class Housekeeper {
   stop() { if (this.timer) clearInterval(this.timer); }
 
   async tick(now = new Date()) {
-    return { expired: this.expireLogs(now), reminded: await this.remind(now) };
+    return { expired: this.expireLogs(now), reminded: await this.remind(now), rotation: await this.keyRotation(now) };
+  }
+
+  // The age of a key counts from when teriac first saw it (GitHub doesn't say when it was made).
+  async keyRotation(now: Date): Promise<boolean> {
+    const cfg = this.d.config.keyRotation;
+    const key = this.d.appKey?.();
+    if (!cfg || !key) return false;
+    const seenKey = `key_seen:${key.fingerprint}`;
+    const seen = this.d.store.getSetting(seenKey) as string | null;
+    if (!seen) { this.d.store.setSetting(seenKey, now.toISOString()); return false; }
+    const age = Math.floor((now.getTime() - Date.parse(seen)) / DAY);
+    if (age < cfg.every_days) return false;
+    const lastKey = `key_reminded:${key.fingerprint}`;
+    const last = this.d.store.getSetting(lastKey) as string | null;
+    if (last && now.getTime() - Date.parse(last) < REMIND_AGAIN_DAYS * DAY) return false;
+    if (this.d.busy?.()) return false; // wait for a quiet moment; checked again in 10 minutes
+    const settings = await this.d.appSettingsUrl?.().catch(() => null) ?? null;
+    const where = settings ? `[the App's settings](${settings})` : "the App's settings (GitHub → Settings → Developer settings → GitHub Apps)";
+    const sent = await notifyText(cfg.notify, this.d.config.channels, {
+      title: '🔑 Time to rotate the teriac GitHub App key',
+      lines: [
+        `The key teriac uses is ${age} days old (rotation every ${cfg.every_days} days). No plans or applies are running now.`,
+        `1. In ${where}, click **Generate a private key**.`,
+        '2. Add it to teriac\'s GitHub Secret as `private-key-next`. No restart needed.',
+        '3. After an hour, delete the old key in GitHub. teriac switches to the new one by itself.',
+        '4. Then move the new key to `private-key` and remove `private-key-next`.',
+      ],
+      event: 'teriac.key_rotation', url: settings ?? undefined,
+      data: { ageDays: age, everyDays: cfg.every_days, keyFingerprint: key.fingerprint, settingsUrl: settings },
+    }, { people: this.d.config.people, env: this.d.env ?? process.env, fetchImpl: this.d.fetchImpl });
+    if (!sent.some(r => r.ok)) return false;      // try again next tick
+    this.d.store.setSetting(lastKey, now.toISOString());
+    log.info('key rotation reminder sent', { ageDays: age, key: key.fingerprint });
+    return true;
   }
 
   // Days to keep a repo's logs after its last apply: the repo's own setting, else the server's.

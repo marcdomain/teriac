@@ -74,3 +74,44 @@ test('settings are checked at start-up', async () => {
   assert.throws(() => parseServerPolicy('repos:\n  - id: github.com/a/b\n    remind_unmerged: { after_hours: 24, notify: [nope] }\n'), /no channel named "nope"/);
   assert.throws(() => parseServerPolicy('repos:\n  - id: github.com/a/b\n    log_retention_days: 0\n'), /whole number of days/);
 });
+
+test('key rotation: reminds when the key is due, while nothing runs, weekly until it changes', async () => {
+  const store = new Store(':memory:');
+  const sent: any[] = [];
+  const fetchImpl = (async (_u: string, init: RequestInit) => { sent.push(JSON.parse(String(init.body))); return new Response('ok'); }) as typeof fetch;
+  let key = { fingerprint: 'aaaaaaaaaaaa', next: false };
+  let busy = false;
+  const hk = new Housekeeper({
+    config: { ...config({}), keyRotation: { every_days: 90, notify: ['ops'] } }, store, adapterFor: () => undefined,
+    env: { HOOK: 'https://hook.test' }, fetchImpl, busy: () => busy, appKey: () => key,
+    appSettingsUrl: async () => 'https://github.com/organizations/acme/settings/apps/teriac',
+  });
+  const day = (n: number) => new Date(Date.parse('2026-01-01T00:00:00Z') + n * 24 * HOUR);
+  assert.equal(await hk.keyRotation(day(0)), false, 'first sight: remembered');
+  assert.equal(await hk.keyRotation(day(89)), false, 'not due yet');
+  busy = true;
+  assert.equal(await hk.keyRotation(day(91)), false, 'due, but a plan is running: wait');
+  busy = false;
+  assert.equal(await hk.keyRotation(day(91)), true);
+  assert.equal(sent[0].title, '🔑 Time to rotate the teriac GitHub App key');
+  const text = JSON.stringify(sent[0]);
+  assert.match(text, /91 days old \(rotation every 90 days\)\. No plans or applies are running now\./);
+  assert.match(text, /settings\/apps\/teriac/);
+  assert.match(text, /private-key-next/);
+  assert.equal(await hk.keyRotation(day(95)), false, 'not again within a week');
+  assert.equal(await hk.keyRotation(day(98)), true, 'a week later, still the old key');
+  key = { fingerprint: 'bbbbbbbbbbbb', next: true };             // rotated
+  assert.equal(await hk.keyRotation(day(99)), false, 'new key: the count starts again');
+  assert.equal(await hk.keyRotation(day(150)), false);
+  assert.equal(await hk.keyRotation(day(190)), true);
+  assert.equal(sent.length, 3);
+});
+
+test('key rotation: off unless set; checked at start-up', async () => {
+  const store = new Store(':memory:');
+  const hk = new Housekeeper({ config: config({}), store, adapterFor: () => undefined, appKey: () => ({ fingerprint: 'x', next: false }) });
+  assert.equal(await hk.keyRotation(new Date()), false);
+  const { parseServerPolicy } = await import('../src/config.ts');
+  assert.throws(() => parseServerPolicy('repos: [{ id: github.com/a/b }]\nkey_rotation: { every_days: 0, notify: [ops] }\n'), /every_days must be a whole number/);
+  assert.throws(() => parseServerPolicy('repos: [{ id: github.com/a/b }]\nkey_rotation: { every_days: 90, notify: [nope] }\n'), /no channel named "nope"/);
+});

@@ -462,6 +462,31 @@ It sends:
 - the slowest projects and the most active people;
 - policy findings, refused actions, and emergency access given.
 
+## Rotating the GitHub App key
+
+The key stays with you: teriac never creates or deletes GitHub keys (GitHub has no API for
+that). It only reminds you when it's time, and switches to the new key without a restart.
+
+```yaml
+key_rotation:                           # in repos.yaml; off unless set
+  every_days: 90
+  notify: [infra-alerts]
+```
+
+When the key teriac uses is `every_days` old (counted from when teriac first saw it), it sends
+one message with the steps, at a moment when no plan or apply is running, then again weekly
+until the key changes:
+
+1. On the App's settings page (linked in the message), **Generate a private key**.
+2. Add it to teriac's GitHub Secret as `private-key-next` (Helm: `github.privateKeyNext`). The
+   Secret is mounted as files, so teriac sees it without a restart.
+3. After an hour (older tokens have expired by then), delete the old key in GitHub. GitHub
+   refuses it, and teriac signs in with the new one by itself.
+4. Move the new key to `private-key` and remove `private-key-next`.
+
+The webhook secret rotates the same way, with `webhook-secret-next`: while both are set, webhooks
+signed with either are accepted.
+
 ## Drift checks
 
 ```yaml
