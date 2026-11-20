@@ -325,6 +325,24 @@ affinity: {}
 podDisruptionBudget:
   enabled: false
 
+# Vertical Pod Autoscaler: sizes CPU and memory from what teriac actually uses. Needs the VPA
+# components in the cluster (built in on GKE and AKS, installed by hand on EKS, kind, k3s, ...).
+#   Off               recommendations only: read them with `kubectl describe vpa`
+#   Initial           applied when the pod starts (upgrades, restarts); never evicts a running apply
+#   Recreate          also evicts the pod to resize it; set podDisruptionBudget.enabled to hold
+#                     that off during drains, and runs in progress get terminationGracePeriodSeconds
+#   InPlaceOrRecreate resizes without a restart where it can (VPA 1.4+, Kubernetes 1.33+)
+verticalPodAutoscaler:
+  enabled: false
+  updateMode: Initial
+  controlledValues: RequestsAndLimits   # or RequestsOnly to keep resources.limits as set
+  minAllowed:
+    cpu: 100m
+    memory: 256Mi
+  maxAllowed:
+    cpu: "4"
+    memory: 8Gi
+
 serviceMonitor:
   enabled: false
   interval: 30s

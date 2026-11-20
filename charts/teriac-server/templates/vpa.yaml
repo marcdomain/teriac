@@ -1,0 +1,34 @@
+{{- if .Values.verticalPodAutoscaler.enabled }}
+{{- with .Values.verticalPodAutoscaler }}
+# Sizes the one replica from its real usage. The updater won't evict a lone pod unless
+# minReplicas is 1, so that is set for the modes that evict.
+apiVersion: autoscaling.k8s.io/v1
+kind: VerticalPodAutoscaler
+metadata:
+  name: {{ include "teriac.fullname" $ }}
+  labels:
+    {{- include "teriac.labels" $ | nindent 4 }}
+spec:
+  targetRef:
+    apiVersion: apps/v1
+    kind: StatefulSet
+    name: {{ include "teriac.fullname" $ }}
+  updatePolicy:
+    updateMode: {{ .updateMode | quote }}
+    {{- if has .updateMode (list "Recreate" "Auto" "InPlaceOrRecreate") }}
+    minReplicas: 1
+    {{- end }}
+  resourcePolicy:
+    containerPolicies:
+      - containerName: teriac-server
+        controlledValues: {{ .controlledValues }}
+        {{- with .minAllowed }}
+        minAllowed:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+        {{- with .maxAllowed }}
+        maxAllowed:
+          {{- toYaml . | nindent 10 }}
+        {{- end }}
+{{- end }}
+{{- end }}
