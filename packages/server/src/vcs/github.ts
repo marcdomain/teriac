@@ -2,7 +2,7 @@
 // No SDK: App JWTs are signed with node:crypto and the REST API is plain fetch.
 import { createHash, createHmac, createSign, timingSafeEqual } from 'node:crypto';
 import type {
-  CheckRun, CloneAuth, Comparison, Permission, PullRequest, PullRequestState, Reaction, Repo, Review, VcsAdapter, VcsEvent,
+  CheckRun, CloneAuth, Comparison, Permission, PullRequest, PullRequestState, Reaction, Repo, Review, VcsAdapter, VcsEvent, Suggestion,
 } from './types.ts';
 import type { GitHubConfig } from '../config.ts';
 import { addSecret, log } from '../log.ts';
@@ -397,6 +397,19 @@ export class GitHubAdapter implements VcsAdapter {
   async comment(repo: Repo, number: number, body: string): Promise<string | null> {
     const { data } = await this.api(repo, 'POST', `/repos/${repo.fullName}/issues/${number}/comments`, { body });
     return data?.id != null ? String(data.id) : null;
+  }
+
+  async suggestChanges(repo: Repo, number: number, sha: string, body: string, suggestions: Suggestion[]): Promise<boolean> {
+    // A suggestion block can't hold a longer fence than its own: use one longer than any inside.
+    const fence = (text: string) => '`'.repeat(Math.max(3, ...[...text.matchAll(/`{3,}/g)].map(m => m[0].length + 1)));
+    const comments = suggestions.map(s => ({
+      path: s.path, line: s.endLine, side: 'RIGHT',
+      ...(s.startLine < s.endLine ? { start_line: s.startLine, start_side: 'RIGHT' } : {}),
+      body: `${s.note}\n\n${fence(s.replacement)}suggestion\n${s.replacement}\n${fence(s.replacement)}`,
+    }));
+    // 422: a line isn't part of the PR's diff; the caller shows the fix in its comment instead.
+    const { status } = await this.api(repo, 'POST', `/repos/${repo.fullName}/pulls/${number}/reviews`, { commit_id: sha, event: 'COMMENT', body, comments }, [422]);
+    return status !== 422;
   }
 
   async editComment(repo: Repo, commentId: string, body: string): Promise<void> {

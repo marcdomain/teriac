@@ -22,6 +22,8 @@ import {
   RateLimiter, cookie, SESSION_COOKIE, OIDC_COOKIE, GITHUB_COOKIE, type GitHubLogin, type GitHubUserToken,
 } from './auth.ts';
 import { metrics } from './metrics.ts';
+import YAML from 'yaml';
+import type { Ai } from './ai.ts';
 import { log } from './log.ts';
 
 const MAX_BODY = 25 * 1024 * 1024; // GitHub's webhook limit
@@ -102,6 +104,8 @@ export interface HttpDeps {
   grants?: NotifyDeps;                        // emergency access (break_glass in repos.yaml)
   config?: ServerConfig;                      // for the Guardrails page (settings only, no secrets)
   backups?: BackupScheduler;                  // scheduled database backups (TERIAC_BACKUP_*)
+  ai?: Ai;                                    // AI answers and policy drafts (TERIAC_AI_PROVIDER)
+  aiLimiter?: RateLimiter;
 }
 
 // The guardrails in force, for the dashboard: freezes (on now or not), protected resources,
@@ -129,6 +133,8 @@ const safetySummary = (c: ServerConfig | undefined, now = new Date()) => {
 };
 
 const defaultLimiter = new RateLimiter(10, 15 * 60_000);
+// AI requests cost money: 20 per person per 15 minutes.
+const aiLimiter = new RateLimiter(20, 15 * 60_000);
 
 // Who is calling: an API token (automation, admin) or a dashboard session cookie. A session
 // from a sign-in method that has since been turned off no longer counts. GitHub sessions
@@ -401,6 +407,38 @@ export const createHttpServer = (deps: HttpDeps): Server => {
         const adapter = deps.adapters[platformForHost(host, deps.platforms ?? {})];
         const notified = await deps.app.dashboardUnlock(adapter, lock, who);
         return send(res, 200, { released: lock, notified });
+      }
+
+      // ---- AI: what is on, questions about a run, policy drafts ----
+      if (req.method === 'GET' && url.pathname === '/api/ai') {
+        const ai = deps.ai;
+        return send(res, 200, ai ? { enabled: true, provider: ai.cfg.provider, model: ai.label, features: ai.cfg.features } : { enabled: false });
+      }
+      const askRun = /^\/api\/runs\/(\d+)\/ask$/.exec(url.pathname);
+      if ((askRun || url.pathname === '/api/ai/policy') && req.method === 'POST') {
+        const ai = deps.ai;
+        if (!ai) return send(res, 404, { error: 'AI help is not set up (TERIAC_AI_PROVIDER).' });
+        // Every request is billed to the server's AI account: a few per person per quarter hour.
+        if (!(deps.aiLimiter ?? aiLimiter).allow(`${who.via}:${who.name}`)) return send(res, 429, { error: 'Too many AI requests; try again in a few minutes.' });
+        const body = JSON.parse((await readBody(req)).toString('utf-8') || '{}') as { question?: unknown; request?: unknown };
+        if (askRun) {
+          if (!ai.has('ask')) return send(res, 404, { error: 'AI answers are turned off (TERIAC_AI_FEATURES).' });
+          const r = deps.store.getRun(Number(askRun[1]));
+          if (!r || !inScope(r.repo)) return send(res, 404, { error: 'not found' });
+          const question = typeof body.question === 'string' ? body.question.trim().slice(0, 2000) : '';
+          if (!question) return send(res, 400, { error: 'question is required' });
+          const answer = await deps.app.askAboutRun(r, question);
+          deps.store.audit({ repo: r.repo, pr: r.pr, user: who.name, action: 'ai_ask', project: r.project, allowed: true, reason: `dashboard, run ${r.id}: ${question.slice(0, 300)}` });
+          return answer ? send(res, 200, { answer, model: ai.label }) : send(res, 502, { error: 'No AI answer this time (the request failed or was declined).' });
+        }
+        if (!need('admin')) return send(res, 403, { error: 'Drafting policies needs the admin role.' });
+        if (!ai.has('policy')) return send(res, 404, { error: 'AI policy drafts are turned off (TERIAC_AI_FEATURES).' });
+        const request = typeof body.request === 'string' ? body.request.trim() : '';
+        if (!request) return send(res, 400, { error: 'request is required' });
+        const draft = await ai.draftPolicy(request);
+        if (!draft) return send(res, 502, { error: 'No AI draft this time (the request failed or was declined).' });
+        deps.store.audit({ repo: '*', pr: 0, user: who.name, action: 'ai_policy_draft', project: '*', allowed: true, reason: `${draft.rules.length} rules for: ${request.slice(0, 300)}` });
+        return send(res, 200, { ...draft, model: ai.label, yaml: YAML.stringify({ policies: { rules: draft.rules } }) });
       }
 
       // ---- emergency access ----

@@ -168,6 +168,24 @@ interface PolicyView { mode: 'off' | 'audit' | 'enforce'; findings: { rule: stri
 const policyOf = (run?: Run): PolicyView | null => (run?.policy ? JSON.parse(run.policy) as PolicyView : null);
 const SEV: Record<string, string> = { critical: '🔴', high: '🔴', medium: '🟠', low: '🟡' };
 
+// The AI's part of a run (TERIAC_AI_PROVIDER): a plan review, or why a run failed and a fix.
+// Always labelled, so nobody mistakes it for a rule-based check.
+export const aiLines = (run?: Run): string[] => {
+  const ai = run?.ai;
+  if (!ai) return [];
+  const tag = `<sub>${ai.model} · advisory, check it yourself</sub>`;
+  if (ai.kind === 'review') {
+    const lines = [`🤖 **AI review** ${tag}`, '', ...ai.summary.split('\n').map(l => `> ${l}`)];
+    for (const f of ai.findings) lines.push(`- ${SEV[f.severity] ?? '🟡'} **${f.title}** · \`${f.address}\` · ${f.why}`);
+    return [...lines, ''];
+  }
+  const lines = [`🤖 **AI: why it failed** ${tag}`, '', ...ai.cause.split('\n').map(l => `> ${l}`), ''];
+  for (const f of ai.fixes) {
+    lines.push(`**Suggested fix** · \`${f.path}\` line${f.startLine === f.endLine ? ` ${f.startLine}` : `s ${f.startLine}–${f.endLine}`}: ${f.why}`, fence(f.replacement, 'hcl'), '');
+  }
+  return lines;
+};
+
 // Links and pictures for people and code (source-control specific).
 export interface CommentLinks {
   commit(sha: string): string;
@@ -346,6 +364,7 @@ export const renderComment = (input: CommentInput): string => {
     for (const w of v.warnings ?? []) lines.push(`> [!WARNING]\n> ${w}`, '');
     if (v.plan?.secrets?.length) lines.push(`> [!CAUTION]\n> ${secretNote(v.plan.secrets)}`, '');
     if (v.plan?.status === 'success' && hasRisk(v.plan)) lines.push(riskLine(v.plan), '');
+    lines.push(...aiLines(v.plan));
     const pol = policyOf(v.plan);
     if (pol && pol.mode !== 'off') {
       if (pol.findings.length) {
@@ -493,6 +512,7 @@ export const renderApplyReport = (input: {
       }
       lines.push('');
     }
+    if (!ok) lines.push(...aiLines(v.apply));
     const outputs = ok ? parseApplyOutputs(v.apply.output) : null;
     if (outputs) lines.push('**Outputs:**', fence(tail(outputs, 4000)), '');
     lines.push(`**${ok ? 'Apply log' : 'Error'}**`, '', fence(tail(applyLog(v.apply.output), Math.max(2000, Math.floor((input.limit - 4000) / Math.max(1, applies.length))))));
@@ -522,6 +542,8 @@ export const renderCheck = (projectName: string, run: Run, blockers: string[] | 
     if (outs) summary.push('', '**Outputs:**', fence(tail(outs, 4000)));
   }
   if (ok && hasRisk(run)) summary.push('', riskLine(run));
+  const ai = aiLines(run);
+  if (ai.length) summary.push('', ...ai);
   if (run.secrets?.length) summary.push('', secretNote(run.secrets));
   const pol = policyOf(run);
   if (pol && pol.mode !== 'off' && pol.findings.length) {

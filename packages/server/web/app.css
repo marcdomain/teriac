@@ -459,3 +459,13 @@ label.field { display: grid; gap: 6px; }
 label.field > span { font: 500 10.5px/1 var(--mono); text-transform: uppercase; letter-spacing: 0.12em; color: var(--faint); }
 label.field input { font: 14px var(--font); padding: 10px 12px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--bg-elev); color: var(--ink); }
 label.field input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+
+/* AI help: reviews, failure fixes, questions and policy drafts */
+.card.ai .ai-body, .card.ai .ai-answer, .card.ai form.ai-ask { padding: 14px 18px; }
+.card.ai .ai-body p { margin: 0 0 10px; }
+.ai-findings { margin: 8px 0 0; padding-left: 18px; display: grid; gap: 8px; }
+.ai-fix { margin-top: 12px; display: grid; gap: 6px; }
+form.ai-ask { display: flex; gap: 8px; }
+form.ai-ask input { flex: 1; min-width: 0; font: 14px var(--font); padding: 9px 12px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--bg-elev); color: var(--ink); }
+.card.ai .ai-answer { border-top: 1px solid var(--line); display: grid; gap: 10px; }
+.card.ai .answer { white-space: pre-wrap; line-height: 1.55; }

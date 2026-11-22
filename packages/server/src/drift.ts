@@ -13,7 +13,8 @@ import { discoverProjects, type Project } from './discovery.ts';
 import { repoPolicyFor } from './policy.ts';
 import { parseCron, cronMatches, nextRun, type Cron } from './cron.ts';
 import { lastAuthor, type Author } from './blame.ts';
-import { planDriftFix, driftFixBody } from './driftfix.ts';
+import { planDriftFix, driftFixBody, aiDriftFix } from './driftfix.ts';
+import type { Ai } from './ai.ts';
 import { notifyAll, type DriftReport, type ProjectDrift } from './notify.ts';
 import { matchGlob } from './glob.ts';
 import { KeyedQueue } from './app.ts';
@@ -39,6 +40,7 @@ export interface DriftDeps {
   env?: NodeJS.ProcessEnv;
   fetchImpl?: typeof fetch;
   now?: () => Date;
+  ai?: Ai;                          // AI decisions on drift the rules can't fix (TERIAC_AI_PROVIDER)
 }
 
 export interface DriftResult {
@@ -204,8 +206,9 @@ export class DriftScheduler {
   private async fixPr(e: ScheduleEntry, root: string, project: Project, plan: Record<string, any>, drift: { address: string; author: Author | null }[], result: ProjectDrift) {
     if (!e.adapter.openPullRequest) { result.fixNote = 'drift-fix PRs are not supported on this platform'; return; }
     try {
-      const fix = planDriftFix(root, project.dir, plan, new Map(drift.map(d => [d.address, d.author])));
-      if (!fix.edits.length) { result.fixNote = 'no fix PR: nothing here can be updated in code automatically'; return; }
+      let fix = planDriftFix(root, project.dir, plan, new Map(drift.map(d => [d.address, d.author])));
+      if (this.deps.ai?.has('drift')) fix = await aiDriftFix(this.deps.ai, root, project.dir, project.name, plan, fix);
+      if (!fix.files.length) { result.fixNote = 'no fix PR: nothing here can be updated in code automatically'; return; }
       const branch = driftBranch(project.name);
       const url = await e.adapter.openPullRequest(e.repo, {
         base: e.branch, branch, title: `Accept drift in ${project.name}`,
@@ -213,7 +216,7 @@ export class DriftScheduler {
       });
       if (url) result.fixPr = url;
       else result.fixNote = `a drift-fix PR is already open (branch \`${branch}\`)`;
-      this.deps.store.audit({ repo: `${e.repo.host}/${e.repo.fullName}`, pr: 0, user: 'teriac', action: 'drift_fix_pr', project: project.name, allowed: true, reason: url ? `opened ${url} (${fix.edits.length} edits)` : `skipped: branch ${branch} exists` });
+      this.deps.store.audit({ repo: `${e.repo.host}/${e.repo.fullName}`, pr: 0, user: 'teriac', action: 'drift_fix_pr', project: project.name, allowed: true, reason: url ? `opened ${url} (${fix.edits.length} edits${fix.ai ? `, ${fix.ai.decisions.filter(d => d.decision === 'adopt').length} by AI` : ''})` : `skipped: branch ${branch} exists` });
     } catch (err) {
       log.warn('drift: could not open a fix PR', { project: project.name, err });
       result.fixNote = `could not open a fix PR: ${(err as Error).message.slice(0, 160)}`;

@@ -62,6 +62,7 @@ Set up the GitHub App like this:
 | `teriac apply -p <project>` | Apply one project. The Apply button does the same |
 | `teriac unlock` | Release this PR's locks and delete its saved plans and live output (`-p <project>` for one). Closing or merging the PR does the same |
 | `teriac cancel` | Stop this PR's running plans and drop its queued work. The PR author, or anyone with write access or more |
+| `teriac ask <question>` | An AI answer about this PR's plans and code, when [AI help](#ai-help) is on. Needs `plan` on a project |
 
 `-p` and `-d` take a name or a glob: `teriac plan -p 'live/prod/*'`. A repo that applies one
 project at a time refuses an apply whose glob matches more than one.
@@ -401,7 +402,8 @@ A repo's `teriac.yaml` can make these stricter (`reapprove_on_change: true`,
 ## Risk score
 
 Every plan with changes gets a risk level, from fixed rules, so the same plan always gets the
-same score. The PR comment's Risk column shows the level, or **None** when nothing risky was found;
+same score. With [AI help](#ai-help) on, the AI review's findings can raise it further (never lower it);
+those reasons start with "AI review:". The PR comment's Risk column shows the level, or **None** when nothing risky was found;
 the reasons are in each project's dropdown and on its check run.
 
 | Raises the level to | When the plan |
@@ -440,6 +442,54 @@ A repo's own `teriac.yaml` is different: repo owners control it, so it can only 
 
 The check run also puts notes on the code: each resource block that will be destroyed or replaced,
 and each policy finding, shows up on its line in the PR's **Files changed**.
+
+## AI help
+
+Optional help from Claude, off until you choose a provider. It only advises: it can raise a plan's
+risk, never lower it, and nothing it says approves or applies anything. Everything it writes is
+labelled with the model's name.
+
+| Feature | What it does |
+|---|---|
+| `review` | A two-to-four sentence summary in each plan's comment and check run, plus findings the rules can miss: forced replacements and why, data that could be lost, access that gets wider, things that become public, protections turned off. Findings also show on the code in **Files changed** |
+| `fix` | When a plan or apply fails: the likely cause, and the smallest code fix, posted as GitHub **suggested changes** (one click to commit) and shown in the comment |
+| `drift` | On drift-fix PRs (`fix_pr: true`), for what the mechanical fixer can't edit: **adopt** (the code is updated to match), **revert** (left alone, so applying puts it back) or **unsure** (left to a person) |
+| `ask` | `teriac ask <question>` on a PR, and **Ask about this run** on the dashboard. The AI can read the PR's code and saved plans, nothing else |
+| `policy` | **Draft a policy with AI** on the dashboard's Guardrails page (admins): plain English in, `policies.rules` YAML out, checked against test cases it writes. You paste it into `repos.yaml` yourself |
+
+```yaml
+# Helm values (or the TERIAC_AI_* variables)
+ai:
+  provider: anthropic           # anthropic, bedrock, vertex or foundry
+  existingSecret: claude-api    # Secret with key api-key (provider anthropic)
+  effort: medium                # low … max: deeper reviews take longer and cost more
+  features: [review, fix, drift, ask, policy]   # default: all
+```
+
+| Variable | |
+|---|---|
+| `TERIAC_AI_PROVIDER` | `anthropic`, `bedrock`, `vertex` or `foundry`. Empty or `off`: no AI |
+| `TERIAC_AI_MODEL` | Default `claude-opus-5-5` (`anthropic.claude-opus-5-5` on Bedrock) |
+| `TERIAC_AI_EFFORT` | `low`, `medium` (default), `high`, `xhigh`, `max` |
+| `TERIAC_AI_FEATURES` | Comma list; default `review,fix,drift,policy,ask` |
+| `TERIAC_AI_TIMEOUT_SECONDS` | Per request, default 180 |
+
+Credentials come from each provider's usual place: `ANTHROPIC_API_KEY`; the pod's AWS role and
+`AWS_REGION` for Bedrock; Workload Identity with `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION`
+for Vertex AI; `ANTHROPIC_FOUNDRY_RESOURCE` and `ANTHROPIC_FOUNDRY_API_KEY` for Microsoft Foundry.
+With Bedrock, Vertex AI or Foundry, plans stay in your own cloud account.
+
+**What is sent.** For a review, the changed attributes of each resource; for a fix, the end of the
+error output and the project's `.tf`, `.hcl` and `.tfvars` files. Values Terraform marks sensitive are
+replaced with `(sensitive value)` and the [secret scan](#leaked-secret-scan) always runs on what is
+sent, whatever `secret_scan` is set to. Anything from the repo is marked as data, not instructions.
+
+**When it can't help.** A failed, timed-out or declined request just means no AI section: plans and
+applies carry on as usual. On Anthropic's API a declined request is retried on a fallback model in
+the same call. Dashboard requests are limited to 20 per person per 15 minutes. Every question,
+suggestion and draft is in the audit log (`ai_ask`, `ai_suggestion`, `ai_policy_draft`).
+
+Cost is per request, at your provider's prices: a typical review sends 5–30k tokens.
 
 ## Change freezes and protected resources
 

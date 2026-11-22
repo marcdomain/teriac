@@ -2,7 +2,7 @@
 // button, and cleanup when a PR closes.
 import { join } from 'node:path';
 import { createHash } from 'node:crypto';
-import { rmSync, mkdirSync, readFileSync, existsSync, realpathSync } from 'node:fs';
+import { rmSync, mkdirSync, readFileSync, existsSync, realpathSync, readdirSync, statSync } from 'node:fs';
 import { AsyncLocalStorage } from 'node:async_hooks';
 import type { ServerConfig, RepoPolicy, Action } from './config.ts';
 import type { VcsAdapter, VcsEvent, Repo, PullRequestState, Comparison, Annotation, CloneAuth } from './vcs/types.ts';
@@ -24,14 +24,15 @@ import { matchGlob } from './glob.ts';
 import { metrics } from './metrics.ts';
 import { scanSecrets, secretNote } from './secrets.ts';
 import { securityFindings } from './security-rules.ts';
-import { assessRisk, extraApprovalFor, type Risk } from './risk.ts';
+import { assessRisk, extraApprovalFor, isProduction, type Risk } from './risk.ts';
+import { raiseRisk, type Ai, type AiResult } from './ai.ts';
 import { activeFreezes, protectedHits } from './freeze.ts';
 import { changeFingerprint, countApprovals, staleFor, staleText } from './safety.ts';
 import { stricterMode, DEFAULT_SIZE_LIMITS, type StaleBaseMode, type SecretScanMode, type RiskConfig, type FreezeConfig, type ProtectedConfig, type SecretPattern } from './safety-config.ts';
 import { locate } from './blame.ts';
 import { notifyText } from './notify.ts';
 import { LiveLogs, type LiveWriter } from './live.ts';
-import { sensitiveValues } from './sensitive.ts';
+import { sensitiveValues, hideValues } from './sensitive.ts';
 import type { PlanSummary } from './render.ts';
 
 export const MARKER = '<!-- teriac:summary -->';
@@ -175,6 +176,7 @@ export interface AppDeps {
   checkout?: typeof gitCheckout;
   env?: NodeJS.ProcessEnv;
   live?: LiveLogs;                // live output for the dashboard
+  ai?: Ai;                        // AI reviews and help (TERIAC_AI_PROVIDER)
 }
 
 // A -var-file (after `--`) must be a file inside the checkout, following symlinks: Terraform
@@ -264,6 +266,84 @@ const overriders = (who: string[], repo: Repo) => {
   });
   return names.length > 1 ? `${names.slice(0, -1).join(', ')} or ${names.at(-1)}` : names[0];
 };
+// ---- what `ask` can see ----
+
+// A run as text for the AI: status, counts, risk, findings, review, and the end of its output.
+const runDigest = (r: Run): string => {
+  const s = r.summary ? JSON.parse(r.summary) as PlanSummary : null;
+  const pol = r.policy ? JSON.parse(r.policy) as PolicyResult : null;
+  return [
+    `## ${r.kind} of ${r.project} (${r.dir || r.project}, workspace ${r.workspace}): ${r.status}, run ${r.id} by ${r.user}, ${r.engine}`,
+    s ? `Changes: ${s.changes.map(c => `${c.action} ${c.address}${c.reason ? ` (because ${c.reason})` : ''}`).join('; ') || 'none'}` : '',
+    r.risk ? `Risk: ${r.risk.level}${r.risk.reasons.length ? ` (${r.risk.reasons.join('; ')})` : ''}` : '',
+    pol?.findings.length ? `Policy (${pol.mode}): ${pol.findings.map(f => `${f.rule} on ${f.address}: ${f.message.split('\n')[0]}`).join('; ')}` : '',
+    r.ai?.kind === 'review' ? `Earlier AI review: ${r.ai.summary}` : r.ai?.kind === 'fix' ? `Earlier AI diagnosis: ${r.ai.cause}` : '',
+    `Output (end):\n${tail(r.output, 3000)}`,
+  ].filter(Boolean).join('\n');
+};
+
+const readJson = (file: string): Record<string, any> | null => { try { return JSON.parse(readFileSync(file, 'utf-8')); } catch { return null; } };
+
+// Read-only tools over runs: one resource's planned change, and a run's full output.
+const runTools = (runs: Run[]) => {
+  const find = (project: string) => runs.find(r => r.project === project);
+  return [
+    {
+      name: 'plan_resource_change',
+      description: 'The planned before/after values of one resource from a project\'s saved plan (sensitive values hidden).',
+      schema: { type: 'object', properties: { project: { type: 'string' }, address: { type: 'string' } }, required: ['project', 'address'], additionalProperties: false },
+      run: ({ project, address }: { project: string; address: string }) => {
+        const r = find(project);
+        const plan = r?.planPath ? readJson(`${r.planPath}.json`) : null;
+        if (!plan) return `no saved plan for project ${project} (plans are dropped when a lock is released or the PR closes)`;
+        const rc = (plan.resource_changes ?? []).find((x: any) => x.address === address);
+        if (!rc) return `no change to ${address} in ${project}'s plan`;
+        return hideValues(JSON.stringify({ address, actions: rc.change?.actions, replace_paths: rc.change?.replace_paths, before: rc.change?.before, after: rc.change?.after, after_unknown: rc.change?.after_unknown }), sensitiveValues(plan));
+      },
+    },
+    {
+      name: 'run_output',
+      description: 'The full console output of a project\'s latest run (cleaned of secrets).',
+      schema: { type: 'object', properties: { project: { type: 'string' } }, required: ['project'], additionalProperties: false },
+      run: ({ project }: { project: string }) => tail(find(project)?.output ?? `no run for ${project}`, 30_000),
+    },
+  ];
+};
+
+// Read-only tools over the PR's checkout: list a folder, read a file (never outside it, never .git).
+const checkoutTools = (root: string) => {
+  const inside = (path: string): string | null => {
+    try {
+      const top = realpathSync(root);
+      const real = realpathSync(join(top, path));
+      if (real !== top && !real.startsWith(`${top}/`)) return null;
+      return real.slice(top.length).split('/').includes('.git') ? null : real;
+    } catch { return null; }
+  };
+  return [
+    {
+      name: 'list_files',
+      description: 'Files and folders in a folder of the pull request\'s code, relative to the repo root ("." for the root).',
+      schema: { type: 'object', properties: { dir: { type: 'string' } }, required: ['dir'], additionalProperties: false },
+      run: ({ dir }: { dir: string }) => {
+        const real = inside(dir);
+        if (!real) return `${dir}: not found`;
+        return readdirSync(real, { withFileTypes: true }).filter(d => d.name !== '.git' && d.name !== '.terraform').slice(0, 300).map(d => `${d.name}${d.isDirectory() ? '/' : ''}`).join('\n');
+      },
+    },
+    {
+      name: 'read_file',
+      description: 'A file of the pull request\'s code, relative to the repo root, with line numbers.',
+      schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false },
+      run: ({ path }: { path: string }) => {
+        const real = inside(path);
+        if (!real || !statSync(real).isFile()) return `${path}: not found`;
+        return readFileSync(real, 'utf-8').slice(0, 60_000).split('\n').map((l, i) => `${String(i + 1).padStart(4)}| ${l}`).join('\n');
+      },
+    },
+  ];
+};
+
 const summaryOf = (run: Run | undefined): PlanSummary | null => (run?.summary ? JSON.parse(run.summary) as PlanSummary : null);
 
 export class App {
@@ -839,7 +919,7 @@ export class App {
     const name = this.deps.config.commandNames[0];
     if (cmd.verb === 'help') {
       const oneAtATime = this.deps.config.requireApplyProject || policy.require_apply_project === true;
-      return reply.say(helpText(name, oneAtATime));
+      return reply.say(helpText(name, oneAtATime, !!this.deps.ai?.has('ask')));
     }
     // Checked before anything is checked out: a fork's code must not run here.
     const fork = await this.forkRefusal(adapter, policy, repo, number);
@@ -858,6 +938,7 @@ export class App {
     if (!ctx.pr.open) return reply.say('❌ This PR is closed.');
 
     if (cmd.verb === 'unlock') return this.unlock(ctx, user, cmd, reply);
+    if (cmd.verb === 'ask') return this.ask(ctx, user, cmd.question ?? '', reply);
     if (cmd.tool) return this.toolCommand(ctx, user, cmd, reply);
 
     if (cmd.verb === 'plan') {
@@ -1082,16 +1163,25 @@ export class App {
         ? `teriac withheld this plan's output: it contains something that looks like a secret (${scanned.found.join(', ')}). `
           + 'Find where it comes from (a variable, a tag, an output), remove it, and plan again.'
         : scanned.text;
-      const risk = ok ? assessRisk(r.summary, project, policy?.findings ?? [], this.safety(ctx).risk) : null;
+      const ruled = ok ? assessRisk(r.summary, project, policy?.findings ?? [], this.safety(ctx).risk) : null;
+      // AI help: a review of a plan with changes, or the cause of a failure (not a withheld one).
+      let ai: AiResult | null = null;
+      if (ok && r.plan && r.hasChanges) {
+        ai = await this.aiReview(ctx, project, engine, r.plan, ruled, policy?.findings ?? []);
+      } else if (!r.ok && !scanned.fail && !mocks.length) {
+        ai = await this.aiFailure(ctx, project, 'plan', scanned.text);
+      }
+      const risk = ai?.kind === 'review' ? raiseRisk(ruled, ai) : ruled;
       store.finishRun(runId, {
         status: ok ? 'success' : 'failed', engine, summary: r.summary ? JSON.stringify(r.summary) : null,
         output, planPath: ok ? planPath : null, hasChanges: r.hasChanges, destroys,
         policy: policy ? JSON.stringify(policy) : null, mocks, providers, usage: r.usage ?? null,
         // The plan file's fingerprint: apply refuses a file that changed since it was reviewed.
         planSha: ok && existsSync(planPath) ? sha256File(planPath) : null,
-        risk, secrets: scanned.found,
+        risk, secrets: scanned.found, ai,
       });
       if (policy?.findings.length) store.saveFindings(store.getRun(runId)!, policy.mode, policy.findings);
+      if (ai?.kind === 'fix') await this.suggestFixes(ctx, project, ai);
     } catch (err) {
       store.finishRun(runId, { status: 'failed', engine, output: `teriac could not run this project: ${(err as Error).message}` });
     } finally {
@@ -1100,6 +1190,56 @@ export class App {
     }
     metrics.observeRun('plan', store.getRun(runId)!.status, Date.now() - started);
     await this.publishCheck(ctx, project, store.getRun(runId)!);
+  }
+
+  // ---- AI help (TERIAC_AI_PROVIDER) ----
+
+  private async aiReview(ctx: PrContext, project: Project, engine: string, plan: Record<string, any>, risk: Risk | null, findings: { rule: string; severity: string; address: string; message: string }[]): Promise<AiResult | null> {
+    const ai = this.deps.ai;
+    if (!ai?.has('review')) return null;
+    const s = this.safety(ctx);
+    return ai.reviewPlan({ project: project.name, production: isProduction(project, s.risk), engine, plan, risk, findings, patterns: s.secretPatterns });
+  }
+
+  private async aiFailure(ctx: PrContext, project: Project, kind: 'plan' | 'apply', output: string): Promise<AiResult | null> {
+    const ai = this.deps.ai;
+    if (!ai?.has('fix')) return null;
+    return ai.explainFailure({ project: project.name, kind, output, root: ctx.root, dir: project.dir, patterns: this.safety(ctx).secretPatterns });
+  }
+
+  // Fixes as suggested changes on the PR's code, where the platform allows it. The PR comment
+  // shows them too, so nothing is lost when a line is outside the PR's diff.
+  private async suggestFixes(ctx: PrContext, project: Project, help: Extract<AiResult, { kind: 'fix' }>) {
+    if (!help.fixes.length || !ctx.adapter.suggestChanges) return;
+    const ok = await ctx.adapter.suggestChanges(ctx.repo, ctx.pr.number, ctx.pr.headSha,
+      `🤖 **AI suggestion** for \`${project.name}\` (${help.model}): ${help.cause.split('\n')[0].slice(0, 300)}\n\n<sub>Check it before committing: AI can be wrong.</sub>`,
+      help.fixes.map(f => ({ path: f.path, startLine: f.startLine, endLine: f.endLine, replacement: f.replacement, note: f.why })),
+    ).catch(err => { log.warn('could not post AI suggestions', { err: (err as Error).message }); return false; });
+    this.deps.store.audit({ repo: ctx.repoKey, pr: ctx.pr.number, user: 'teriac', action: 'ai_suggestion', project: project.name, allowed: true, reason: `${help.fixes.length} suggested fix${help.fixes.length === 1 ? '' : 'es'} by ${help.model}${ok ? '' : ' (shown in the comment: outside the PR\'s diff)'}` });
+  }
+
+  // `teriac ask`: an AI answer from this PR's latest plans, with read-only access to the
+  // checkout and the saved plans. Needs plan rights on a project of the PR.
+  private async ask(ctx: PrContext, user: string, question: string, reply: Reply) {
+    const ai = this.deps.ai;
+    if (!ai?.has('ask')) return reply.say('AI answers are turned off on this server (`TERIAC_AI_FEATURES`).');
+    let may = false;
+    for (const p of ctx.projects) if ((await this.allowed(ctx, 'plan', user, p)).allowed) { may = true; break; }
+    if (!may) return reply.say('🚫 Asking needs permission to plan a project in this repo.');
+    const runs = this.deps.store.latestRuns(ctx.repoKey, ctx.pr.number, 'plan').filter(r => r.headSha === ctx.pr.headSha);
+    const summary = [`Pull request #${ctx.pr.number}: ${ctx.pr.title} (by ${ctx.pr.author}, ${ctx.pr.headRef} → ${ctx.pr.baseRef})`,
+      `Projects in the repo: ${ctx.projects.map(p => `${p.name} (${p.dir})`).join(', ') || 'none'}`,
+      ...runs.map(r => runDigest(r))].join('\n\n');
+    const answer = await ai.ask(question, { summary, tools: [...runTools(runs), ...checkoutTools(ctx.root)] }, this.safety(ctx).secretPatterns);
+    this.deps.store.audit({ repo: ctx.repoKey, pr: ctx.pr.number, user, action: 'ai_ask', project: '*', allowed: true, reason: question.slice(0, 300) });
+    reply.say(answer ? `🤖 **AI answer** <sub>${ai.label} · advisory, check it yourself</sub>\n\n${answer}` : '🤖 No AI answer this time (the request failed or was declined). Try rephrasing, or ask again later.');
+  }
+
+  // The dashboard's "Ask about this run": the run and its saved plan, no checkout.
+  async askAboutRun(run: Run, question: string): Promise<string | null> {
+    const ai = this.deps.ai;
+    if (!ai?.has('ask')) return null;
+    return ai.ask(question, { summary: runDigest(run), tools: runTools([run]) }, this.deps.config.secretScan?.patterns);
   }
 
   // ---- rules that depend on the plan ----
@@ -1504,7 +1644,10 @@ export class App {
       const scanned = this.scan(ctx, r.output);
       this.auditSecrets(ctx, user, project, scanned.found, 'apply');
       // The counts are saved now, so the Metrics page never has to read logs.
-      store.finishRun(runId, { status: r.ok ? 'success' : 'failed', engine, output: scanned.text, summary: plan.summary, usage: r.usage ?? null, applied: parseApplyResult(r.output), secrets: scanned.found });
+      // A failed apply: what went wrong and how to fix it, from the AI (when on).
+      const ai = r.ok ? null : await this.aiFailure(ctx, project, 'apply', scanned.text);
+      store.finishRun(runId, { status: r.ok ? 'success' : 'failed', engine, output: scanned.text, summary: plan.summary, usage: r.usage ?? null, applied: parseApplyResult(r.output), secrets: scanned.found, ai });
+      if (ai?.kind === 'fix') await this.suggestFixes(ctx, project, ai);
       this.notifyApply(ctx, project, user, store.getRun(runId)!);
       if (r.ok) {
         // unlock_after_apply: free the project for other PRs now. By default the lock stays
@@ -1629,6 +1772,9 @@ export class App {
     for (const f of this.policyOf(run)?.findings ?? []) {
       if (f.address === '(scanner)') continue;
       add(f.address, f.severity === 'critical' || f.severity === 'high' ? 'failure' : 'warning', `Policy: ${f.rule}`, f.message);
+    }
+    if (run.ai?.kind === 'review') {
+      for (const f of run.ai.findings) add(f.address, f.severity === 'low' ? 'notice' : 'warning', `AI review: ${f.title}`, `${f.why} (${run.ai.model}, advisory)`);
     }
     return [...out.values()].slice(0, 50);
   }

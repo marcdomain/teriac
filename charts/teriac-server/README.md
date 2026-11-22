@@ -97,6 +97,7 @@ HttpOnly cookies. The chart generates the signing key once and keeps it across u
 | `persistence.size` | `20Gi` | Checkouts, saved plans, binaries, provider cache, database |
 | `backup.enabled` | `false` | Back up the database on `backup.schedule` (cron) to the backend you fill in: `backup.backend.s3.bucket`, `backup.backend.gcs.bucket` or `backup.backend.azure.container`. Old backups: a lifecycle rule on the bucket. An empty volume is restored on start. See [Backups](../../packages/server/README.md#backups) |
 | `serviceMonitor.enabled` | `false` | Prometheus scraping of `/metrics` |
+| `ai.provider` | `""` | AI help from Claude: `anthropic` (with `ai.existingSecret`), `bedrock`, `vertex` or `foundry`. Plan reviews, fixes for failed runs, drift decisions, `teriac ask`, policy drafts. See [AI help](../../packages/server/README.md#ai-help) |
 | `podDisruptionBudget.enabled` | `false` | Stop node drains from interrupting an apply |
 | `verticalPodAutoscaler.enabled` | `false` | Size CPU and memory from real usage (needs VPA in the cluster). `updateMode`: `Off` (recommendations only), `Initial` (default, applied on restart; never evicts), `Recreate`, or `InPlaceOrRecreate` (VPA 1.4+, Kubernetes 1.33+) |
 | `networkPolicy.enabled` | `false` | Allow inbound traffic only from `networkPolicy.ingressFrom` |

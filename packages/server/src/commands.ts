@@ -3,6 +3,7 @@
 //   teriac apply [-p project] [-d dir] [-w workspace]
 //   teriac unlock [-p project]
 //   teriac help
+//   teriac ask <question>     (AI answer, when TERIAC_AI_PROVIDER is set)
 // Terraform commands on one project (-p is required):
 //   teriac state list [address]... | state show <address> | state rm <address>... | state mv <from> <to>
 //   teriac output [name] | show | validate | providers | fmt
@@ -11,9 +12,9 @@
 
 import type { CommandAction } from './config.ts';
 
-export type Verb = 'plan' | 'apply' | 'unlock' | 'help' | 'cancel'
+export type Verb = 'plan' | 'apply' | 'unlock' | 'help' | 'cancel' | 'ask'
   | 'state' | 'output' | 'show' | 'validate' | 'providers' | 'fmt' | 'import' | 'taint' | 'untaint' | 'force-unlock';
-const VERBS: Verb[] = ['plan', 'apply', 'unlock', 'help', 'cancel', 'state', 'output', 'show', 'validate', 'providers', 'fmt', 'import', 'taint', 'untaint', 'force-unlock'];
+const VERBS: Verb[] = ['plan', 'apply', 'unlock', 'help', 'cancel', 'ask', 'state', 'output', 'show', 'validate', 'providers', 'fmt', 'import', 'taint', 'untaint', 'force-unlock'];
 
 // Terraform commands teriac runs for a single project. Nothing else is passed through:
 // commands like `console` or flags like `-chdir` could reach beyond the project.
@@ -45,6 +46,7 @@ export interface Command {
   replace?: string[];         // plan -replace=<address>
   tool?: ToolCommand;         // a Terraform command such as "state list"
   args?: string[];            // its positional arguments, checked below
+  question?: string;          // `ask`: everything after the verb, every line
 }
 
 // Resource addresses only: no leading "-", no spaces, so a target can never
@@ -80,6 +82,12 @@ export const parseCommand = (body: string, names: string[]): ParseResult => {
   }
 
   const command: Command = { verb, destroy: false, override: false, targets: [], extraArgs: [] };
+  if (verb === 'ask') {
+    // Free text: the rest of the comment, not parsed as flags.
+    const question = body.trim().replace(/^@?\S+\s+ask\b/i, '').trim();
+    if (!question) return { ok: false, error: `Ask a question: \`${name} ask why is the subnet replaced?\`` };
+    return { ok: true, command: { ...command, question: question.slice(0, 2000) } };
+  }
   let first = 2;
   if (verb === 'state') {
     const sub = (tokens[2] ?? '').toLowerCase();
@@ -232,7 +240,7 @@ export const toolArgs = (c: Command): string[] => {
 
 // Lists only what this server allows: a bare `apply` is left out when
 // projects must be applied one at a time.
-export const helpText = (name = 'teriac', oneProjectPerApply = false): string => [
+export const helpText = (name = 'teriac', oneProjectPerApply = false, ask = false): string => [
   '### teriac commands',
   '| Command | What it does |',
   '|---|---|',
@@ -245,6 +253,7 @@ export const helpText = (name = 'teriac', oneProjectPerApply = false): string =>
   ...(oneProjectPerApply ? [] : [`| \`${name} apply\` | Apply every planned project whose requirements are met |`]),
   `| \`${name} apply -p <project>\` | Apply one project${oneProjectPerApply ? ' (this server applies one project at a time)' : ''} |`,
   `| \`${name} unlock\` | Release this PR's locks and discard its plans |`,
+  ...(ask ? [`| \`${name} ask <question>\` | An AI answer about this PR's plans and code (advisory) |`] : []),
   `| \`${name} cancel\` | Drop this PR's queued plans and applies, and stop running plans (running applies finish) |`,
   `| \`${name} state list -p <project> [address]\` | Resources in the state |`,
   `| \`${name} state show -p <project> <address>\` | One resource's attributes (sensitive values hidden) |`,

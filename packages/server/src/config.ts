@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import YAML from 'yaml';
 import { parseCron, validTimeZone } from './cron.ts';
 import { parseBackup, type BackupConfig } from './backup.ts';
+import { loadAiConfig, type AiConfig } from './ai.ts';
 import { randomBytes } from 'node:crypto';
 import type { AuthConfig, DashboardUser } from './auth.ts';
 import { REACTIONS, type Ack } from './vcs/types.ts';
@@ -179,6 +180,7 @@ export interface ServerConfig {
   summary?: SummaryConfig;
   keyRotation?: KeyRotationConfig;        // key_rotation in repos.yaml
   backup?: BackupConfig;                  // scheduled database backups (TERIAC_BACKUP_*)
+  ai?: AiConfig;                          // AI reviews and help (TERIAC_AI_*), off unless a provider is set
 }
 
 // A secret that may change while the server runs: re-read from its file when the file
@@ -534,5 +536,6 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): ServerConfig =
     keyRotation: policy.keyRotation,
     backup: parseBackup({ ...env, TERIAC_BACKUP_AZURE_KEY: readSecret(env, 'TERIAC_BACKUP_AZURE_KEY') }, policy.channels),
     auth: loadAuth(env, publicUrl, policy.users),
+    ai: loadAiConfig(env),
   };
 };
