@@ -8,6 +8,17 @@
   try { token = sessionStorage.getItem('teriac-token'); } catch { /* storage blocked */ }
   let me = null;
 
+  // ---- Seasonal logo: a Christmas hat when the server says it's the season ----
+  const HAT = '<g class="hat" transform="rotate(-8 32 12)"><path d="M13 16 C14 2 26 -10 42 -12 C50 -13 57 -8 60 -1 C55 -5 49 -4 46 0 C50 4 51 10 51 16 Z" fill="#dc2626"/><path d="M42 -12 C50 -13 57 -8 60 -1 C55 -5 49 -4 46 0 C44 -5 43 -9 42 -12 Z" fill="#b91c1c"/><rect x="9" y="12" width="46" height="10" rx="5" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/><circle cx="60" cy="1" r="5" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/></g>';
+  fetch('/auth/config').then(r => r.json()).then((cfg) => {
+    if (!cfg.festive) return;
+    const logo = document.querySelector('.brand svg.logo');
+    if (!logo || logo.classList.contains('festive')) return;
+    logo.setAttribute('viewBox', '0 -16 250 80');
+    logo.insertAdjacentHTML('beforeend', HAT);
+    logo.classList.add('festive');
+  }).catch(() => {});
+
   // ---- API ----------------------------------------------------------------
   const api = async (path, opts = {}) => {
     const res = await fetch(path, {
@@ -26,9 +37,19 @@
   const isAdmin = () => me?.role === 'admin';
   // What AI help this server has (TERIAC_AI_PROVIDER), asked once.
   let aiInfo = null;
-  const aiOn = async (feature) => {
-    if (!aiInfo) aiInfo = await api('/api/ai').catch(() => ({ enabled: false }));
-    return aiInfo.enabled && aiInfo.features.includes(feature);
+  const aiServer = async () => (aiInfo ??= await api('/api/ai').catch(() => ({ enabled: false })));
+  // Where AI is on, as the Guardrails page shows it: each level of repos.yaml that sets `ai`.
+  const aiCardGuard = (a) => {
+    if (!a) return `<div class="card ai"><div class="card-head"><h2>AI help</h2><span class="muted small">off: set <code>TERIAC_AI_PROVIDER</code> (<code>ai.provider</code> in the chart)</span></div></div>`;
+    const feats = (list) => list.map(f => `<span class="pill">${esc(f)}</span>`).join(' ');
+    const result = (r) => (r ? `${feats(r.features)} <span class="muted small">${esc(r.model.replace(/^anthropic\./, ''))} · ${esc(r.effort)}</span>` : '<span class="pill bad">off</span>');
+    const set = (o) => (o ? `<code>${esc(JSON.stringify(o).replace(/"([a-z]+)":/g, '$1: '))}</code>` : '<span class="muted">not set: on with every feature</span>');
+    return `<div class="card ai"><div class="card-head"><h2>AI help</h2><span class="muted small">${esc(a.provider)} · ${esc(a.model)} · ${esc(a.effort)} · ceiling ${feats(a.features)}</span></div>
+      ${table(['Level', 'Applies to', 'ai: in repos.yaml', 'Result'], a.levels.map(l => `<tr>
+        <td>${esc(l.scope)}</td><td class="mono">${esc(l.match)}</td><td>${set(l.set)}</td><td>${result(l.result)}</td>
+      </tr>`), '')}
+      <div class="ai-body muted small">The first matching project rule with <code>ai</code> wins over its repo entry, which wins over the server. A repo's <code>teriac.yaml</code> can still turn AI off or drop features for itself, never turn it on.</div>
+    </div>`;
   };
   // The AI's part of a run: a plan review, or why it failed and the suggested fixes.
   const aiCard = (ai) => {
@@ -522,7 +543,8 @@
 
     async run(arg) {
       const id = /(\d+)$/.exec(arg)?.[1] ?? arg;
-      const [r, canAsk] = await Promise.all([api(`/api/runs/${encodeURIComponent(id)}`), aiOn('ask')]);
+      const [r, ai] = await Promise.all([api(`/api/runs/${encodeURIComponent(id)}`), api(`/api/runs/${encodeURIComponent(id)}/ai`).catch(() => ({ ask: false }))]);
+      const canAsk = ai.ask;
       // Show the full address (repo, PR, run), also when opened from an old #runs/<run> link.
       const canonical = `#${runPath(r)}`;
       if (location.hash.split('?')[0] !== canonical) history.replaceState(null, '', canonical);
@@ -554,7 +576,7 @@
         ${r.kind === 'plan' && r.status === 'success' && r.risk && RISK[r.risk.level] ? `<div class="banner ${r.risk.level === 'medium' ? 'warn' : ''}"><b>Risk: ${RISK[r.risk.level][1]}</b> · ${r.risk.reasons.map(reasonHtml).join(' · ')}</div>` : ''}
         ${r.secrets?.length ? `<div class="banner warn"><b>Something that looks like a secret was hidden from this output</b> (${r.secrets.map(esc).join(', ')}). Check where it came from.</div>` : ''}
         ${aiCard(r.ai)}
-        ${canAsk && r.status !== 'running' && r.status !== 'queued' ? `<div class="card ai"><div class="card-head"><h2>Ask about this run</h2><span class="muted small">AI · advisory</span></div>
+        ${canAsk && r.status !== 'running' && r.status !== 'queued' ? `<div class="card ai"><div class="card-head"><h2>Ask about this run</h2><span class="muted small">${esc(ai.model)} · advisory</span></div>
           <form class="ai-ask" data-ask="${r.id}"><input name="q" maxlength="2000" placeholder="Why is the database replaced?" autocomplete="off" required><button type="submit">Ask</button></form>
           <div class="ai-answer" hidden></div></div>` : ''}
         ${s && s.changes.length ? `<div class="card"><div class="card-head"><h2>Changes</h2>${counts(s)}</div><pre class="changes">${changeLines(s.changes)}</pre></div>` : ''}
@@ -586,7 +608,8 @@
     },
 
     async guardrails() {
-      const [g, b, applies, canDraft] = await Promise.all([api('/api/safety'), api('/api/backups').catch(() => ({ enabled: false })), api('/api/applies').catch(() => null), aiOn('policy')]);
+      const [g, b, applies, aiSrv] = await Promise.all([api('/api/safety'), api('/api/backups').catch(() => ({ enabled: false })), api('/api/applies').catch(() => null), aiServer()]);
+      const canDraft = aiSrv.enabled && aiSrv.policy;
       if (g.error) return `<div class="page-head"><h1>Guardrails</h1></div><div class="card"><div class="empty">Not available on this server.</div></div>`;
       const people = (list) => (list.length ? list.map(p => `<span class="pill">${esc(p)}</span>`).join(' ') : '<span class="muted">nobody</span>');
       const globs = (list) => (list.length ? list.map(x => `<code>${esc(x)}</code>`).join(', ') : '<span class="muted">all projects</span>');
@@ -635,6 +658,7 @@
             <td>${x.staleBase === 'block' ? '<span class="pill bad">block</span>' : x.staleBase === 'warn' ? '<span class="pill warn">warn</span>' : '<span class="muted">off</span>'}</td>
             <td>${yes(x.verifyPlan)}</td><td>${esc(x.secretScan || g.secretScan.mode)}</td>
           </tr>`), 'No repos.')}</div>
+        ${aiCardGuard(g.ai)}
         ${canDraft ? `<div class="card ai"><div class="card-head"><h2>Draft a policy with AI</h2><span class="muted small">checked against its own tests · paste into repos.yaml yourself</span></div>
           <form class="ai-ask" data-policy><input name="q" maxlength="4000" placeholder="No public S3 buckets in prod, and RDS keeps backups for at least 7 days" autocomplete="off" required ${isAdmin() ? '' : 'disabled title="Admins only"'}><button type="submit" ${isAdmin() ? '' : 'disabled'}>Draft</button></form>
           <div class="ai-answer" hidden></div></div>` : ''}`;

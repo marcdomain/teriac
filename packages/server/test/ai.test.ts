@@ -190,3 +190,60 @@ test('drift: the AI adopts, reverts or leaves what the rules could not edit', as
     assert.match(body, /\*\*🤖 Left for applying back\*\*[^\n]*\n- `aws_security_group\.ssh`: SSH opened to the internet\./);
   } finally { rmSync(tmp, { recursive: true, force: true }); }
 });
+
+test('where AI is on: server, repo and project layers override; teriac.yaml only narrows', async () => {
+  const { resolveAi, validateAiOverride } = await import('../src/ai.ts');
+  assert.deepEqual(resolveAi(cfg, []), { features: cfg.features, model: 'claude-opus-5-5', effort: 'medium' });
+  assert.equal(resolveAi(undefined, []), null, 'no provider: off everywhere');
+  // Off by default, on for one project with fewer features, a cheaper model and more effort.
+  const project = resolveAi(cfg, [{ enabled: false }, undefined, { enabled: true, features: ['review', 'fix'], model: 'claude-sonnet-5-5', effort: 'high' }]);
+  assert.deepEqual(project, { features: ['review', 'fix'], model: 'claude-sonnet-5-5', effort: 'high' });
+  assert.equal(resolveAi(cfg, [{ enabled: false }]), null);
+  // The server's TERIAC_AI_FEATURES is the ceiling.
+  assert.deepEqual(resolveAi({ ...cfg, features: ['review'] }, [{ features: ['review', 'ask'] }])?.features, ['review']);
+  // teriac.yaml can't turn it on or change the model, only switch off or drop features.
+  assert.equal(resolveAi(cfg, [{ enabled: false }], [{ enabled: true }]), null);
+  assert.deepEqual(resolveAi(cfg, [], [{ features: ['review'], model: 'x' } as any]), { features: ['review'], model: 'claude-opus-5-5', effort: 'medium' });
+  assert.equal(resolveAi(cfg, [], [{ enabled: false }]), null);
+  // Bedrock model names get their prefix.
+  assert.equal(resolveAi({ ...cfg, provider: 'bedrock', model: 'anthropic.claude-opus-5-5' }, [{ model: 'claude-sonnet-5-5' }])?.model, 'anthropic.claude-sonnet-5-5');
+  assert.deepEqual(validateAiOverride(false, 'ai'), { enabled: false });
+  assert.throws(() => validateAiOverride({ features: ['approve'] }, 'repos[0].ai'), /repos\[0\]\.ai\.features: unknown feature "approve"/);
+  assert.throws(() => validateAiOverride({ model: '' }, 'ai'), /ai\.model must be a model name/);
+  assert.throws(() => validateAiOverride({ budget: 3 }, 'ai'), /unknown setting "budget"/);
+});
+
+test('repos.yaml and teriac.yaml accept ai at every level', async () => {
+  const { parseServerPolicy } = await import('../src/config.ts');
+  const { parseRepoConfig } = await import('../src/repoConfig.ts');
+  const p = parseServerPolicy('ai: { enabled: false }\nrepos:\n  - id: github.com/acme/*\n    ai: { effort: high }\n    projects:\n      - match: envs/prod\n        ai: { enabled: true, features: [review] }\n');
+  assert.deepEqual(p.aiPolicy, { enabled: false });
+  assert.deepEqual(p.repos[0].ai, { effort: 'high' });
+  assert.deepEqual(p.repos[0].projects![0].ai, { enabled: true, features: ['review'] });
+  assert.throws(() => parseServerPolicy('repos:\n  - id: a/*\n    projects:\n      - match: x\n        ai: { features: [nope] }\n'), /projects\[0\]\.ai\.features: unknown feature "nope"/);
+  const r = parseRepoConfig('teriac.yaml', 'ai: { features: [review, fix] }\nprojects:\n  - dir: envs/dev\n    ai: false\n');
+  assert.deepEqual(r.ai, { features: ['review', 'fix'] });
+  assert.deepEqual(r.rules.find(x => x.match === 'envs/dev')?.ai, { enabled: false });
+});
+
+test('PR comment stays short: only important findings, no repeats, posted fixes become a pointer', () => {
+  const run = (ai: Run['ai']) => ({ ai } as Run);
+  const calm = run({ kind: 'review', model: 'm', summary: 'Adds a tag.', findings: [{ address: 'a', severity: 'low', title: 'Tag', why: 'fine' }] });
+  assert.deepEqual(aiLines(calm, { brief: true }), [], 'nothing important: nothing in the PR');
+  assert.match(aiLines(calm).join('\n'), /Adds a tag\./, 'the check run still has it');
+  const many = run({ kind: 'review', model: 'm', summary: 's', findings: Array.from({ length: 8 }, (_, i) => ({ address: `r${i}`, severity: i < 7 ? 'high' as const : 'low' as const, title: `t${i}`, why: 'w' })) });
+  const brief = aiLines(many, { brief: true }).join('\n');
+  assert.equal((brief.match(/^- 🔴/gm) ?? []).length, 5);
+  assert.match(brief, /3 more on the check run/);
+  const posted = aiLines(run({ kind: 'fix', model: 'm', cause: 'Missing variable.', posted: true, fixes: [{ path: 'main.tf', startLine: 1, endLine: 1, replacement: 'x', why: 'y' }] }), { brief: true }).join('\n');
+  assert.match(posted, /A suggested fix is on the code in \*\*Files changed\*\*/);
+  assert.doesNotMatch(posted, /```hcl/);
+});
+
+test('season: the Christmas hat from 1 December to 6 January', async () => {
+  const { christmas } = await import('../src/season.ts');
+  assert.equal(christmas(new Date('2026-11-30T23:59:00Z')), false);
+  assert.equal(christmas(new Date('2026-12-01T00:00:00Z')), true);
+  assert.equal(christmas(new Date('2027-01-06T12:00:00Z')), true);
+  assert.equal(christmas(new Date('2027-01-07T00:00:00Z')), false);
+});

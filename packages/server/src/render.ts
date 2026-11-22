@@ -2,6 +2,7 @@
 import type { Run } from './store.ts';
 import { RISK_BADGE } from './risk.ts';
 import { secretNote } from './secrets.ts';
+import { important } from './ai-config.ts';
 import type { RiskLevel } from './safety-config.ts';
 
 export type ChangeAction = 'create' | 'update' | 'delete' | 'replace' | 'import' | 'forget' | 'move';
@@ -162,24 +163,38 @@ const riskBadge = (run?: Run) => (run?.risk ? RISK_BADGE[run.risk.level as RiskL
 const hasRisk = (run?: Run) => !!run?.risk && run.risk.level !== 'low';
 // The table cell: "None", or the level; the reasons are in the project's dropdown.
 const riskCell = (run?: Run) => (run?.risk ? (hasRisk(run) ? riskBadge(run) : 'None') : '—');
-const riskLine = (run?: Run) => (hasRisk(run) ? `**Risk: ${riskBadge(run)}**${run!.risk!.reasons.length ? ` · ${run!.risk!.reasons.join(' · ')}` : ''}` : '');
+// Reasons from the AI review are left out: its own block lists them.
+const riskLine = (run?: Run) => {
+  if (!hasRisk(run)) return '';
+  const reasons = run!.risk!.reasons.filter(r => !r.startsWith('AI review: '));
+  return `**Risk: ${riskBadge(run)}**${reasons.length ? ` · ${reasons.join(' · ')}` : run!.ai ? ' · see the AI review' : ''}`;
+};
 
 interface PolicyView { mode: 'off' | 'audit' | 'enforce'; findings: { rule: string; severity: string; address: string; message: string }[] }
 const policyOf = (run?: Run): PolicyView | null => (run?.policy ? JSON.parse(run.policy) as PolicyView : null);
 const SEV: Record<string, string> = { critical: '🔴', high: '🔴', medium: '🟠', low: '🟡' };
 
-// The AI's part of a run (TERIAC_AI_PROVIDER): a plan review, or why a run failed and a fix.
-// Always labelled, so nobody mistakes it for a rule-based check.
-export const aiLines = (run?: Run): string[] => {
+// The AI's part of a run (TERIAC_AI_PROVIDER), always labelled. `brief` (the PR comment): a
+// review shows only when it found something that matters, with at most five findings, and a
+// fix already posted on the code is a pointer, not a copy. The check run and dashboard get it all.
+export const aiLines = (run?: Run, opts: { brief?: boolean } = {}): string[] => {
   const ai = run?.ai;
   if (!ai) return [];
   const tag = `<sub>${ai.model} · advisory, check it yourself</sub>`;
   if (ai.kind === 'review') {
+    const findings = opts.brief ? ai.findings.filter(important).slice(0, 5) : ai.findings;
+    if (opts.brief && !findings.length) return [];
     const lines = [`🤖 **AI review** ${tag}`, '', ...ai.summary.split('\n').map(l => `> ${l}`)];
-    for (const f of ai.findings) lines.push(`- ${SEV[f.severity] ?? '🟡'} **${f.title}** · \`${f.address}\` · ${f.why}`);
+    for (const f of findings) lines.push(`- ${SEV[f.severity] ?? '🟡'} **${f.title}** · \`${f.address}\` · ${f.why}`);
+    const more = ai.findings.length - findings.length;
+    if (more > 0) lines.push(`- <sub>${more} more on the check run</sub>`);
     return [...lines, ''];
   }
-  const lines = [`🤖 **AI: why it failed** ${tag}`, '', ...ai.cause.split('\n').map(l => `> ${l}`), ''];
+  const cause = opts.brief && ai.cause.length > 600 ? `${ai.cause.slice(0, 600)}…` : ai.cause;
+  const lines = [`🤖 **AI: why it failed** ${tag}`, '', ...cause.split('\n').map(l => `> ${l}`), ''];
+  if (opts.brief && ai.posted && ai.fixes.length) {
+    return [...lines, `💡 ${ai.fixes.length === 1 ? 'A suggested fix is' : `${ai.fixes.length} suggested fixes are`} on the code in **Files changed**: one click to commit.`, ''];
+  }
   for (const f of ai.fixes) {
     lines.push(`**Suggested fix** · \`${f.path}\` line${f.startLine === f.endLine ? ` ${f.startLine}` : `s ${f.startLine}–${f.endLine}`}: ${f.why}`, fence(f.replacement, 'hcl'), '');
   }
@@ -364,7 +379,7 @@ export const renderComment = (input: CommentInput): string => {
     for (const w of v.warnings ?? []) lines.push(`> [!WARNING]\n> ${w}`, '');
     if (v.plan?.secrets?.length) lines.push(`> [!CAUTION]\n> ${secretNote(v.plan.secrets)}`, '');
     if (v.plan?.status === 'success' && hasRisk(v.plan)) lines.push(riskLine(v.plan), '');
-    lines.push(...aiLines(v.plan));
+    lines.push(...aiLines(v.plan, { brief: true }));
     const pol = policyOf(v.plan);
     if (pol && pol.mode !== 'off') {
       if (pol.findings.length) {
@@ -512,7 +527,7 @@ export const renderApplyReport = (input: {
       }
       lines.push('');
     }
-    if (!ok) lines.push(...aiLines(v.apply));
+    if (!ok) lines.push(...aiLines(v.apply, { brief: true }));
     const outputs = ok ? parseApplyOutputs(v.apply.output) : null;
     if (outputs) lines.push('**Outputs:**', fence(tail(outputs, 4000)), '');
     lines.push(`**${ok ? 'Apply log' : 'Error'}**`, '', fence(tail(applyLog(v.apply.output), Math.max(2000, Math.floor((input.limit - 4000) / Math.max(1, applies.length))))));

@@ -15,42 +15,12 @@ import type { Risk } from './risk.ts';
 import { validatePolicies, evaluateRules, SEVERITIES, type PolicyRule, type Severity } from './policies.ts';
 import { log } from './log.ts';
 
-export type AiProvider = 'anthropic' | 'bedrock' | 'vertex' | 'foundry';
-export const AI_PROVIDERS: AiProvider[] = ['anthropic', 'bedrock', 'vertex', 'foundry'];
-export type AiFeature = 'review' | 'fix' | 'drift' | 'policy' | 'ask';
-export const AI_FEATURES: AiFeature[] = ['review', 'fix', 'drift', 'policy', 'ask'];
-export type AiEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
-const EFFORTS: AiEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
-
-export interface AiConfig {
-  provider: AiProvider;
-  model: string;
-  effort: AiEffort;
-  features: AiFeature[];
-  timeoutMs: number;
-}
-
-export const DEFAULT_MODEL = 'claude-opus-5-5';
-
-// TERIAC_AI_PROVIDER turns it on. Credentials come from each provider's usual place:
-// ANTHROPIC_API_KEY; the AWS credential chain and AWS_REGION; Google ADC with
-// ANTHROPIC_VERTEX_PROJECT_ID and CLOUD_ML_REGION; ANTHROPIC_FOUNDRY_RESOURCE and ANTHROPIC_FOUNDRY_API_KEY.
-export const loadAiConfig = (env: NodeJS.ProcessEnv): AiConfig | undefined => {
-  const provider = (env.TERIAC_AI_PROVIDER ?? '').trim().toLowerCase();
-  if (!provider || provider === 'off') return undefined;
-  if (!AI_PROVIDERS.includes(provider as AiProvider)) throw new Error(`TERIAC_AI_PROVIDER must be one of ${AI_PROVIDERS.join(', ')} or off, not "${env.TERIAC_AI_PROVIDER}"`);
-  const effort = (env.TERIAC_AI_EFFORT || 'medium').trim().toLowerCase();
-  if (!EFFORTS.includes(effort as AiEffort)) throw new Error(`TERIAC_AI_EFFORT must be one of ${EFFORTS.join(', ')}, not "${env.TERIAC_AI_EFFORT}"`);
-  const features = (env.TERIAC_AI_FEATURES || AI_FEATURES.join(',')).split(',').map(s => s.trim().toLowerCase()).filter(Boolean);
-  for (const f of features) if (!AI_FEATURES.includes(f as AiFeature)) throw new Error(`TERIAC_AI_FEATURES: unknown feature "${f}" (${AI_FEATURES.join(', ')})`);
-  if (provider === 'vertex' && !env.ANTHROPIC_VERTEX_PROJECT_ID) throw new Error('TERIAC_AI_PROVIDER=vertex needs ANTHROPIC_VERTEX_PROJECT_ID (and CLOUD_ML_REGION, default "global")');
-  if (provider === 'bedrock' && !(env.AWS_REGION || env.AWS_DEFAULT_REGION)) throw new Error('TERIAC_AI_PROVIDER=bedrock needs AWS_REGION');
-  const model = env.TERIAC_AI_MODEL?.trim() || (provider === 'bedrock' ? `anthropic.${DEFAULT_MODEL}` : DEFAULT_MODEL);
-  return {
-    provider: provider as AiProvider, model, effort: effort as AiEffort, features: features as AiFeature[],
-    timeoutMs: Math.max(10, Number(env.TERIAC_AI_TIMEOUT_SECONDS || 180)) * 1000,
-  };
-};
+import {
+  AI_PROVIDERS, AI_FEATURES, DEFAULT_MODEL, loadAiConfig, validateAiOverride, resolveAi, important, label,
+  type AiProvider, type AiFeature, type AiEffort, type AiConfig, type AiOverride, type AiSettings,
+} from './ai-config.ts';
+export { AI_PROVIDERS, AI_FEATURES, DEFAULT_MODEL, loadAiConfig, validateAiOverride, resolveAi, important, label };
+export type { AiProvider, AiFeature, AiEffort, AiConfig, AiOverride, AiSettings };
 
 // One request to the Messages API (beta surface: every provider client has it).
 export type AiCall = (params: MessageCreateParamsNonStreaming) => Promise<BetaMessage>;
@@ -174,12 +144,14 @@ export class Ai {
 
   has(feature: AiFeature): boolean { return this.cfg.features.includes(feature); }
   get label(): string { return this.cfg.model.replace(/^anthropic\./, ''); }
+  // The server-wide settings, for callers with no project (policy drafts).
+  get defaults(): AiSettings { return { features: this.cfg.features, model: this.cfg.model, effort: this.cfg.effort }; }
 
-  private base(maxTokens: number) {
+  private base(maxTokens: number, s: AiSettings) {
     return {
-      model: this.cfg.model,
+      model: s.model,
       max_tokens: maxTokens,
-      output_config: { effort: this.cfg.effort },
+      output_config: { effort: s.effort },
       // On Anthropic's API a declined request is re-run on a fallback model in the same call.
       ...(this.cfg.provider === 'anthropic' ? { betas: ['server-side-fallback-2026-07-01'], fallbacks: 'default' as const } : {}),
     };
@@ -187,14 +159,14 @@ export class Ai {
 
   // One request with a JSON schema for the answer. Null when the model declines or fails:
   // every caller carries on without AI help.
-  async json<T>(what: string, user: string, schema: Record<string, unknown>, maxTokens = 16000): Promise<T | null> {
+  async json<T>(what: string, user: string, schema: Record<string, unknown>, s: AiSettings = this.defaults, maxTokens = 16000): Promise<T | null> {
     const started = Date.now();
     try {
       const call = await this.call;
       const msg = await call({
-        ...this.base(maxTokens),
+        ...this.base(maxTokens, s),
         system: [{ type: 'text', text: SYSTEM_BASE, cache_control: { type: 'ephemeral' } }],
-        output_config: { effort: this.cfg.effort, format: { type: 'json_schema', schema } },
+        output_config: { effort: s.effort, format: { type: 'json_schema', schema } },
         messages: [{ role: 'user', content: cut(user, MAX_INPUT) }],
       });
       if (msg.stop_reason === 'refusal') { log.warn('ai declined', { what, category: msg.stop_details?.category ?? null }); return null; }
@@ -212,7 +184,7 @@ export class Ai {
   async reviewPlan(input: {
     project: string; production: boolean; engine: string; plan: Record<string, any>;
     risk: Risk | null; findings: { rule: string; severity: string; address: string; message: string }[]; patterns?: SecretPattern[];
-  }): Promise<PlanReview | null> {
+  }, s: AiSettings = this.defaults): Promise<PlanReview | null> {
     const sensitive = sensitiveValues(input.plan);
     const digest = clean(planDigest(input.plan), sensitive, input.patterns);
     if (!digest.trim()) return null;
@@ -227,16 +199,16 @@ export class Ai {
     const r = await this.json<{ summary: string; findings: AiFinding[] }>('plan review', user, obj({
       summary: str,
       findings: { type: 'array', items: obj({ address: str, severity: sev, title: str, why: str }) },
-    }), 8000);
+    }), s, 8000);
     if (!r) return null;
     const findings = r.findings.filter(f => SEVERITIES.includes(f.severity)).slice(0, 15)
       .map(f => ({ ...f, title: oneLine(f.title, 160), why: oneLine(f.why, 600), address: oneLine(f.address, 200) }));
-    return { kind: 'review', model: this.label, summary: oneLine(r.summary, 1200), findings };
+    return { kind: 'review', model: label(s), summary: oneLine(r.summary, 1200), findings };
   }
 
   // ---- 2. failed runs ----
 
-  async explainFailure(input: { project: string; kind: 'plan' | 'apply'; output: string; root: string; dir: string; sensitive?: string[]; patterns?: SecretPattern[] }): Promise<FailureHelp | null> {
+  async explainFailure(input: { project: string; kind: 'plan' | 'apply'; output: string; root: string; dir: string; sensitive?: string[]; patterns?: SecretPattern[] }, s: AiSettings = this.defaults): Promise<FailureHelp | null> {
     const files = projectFiles(input.root, input.dir);
     const user = [
       `A ${input.kind} of project \`${input.project}\` failed. Find the cause and, when it is in these files, the smallest fix.`,
@@ -247,7 +219,7 @@ export class Ai {
     const r = await this.json<{ cause: string; fixes: { path: string; start_line: number; end_line: number; replacement: string; why: string }[] }>('failure help', user, obj({
       cause: str,
       fixes: { type: 'array', items: obj({ path: str, start_line: { type: 'integer' }, end_line: { type: 'integer' }, replacement: str, why: str }) },
-    }));
+    }), s);
     if (!r) return null;
     const byPath = new Map(files.map(f => [f.path, f.text.split('\n').length]));
     const fixes = r.fixes.filter(f => {
@@ -257,7 +229,7 @@ export class Ai {
       path: f.path, startLine: f.start_line, endLine: f.end_line,
       replacement: scanSecrets(f.replacement.replace(/\n+$/, '')).text, why: oneLine(f.why, 400),
     }));
-    return { kind: 'fix', model: this.label, cause: oneLine(r.cause, 1500), fixes };
+    return { kind: 'fix', model: label(s), cause: oneLine(r.cause, 1500), fixes };
   }
 
   // ---- 3. drift ----
@@ -265,7 +237,7 @@ export class Ai {
   async driftDecisions(input: {
     project: string; plan: Record<string, any>; addresses: string[];
     files: { path: string; text: string }[]; patterns?: SecretPattern[];
-  }): Promise<DriftDecision[] | null> {
+  }, s: AiSettings = this.defaults): Promise<DriftDecision[] | null> {
     const sensitive = sensitiveValues(input.plan);
     const drifted = (input.plan.resource_drift ?? []).filter((d: any) => input.addresses.includes(d.address))
       .map((d: any) => JSON.stringify({ address: d.address, actions: d.change?.actions, before: d.change?.before, after: d.change?.after }));
@@ -288,7 +260,7 @@ export class Ai {
           edits: { type: 'array', items: obj({ path: str, start_line: { type: 'integer' }, end_line: { type: 'integer' }, replacement: str }) },
         }),
       },
-    }));
+    }), s);
     if (!r) return null;
     return r.decisions.filter(d => input.addresses.includes(d.address)).map(d => ({
       address: d.address, decision: d.decision, why: oneLine(d.why, 500),
@@ -298,7 +270,7 @@ export class Ai {
 
   // ---- 4. policies from plain English ----
 
-  async draftPolicy(request: string): Promise<PolicyDraft | null> {
+  async draftPolicy(request: string, s: AiSettings = this.defaults): Promise<PolicyDraft | null> {
     const cond = obj({
       attribute: { type: 'string', description: 'dot path into the resource values, list items by index, e.g. "versioning.0.enabled"' },
       op: { type: 'string', enum: ['equals', 'in', 'matches', 'exists'] },
@@ -325,7 +297,7 @@ export class Ai {
       },
       tests: { type: 'array', items: obj({ rule: str, resource_type: str, values_json: str, should_fail: { type: 'boolean' }, description: str }) },
       notes: { type: 'string', description: 'anything the rules cannot express, or assumptions made; empty when none' },
-    }));
+    }), s);
     if (!r) return null;
     return checkPolicyDraft(r);
   }
@@ -333,7 +305,7 @@ export class Ai {
   // ---- 5. questions ----
 
   // A short tool loop: Claude may call the read-only tools given, then answers in Markdown.
-  async ask(question: string, ctx: AskContext, patterns?: SecretPattern[]): Promise<string | null> {
+  async ask(question: string, ctx: AskContext, patterns?: SecretPattern[], s: AiSettings = this.defaults): Promise<string | null> {
     const tools: BetaTool[] = (ctx.tools ?? []).map(t => ({ name: t.name, description: t.description, input_schema: t.schema as BetaTool['input_schema'], strict: true }));
     const messages: BetaMessageParam[] = [{
       role: 'user',
@@ -347,7 +319,7 @@ export class Ai {
       const call = await this.call;
       for (let turn = 0; turn < 8; turn++) {
         const msg = await call({
-          ...this.base(8000),
+          ...this.base(8000, s),
           system: [{ type: 'text', text: SYSTEM_BASE, cache_control: { type: 'ephemeral' } }],
           ...(tools.length ? { tools } : {}),
           messages,
@@ -381,7 +353,7 @@ const oneLine = (s: string, max: number) => scanSecrets(String(s ?? '')).text.re
 export interface AiFinding { address: string; severity: Severity; title: string; why: string }
 export interface PlanReview { kind: 'review'; model: string; summary: string; findings: AiFinding[] }
 export interface CodeFix { path: string; startLine: number; endLine: number; replacement: string; why: string }
-export interface FailureHelp { kind: 'fix'; model: string; cause: string; fixes: CodeFix[] }
+export interface FailureHelp { kind: 'fix'; model: string; cause: string; fixes: CodeFix[]; posted?: boolean }  // posted: as suggested changes on the code
 export type AiResult = PlanReview | FailureHelp;
 export interface DriftDecision { address: string; decision: 'adopt' | 'revert' | 'unsure'; why: string; edits: Omit<CodeFix, 'why'>[] }
 

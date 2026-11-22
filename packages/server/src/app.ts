@@ -11,7 +11,7 @@ import { parseCommand, helpText, toolArgs, TOOL_ACTION, EDITS_STATE, type Comman
 import { loadRepoConfig, loadRepoConfigFrom, emptyRepoConfig, type RepoConfig } from './repoConfig.ts';
 import { discoverProjects, affectedProjects, terragruntDependencies, mockedDependencies, unappliedDependencies, type Project } from './discovery.ts';
 import {
-  repoPolicyFor, rulesFor, checkPermission, applyBlockers, matchesPrincipal, type Lookup, type EffectiveRules,
+  repoPolicyFor, rulesFor, ruleMatches, checkPermission, applyBlockers, matchesPrincipal, type Lookup, type EffectiveRules,
 } from './policy.ts';
 import { renderComment, renderCheck, renderApplyReport, parseApplyResult, providersOf, cmdBlock, fence, tail, type ProjectView, type CommentLinks } from './render.ts';
 import { repoLinks, platformForHost } from './links.ts';
@@ -25,7 +25,7 @@ import { metrics } from './metrics.ts';
 import { scanSecrets, secretNote } from './secrets.ts';
 import { securityFindings } from './security-rules.ts';
 import { assessRisk, extraApprovalFor, isProduction, type Risk } from './risk.ts';
-import { raiseRisk, type Ai, type AiResult } from './ai.ts';
+import { raiseRisk, resolveAi, label, important, type Ai, type AiResult, type AiSettings, type AiFeature } from './ai.ts';
 import { activeFreezes, protectedHits } from './freeze.ts';
 import { changeFingerprint, countApprovals, staleFor, staleText } from './safety.ts';
 import { stricterMode, DEFAULT_SIZE_LIMITS, type StaleBaseMode, type SecretScanMode, type RiskConfig, type FreezeConfig, type ProtectedConfig, type SecretPattern } from './safety-config.ts';
@@ -853,6 +853,7 @@ export class App {
     this.deps.store.markPrClosed(this.repoKey(repo), number, merged);
     const released = this.deps.store.releasePrLocks(this.repoKey(repo), number);
     this.deps.store.forgetPrComments(this.repoKey(repo), number);
+    this.deps.store.deleteSetting(`ai_suggested:${this.repoKey(repo)}#${number}`);
     this.forgetPlans(this.repoKey(repo), number);
     rmSync(this.workDir(repo, number), { recursive: true, force: true });
     rmSync(this.planDir(repo, number), { recursive: true, force: true });
@@ -1181,7 +1182,7 @@ export class App {
         risk, secrets: scanned.found, ai,
       });
       if (policy?.findings.length) store.saveFindings(store.getRun(runId)!, policy.mode, policy.findings);
-      if (ai?.kind === 'fix') await this.suggestFixes(ctx, project, ai);
+      if (ai?.kind === 'fix' && await this.suggestFixes(ctx, project, ai)) store.setRunAi(runId, { ...ai, posted: true });
     } catch (err) {
       store.finishRun(runId, { status: 'failed', engine, output: `teriac could not run this project: ${(err as Error).message}` });
     } finally {
@@ -1194,28 +1195,52 @@ export class App {
 
   // ---- AI help (TERIAC_AI_PROVIDER) ----
 
+  // AI settings for one project, or null when a feature is off for it: repos.yaml (top, repo
+  // entry, first matching project rule with `ai`), then teriac.yaml, which can only narrow.
+  aiSettings(policy: RepoPolicy, repoConfig: RepoConfig | null, project: { name: string; dir: string }): AiSettings | null {
+    const p = project as Project;
+    const server = [this.deps.config.aiPolicy, policy.ai, policy.projects?.find(r => r.ai && ruleMatches(r, p))?.ai];
+    const repo = policy.allow_repo_config === false || !repoConfig ? [] : [repoConfig.ai, ...repoConfig.rules.filter(r => ruleMatches(r, p)).map(r => r.ai)];
+    return resolveAi(this.deps.ai?.cfg, server, repo);
+  }
+
+  // The settings from repos.yaml's top-level `ai` alone: policy drafts, and the dashboard's default.
+  aiServerSettings(): AiSettings | null { return resolveAi(this.deps.ai?.cfg, [this.deps.config.aiPolicy]); }
+
+  private aiFor(ctx: PrContext, project: Project, feature: AiFeature): AiSettings | null {
+    const s = this.deps.ai ? this.aiSettings(ctx.policy, ctx.rulesConfig, project) : null;
+    return s?.features.includes(feature) ? s : null;
+  }
+
   private async aiReview(ctx: PrContext, project: Project, engine: string, plan: Record<string, any>, risk: Risk | null, findings: { rule: string; severity: string; address: string; message: string }[]): Promise<AiResult | null> {
-    const ai = this.deps.ai;
-    if (!ai?.has('review')) return null;
-    const s = this.safety(ctx);
-    return ai.reviewPlan({ project: project.name, production: isProduction(project, s.risk), engine, plan, risk, findings, patterns: s.secretPatterns });
+    const s = this.aiFor(ctx, project, 'review');
+    if (!s) return null;
+    const safety = this.safety(ctx);
+    return this.deps.ai!.reviewPlan({ project: project.name, production: isProduction(project, safety.risk), engine, plan, risk, findings, patterns: safety.secretPatterns }, s);
   }
 
   private async aiFailure(ctx: PrContext, project: Project, kind: 'plan' | 'apply', output: string): Promise<AiResult | null> {
-    const ai = this.deps.ai;
-    if (!ai?.has('fix')) return null;
-    return ai.explainFailure({ project: project.name, kind, output, root: ctx.root, dir: project.dir, patterns: this.safety(ctx).secretPatterns });
+    const s = this.aiFor(ctx, project, 'fix');
+    if (!s) return null;
+    return this.deps.ai!.explainFailure({ project: project.name, kind, output, root: ctx.root, dir: project.dir, patterns: this.safety(ctx).secretPatterns }, s);
   }
 
   // Fixes as suggested changes on the PR's code, where the platform allows it. The PR comment
   // shows them too, so nothing is lost when a line is outside the PR's diff.
-  private async suggestFixes(ctx: PrContext, project: Project, help: Extract<AiResult, { kind: 'fix' }>) {
-    if (!help.fixes.length || !ctx.adapter.suggestChanges) return;
+  // True when they are on the code (now, or already: the same fix is never posted twice on a PR).
+  private async suggestFixes(ctx: PrContext, project: Project, help: Extract<AiResult, { kind: 'fix' }>): Promise<boolean> {
+    if (!help.fixes.length || !ctx.adapter.suggestChanges) return false;
+    const key = `ai_suggested:${ctx.repoKey}#${ctx.pr.number}`;
+    const seen = this.deps.store.getSetting<string[]>(key) ?? [];
+    const hash = createHash('sha256').update(JSON.stringify(help.fixes.map(f => [f.path, f.startLine, f.endLine, f.replacement]))).digest('hex').slice(0, 16);
+    if (seen.includes(hash)) return true;
     const ok = await ctx.adapter.suggestChanges(ctx.repo, ctx.pr.number, ctx.pr.headSha,
       `🤖 **AI suggestion** for \`${project.name}\` (${help.model}): ${help.cause.split('\n')[0].slice(0, 300)}\n\n<sub>Check it before committing: AI can be wrong.</sub>`,
       help.fixes.map(f => ({ path: f.path, startLine: f.startLine, endLine: f.endLine, replacement: f.replacement, note: f.why })),
     ).catch(err => { log.warn('could not post AI suggestions', { err: (err as Error).message }); return false; });
+    if (ok) this.deps.store.setSetting(key, [...seen, hash].slice(-50));
     this.deps.store.audit({ repo: ctx.repoKey, pr: ctx.pr.number, user: 'teriac', action: 'ai_suggestion', project: project.name, allowed: true, reason: `${help.fixes.length} suggested fix${help.fixes.length === 1 ? '' : 'es'} by ${help.model}${ok ? '' : ' (shown in the comment: outside the PR\'s diff)'}` });
+    return ok;
   }
 
   // `teriac ask`: an AI answer from this PR's latest plans, with read-only access to the
@@ -1223,23 +1248,41 @@ export class App {
   private async ask(ctx: PrContext, user: string, question: string, reply: Reply) {
     const ai = this.deps.ai;
     if (!ai?.has('ask')) return reply.say('AI answers are turned off on this server (`TERIAC_AI_FEATURES`).');
+    // On when some project of the PR has `ask` on; that project's model and effort answer.
+    const changed = affectedProjects(ctx.projects, await ctx.adapter.changedFiles(ctx.repo, ctx.pr.number).catch(() => []));
+    const scope = changed.length ? changed : ctx.projects;
+    const on = scope.map(p => ({ p, s: this.aiFor(ctx, p, 'ask') })).filter((x): x is { p: Project; s: AiSettings } => !!x.s);
+    if (!on.length) return reply.say('AI answers are turned off for the projects in this PR (`ai` in repos.yaml or teriac.yaml).');
     let may = false;
-    for (const p of ctx.projects) if ((await this.allowed(ctx, 'plan', user, p)).allowed) { may = true; break; }
+    for (const { p } of on) if ((await this.allowed(ctx, 'plan', user, p)).allowed) { may = true; break; }
     if (!may) return reply.say('🚫 Asking needs permission to plan a project in this repo.');
+    const settings = on[0].s;
     const runs = this.deps.store.latestRuns(ctx.repoKey, ctx.pr.number, 'plan').filter(r => r.headSha === ctx.pr.headSha);
     const summary = [`Pull request #${ctx.pr.number}: ${ctx.pr.title} (by ${ctx.pr.author}, ${ctx.pr.headRef} → ${ctx.pr.baseRef})`,
       `Projects in the repo: ${ctx.projects.map(p => `${p.name} (${p.dir})`).join(', ') || 'none'}`,
       ...runs.map(r => runDigest(r))].join('\n\n');
-    const answer = await ai.ask(question, { summary, tools: [...runTools(runs), ...checkoutTools(ctx.root)] }, this.safety(ctx).secretPatterns);
+    const answer = await ai.ask(question, { summary, tools: [...runTools(runs), ...checkoutTools(ctx.root)] }, this.safety(ctx).secretPatterns, settings);
     this.deps.store.audit({ repo: ctx.repoKey, pr: ctx.pr.number, user, action: 'ai_ask', project: '*', allowed: true, reason: question.slice(0, 300) });
-    reply.say(answer ? `🤖 **AI answer** <sub>${ai.label} · advisory, check it yourself</sub>\n\n${answer}` : '🤖 No AI answer this time (the request failed or was declined). Try rephrasing, or ask again later.');
+    reply.say(answer ? `🤖 **AI answer** <sub>${label(settings)} · advisory, check it yourself</sub>\n\n${answer}` : '🤖 No AI answer this time (the request failed or was declined). Try rephrasing, or ask again later.');
+  }
+
+  // AI settings for a run's project, from repos.yaml and the teriac.yaml on the repo's default branch.
+  async aiForRun(adapter: VcsAdapter | undefined, run: Run, feature: AiFeature): Promise<AiSettings | null> {
+    if (!this.deps.ai || !adapter) return null;
+    const [host, owner, ...rest] = run.repo.split('/');
+    const repo: Repo = { platform: adapter.platform, host, owner, name: rest.join('/'), fullName: `${owner}/${rest.join('/')}`, cloneUrl: '' };
+    const policy = repoPolicyFor(this.deps.config.repos, repo);
+    if (!policy) return null;
+    const pr = await adapter.getPullRequest(repo, run.pr).catch(() => null);
+    const base = pr?.baseRef ?? repo.defaultBranch ?? 'main';
+    const repoConfig = policy.allow_repo_config === false ? null : await loadRepoConfigFrom(f => adapter.fileAt(repo, f, base)).catch(() => null);
+    const s = this.aiSettings(policy, repoConfig, { name: run.project, dir: run.dir || run.project });
+    return s?.features.includes(feature) ? s : null;
   }
 
   // The dashboard's "Ask about this run": the run and its saved plan, no checkout.
-  async askAboutRun(run: Run, question: string): Promise<string | null> {
-    const ai = this.deps.ai;
-    if (!ai?.has('ask')) return null;
-    return ai.ask(question, { summary: runDigest(run), tools: runTools([run]) }, this.deps.config.secretScan?.patterns);
+  async askAboutRun(run: Run, question: string, s: AiSettings): Promise<string | null> {
+    return this.deps.ai?.ask(question, { summary: runDigest(run), tools: runTools([run]) }, this.deps.config.secretScan?.patterns, s) ?? null;
   }
 
   // ---- rules that depend on the plan ----
@@ -1647,7 +1690,7 @@ export class App {
       // A failed apply: what went wrong and how to fix it, from the AI (when on).
       const ai = r.ok ? null : await this.aiFailure(ctx, project, 'apply', scanned.text);
       store.finishRun(runId, { status: r.ok ? 'success' : 'failed', engine, output: scanned.text, summary: plan.summary, usage: r.usage ?? null, applied: parseApplyResult(r.output), secrets: scanned.found, ai });
-      if (ai?.kind === 'fix') await this.suggestFixes(ctx, project, ai);
+      if (ai?.kind === 'fix' && await this.suggestFixes(ctx, project, ai)) store.setRunAi(runId, { ...ai, posted: true });
       this.notifyApply(ctx, project, user, store.getRun(runId)!);
       if (r.ok) {
         // unlock_after_apply: free the project for other PRs now. By default the lock stays
@@ -1774,7 +1817,12 @@ export class App {
       add(f.address, f.severity === 'critical' || f.severity === 'high' ? 'failure' : 'warning', `Policy: ${f.rule}`, f.message);
     }
     if (run.ai?.kind === 'review') {
-      for (const f of run.ai.findings) add(f.address, f.severity === 'low' ? 'notice' : 'warning', `AI review: ${f.title}`, `${f.why} (${run.ai.model}, advisory)`);
+      const noted = new Set([...out.values()].map(a => `${a.path}:${a.startLine}`));
+      for (const f of run.ai.findings.filter(important)) {
+        const loc = locate(ctx.root, project.dir, f.address);
+        if (loc && noted.has(`${loc.file}:${loc.start}`)) continue;
+        add(f.address, 'warning', `AI review: ${f.title}`, `${f.why} (${run.ai.model}, advisory)`);
+      }
     }
     return [...out.values()].slice(0, 50);
   }

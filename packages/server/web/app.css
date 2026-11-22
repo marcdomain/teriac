@@ -119,6 +119,7 @@ a.button:hover { background: var(--accent-strong); }
   position: sticky; top: 0; z-index: 5; }
 .brand { display: flex; align-items: center; gap: 8px; color: var(--ink); text-decoration: none; }
 .logo { height: 26px; width: auto; display: block; }
+.logo.festive { height: 32px; margin-top: -6px; } /* the hat sits above the usual box */
 .product { font: 500 10.5px/1 var(--mono); text-transform: uppercase; letter-spacing: 0.14em; color: var(--accent);
   padding: 4px 7px; border: 1px solid var(--accent-line); border-radius: 999px; background: var(--accent-soft); }
 nav { display: flex; gap: 2px; overflow-x: auto; scrollbar-width: none; min-width: 0; flex: 1 1 100%; order: 3; }

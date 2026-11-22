@@ -521,6 +521,7 @@ test('AI: the plan review is in the comment and the check, raises the risk, and 
   assert.match(gh.sticky.get(1)!, /🤖 \*\*AI review\*\* <sub>claude-opus-5-5 · advisory/);
   assert.match(gh.sticky.get(1)!, /> Replaces the database and deletes the legacy queue\./);
   assert.match(gh.checks.get('teriac: envs/dev')!.summary, /Database is replaced/);
+  assert.doesNotMatch(gh.sticky.get(1)!, /\*\*Risk:[^\n]*AI review: Database is replaced/, 'not repeated in the risk line');
   const sent = aiRequests.join('\n');
   assert.ok(sent.includes('terraform_data.database'), 'the plan is sent');
   assert.ok(!sent.includes('super-secret-key'), 'server secrets are not');
@@ -538,4 +539,17 @@ test('AI: teriac ask answers using the read-only tools, and is audited', async (
   await comment(1, 'mallory', 'teriac ask anything');
   assert.match(gh.lastReply(), /Asking needs permission to plan/);
   assert.equal(aiRequests.length, 0);
+});
+
+test('AI: per-project settings in repos.yaml: off for a project means no request for it', async () => {
+  const policy = (app as any).deps.config.repos[0];
+  policy.projects.unshift({ match: 'envs/dev', ai: { enabled: false } });
+  aiRequests.length = 0;
+  try {
+    await comment(1, 'bob', 'teriac plan -p envs/dev');
+    assert.equal(aiRequests.length, 0);
+    assert.equal(store.latestRuns('github.com/acme/infra', 1, 'plan').find(r => r.project === 'envs/dev')!.ai, null);
+    await comment(1, 'bob', 'teriac plan -p envs/prod');
+    assert.equal(aiRequests.length, 1, 'envs/prod still gets its review');
+  } finally { policy.projects.shift(); }
 });

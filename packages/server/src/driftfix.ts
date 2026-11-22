@@ -6,7 +6,7 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { locate } from './blame.ts';
 import type { Author } from './blame.ts';
-import { applyEdits, type Ai, type DriftDecision } from './ai.ts';
+import { applyEdits, label, type Ai, type AiSettings, type DriftDecision } from './ai.ts';
 
 export interface DriftEdit { address: string; file: string; attribute: string; from: unknown; to: unknown }
 export interface DriftManual { address: string; reason: string; author?: Author | null }
@@ -97,7 +97,7 @@ export const planDriftFix = (
 // For what the rules above leave to a person: the AI decides adopt (edits the code), revert
 // (the PR leaves it, so applying the base branch puts it back) or unsure. Its edits go in the
 // same PR, listed apart from the mechanical ones.
-export const aiDriftFix = async (ai: Ai, root: string, projectDir: string, project: string, plan: Record<string, any>, fix: DriftFix): Promise<DriftFix> => {
+export const aiDriftFix = async (ai: Ai, root: string, projectDir: string, project: string, plan: Record<string, any>, fix: DriftFix, s: AiSettings = ai.defaults): Promise<DriftFix> => {
   const addresses = [...new Set(fix.manual.map(m => m.address))];
   if (!addresses.length) return fix;
   const files = new Map(fix.files.map(f => [f.path, f.content]));
@@ -108,7 +108,7 @@ export const aiDriftFix = async (ai: Ai, root: string, projectDir: string, proje
     }
   }
   if (!files.size) return fix;
-  const decisions = await ai.driftDecisions({ project, plan, addresses, files: [...files].map(([path, text]) => ({ path, text })) });
+  const decisions = await ai.driftDecisions({ project, plan, addresses, files: [...files].map(([path, text]) => ({ path, text })) }, s);
   if (!decisions?.length) return fix;
   const before = new Map(files);
   const { skipped } = applyEdits(files, decisions.flatMap(d => d.edits));
@@ -122,7 +122,7 @@ export const aiDriftFix = async (ai: Ai, root: string, projectDir: string, proje
     ...fix,
     files: changed.map(([path, content]) => ({ path, content })),
     manual: fix.manual.filter(m => !decided.has(m.address)),
-    ai: { model: ai.label, decisions },
+    ai: { model: label(s), decisions },
   };
 };
 

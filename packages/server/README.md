@@ -474,7 +474,32 @@ ai:
 | `TERIAC_AI_FEATURES` | Comma list; default `review,fix,drift,policy,ask` |
 | `TERIAC_AI_TIMEOUT_SECONDS` | Per request, default 180 |
 
-Credentials come from each provider's usual place: `ANTHROPIC_API_KEY`; the pod's AWS role and
+**Per repo and per project.** `ai:` in `repos.yaml` turns AI on or off and changes the features,
+model and effort, at the top (every repo), on a repo entry, and on a project rule. The first matching
+project rule with `ai` wins over its repo entry, which wins over the top. `TERIAC_AI_FEATURES` stays
+the ceiling. The Guardrails page shows what each level ends up with.
+
+```yaml
+ai: { enabled: false }                  # off by default…
+repos:
+  - id: github.com/acme/infra
+    projects:
+      - match: "live/prod/**"
+        ai: { enabled: true, features: [review, fix], effort: high }   # …on for production
+      - match: "live/dev/**"
+        ai: { enabled: true, model: claude-sonnet-5-5 }               # a cheaper model for dev
+```
+
+A repo's `teriac.yaml` can turn AI off or drop features for itself (`ai: false`, or
+`ai: { features: [review] }`, at the top or on a project), never turn it on or change the model:
+the server's owner pays for the requests.
+
+**Kept short in PRs.** The comment shows the AI review only when it found something medium or worse,
+with at most five findings, and never repeats them in the risk line; the full review is on the check
+run and the dashboard. A fix posted as a suggested change is a one-line pointer in the comment, and the
+same fix is never posted twice on a PR.
+
+Credentials come from each provider's usual place: `ANTHROPIC_API_KEY` (or `ANTHROPIC_API_KEY_FILE`); the pod's AWS role and
 `AWS_REGION` for Bedrock; Workload Identity with `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION`
 for Vertex AI; `ANTHROPIC_FOUNDRY_RESOURCE` and `ANTHROPIC_FOUNDRY_API_KEY` for Microsoft Foundry.
 With Bedrock, Vertex AI or Foundry, plans stay in your own cloud account.
@@ -745,6 +770,8 @@ comment, teriac posts a warning naming who did it, with a link to the comment an
 original" section, and logs it in the audit log.
 
 ## Dashboard
+
+From 1 December to 6 January the logo and tab icon wear a Christmas hat; `TERIAC_SEASONAL_LOGO=false` turns that off.
 
 Open the server's URL in a browser. It shows:
 - an overview of runs, failures, locks and drift, with a banner while a change freeze is on;

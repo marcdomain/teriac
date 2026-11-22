@@ -52,6 +52,7 @@ config:
   logLevel: info
   verifySignatures: true        # check vendor signatures on downloaded Terraform/OpenTofu/Terragrunt; false for mirrors without .sig files
   moduleAuth: true              # Terraform's git::https:// module downloads sign in with a read-only App token (private modules work); false to turn off
+  seasonalLogo: true            # a Christmas hat on the dashboard logo from 1 December to 6 January
   logRetentionDays: ""          # clear run logs this many days after a PR's last apply (summaries and PR comments stay); per repo: log_retention_days
 
 # AI help from Claude (off unless provider is set): a plain-English review in every plan

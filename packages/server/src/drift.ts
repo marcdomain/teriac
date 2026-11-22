@@ -14,7 +14,8 @@ import { repoPolicyFor } from './policy.ts';
 import { parseCron, cronMatches, nextRun, type Cron } from './cron.ts';
 import { lastAuthor, type Author } from './blame.ts';
 import { planDriftFix, driftFixBody, aiDriftFix } from './driftfix.ts';
-import type { Ai } from './ai.ts';
+import type { Ai, AiSettings } from './ai.ts';
+import type { RepoConfig } from './repoConfig.ts';
 import { notifyAll, type DriftReport, type ProjectDrift } from './notify.ts';
 import { matchGlob } from './glob.ts';
 import { KeyedQueue } from './app.ts';
@@ -41,6 +42,7 @@ export interface DriftDeps {
   fetchImpl?: typeof fetch;
   now?: () => Date;
   ai?: Ai;                          // AI decisions on drift the rules can't fix (TERIAC_AI_PROVIDER)
+  aiSettings?: (policy: RepoPolicy, repoConfig: RepoConfig | null, project: Project) => AiSettings | null;
 }
 
 export interface DriftResult {
@@ -168,7 +170,7 @@ export class DriftScheduler {
     const projects = discoverProjects(root, repoConfig)
       .filter(p => e.spec.projects.some(g => matchGlob(g, p.name) || matchGlob(g, p.dir)));
 
-    const findings = await Promise.all(projects.map(p => this.deps.limited(() => this.checkProject(e, root, auth, p, repoKey, moduleAuth))));
+    const findings = await Promise.all(projects.map(p => this.deps.limited(() => this.checkProject(e, root, auth, p, repoKey, moduleAuth, repoConfig))));
 
     const report: DriftReport = {
       repo: e.repo.fullName, host: e.repo.host, branch: e.branch, sha, schedule: e.spec.name ?? e.spec.schedule,
@@ -203,11 +205,12 @@ export class DriftScheduler {
     return { report, notified };
   }
 
-  private async fixPr(e: ScheduleEntry, root: string, project: Project, plan: Record<string, any>, drift: { address: string; author: Author | null }[], result: ProjectDrift) {
+  private async fixPr(e: ScheduleEntry, root: string, project: Project, plan: Record<string, any>, drift: { address: string; author: Author | null }[], result: ProjectDrift, repoConfig: RepoConfig | null) {
     if (!e.adapter.openPullRequest) { result.fixNote = 'drift-fix PRs are not supported on this platform'; return; }
     try {
       let fix = planDriftFix(root, project.dir, plan, new Map(drift.map(d => [d.address, d.author])));
-      if (this.deps.ai?.has('drift')) fix = await aiDriftFix(this.deps.ai, root, project.dir, project.name, plan, fix);
+      const s = this.deps.ai ? this.deps.aiSettings?.(e.policy, repoConfig, project) ?? null : null;
+      if (s?.features.includes('drift')) fix = await aiDriftFix(this.deps.ai!, root, project.dir, project.name, plan, fix, s);
       if (!fix.files.length) { result.fixNote = 'no fix PR: nothing here can be updated in code automatically'; return; }
       const branch = driftBranch(project.name);
       const url = await e.adapter.openPullRequest(e.repo, {
@@ -223,7 +226,7 @@ export class DriftScheduler {
     }
   }
 
-  private async checkProject(e: ScheduleEntry, root: string, auth: Awaited<ReturnType<VcsAdapter['cloneAuth']>>, project: Project, repoKey: string, moduleAuth: Awaited<ReturnType<VcsAdapter['cloneAuth']>> | null = null): Promise<ProjectDrift> {
+  private async checkProject(e: ScheduleEntry, root: string, auth: Awaited<ReturnType<VcsAdapter['cloneAuth']>>, project: Project, repoKey: string, moduleAuth: Awaited<ReturnType<VcsAdapter['cloneAuth']>> | null = null, repoConfig: RepoConfig | null = null): Promise<ProjectDrift> {
     const { config, store } = this.deps;
     const last = store.lastApply(repoKey, project.name);
     const lastApply = last ? { user: last.user, pr: last.pr, at: last.finishedAt ?? last.startedAt } : null;
@@ -263,7 +266,7 @@ export class DriftScheduler {
         drift.push({ address: d.address, action: d.action, author: await lastAuthor(root, project.dir, d.address, auth).catch(() => null) });
       }
       const result: ProjectDrift = { project: project.name, engine, drift, pending, lastApply };
-      if (drift.length && e.spec.fix_pr && refresh.plan) await this.fixPr(e, root, project, refresh.plan, drift, result);
+      if (drift.length && e.spec.fix_pr && refresh.plan) await this.fixPr(e, root, project, refresh.plan, drift, result, repoConfig);
       return result;
     } catch (err) {
       return { project: project.name, engine, drift: [], pending: null, lastApply, error: (err as Error).message };
