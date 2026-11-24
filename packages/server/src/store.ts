@@ -400,6 +400,16 @@ export class Store {
     ).run(r.status, now(), r.engine ?? '', r.summary ?? null, r.output, r.planPath ?? null, r.hasChanges ? 1 : 0, r.destroys ?? 0, r.policy ?? null, r.mocks?.length ? JSON.stringify(r.mocks) : null, r.providers?.length ? JSON.stringify(r.providers) : null, r.usage ? JSON.stringify(r.usage) : null, r.applied ? JSON.stringify(r.applied) : null, r.planSha ?? null, r.risk ? JSON.stringify(r.risk) : null, r.secrets?.length ? JSON.stringify(r.secrets) : null, r.ai ? JSON.stringify(r.ai) : null, id);
   }
 
+  // Whether a plan of this PR's project already had an AI review (review: first).
+  hadAiReview(repo: string, pr: number, project: string): boolean {
+    return !!this.db.prepare(`SELECT 1 FROM runs WHERE repo = ? AND pr = ? AND project = ? AND kind = 'plan' AND ai LIKE '{"kind":"review"%' LIMIT 1`).get(repo, pr, project);
+  }
+
+  // A review asked for after the plan (`teriac review`): its result and the raised risk.
+  setRunReview(id: number, ai: AiResult, risk: object | null): void {
+    this.db.prepare('UPDATE runs SET ai = ?, risk = ? WHERE id = ?').run(JSON.stringify(ai), risk ? JSON.stringify(risk) : null, id);
+  }
+
   // The AI's result changed after the run finished (its fixes were posted on the code).
   setRunAi(id: number, ai: AiResult): void {
     this.db.prepare('UPDATE runs SET ai = ? WHERE id = ?').run(JSON.stringify(ai), id);

@@ -30,7 +30,7 @@ const fakeAi: AiCall = async (params) => {
   const reply = (content: unknown[], stop: string) => ({ id: 'm', type: 'message', role: 'assistant', model: params.model, content, stop_reason: stop, stop_details: null, usage: { input_tokens: 1, output_tokens: 1 } }) as any;
   const user = JSON.stringify(params.messages);
   if (params.output_config?.format) {
-    const json = user.includes('Review this plan')
+    const json = user.includes('Review this Terraform plan')
       ? { summary: 'Replaces the database and deletes the legacy queue.', findings: aiFinding ? [{ address: 'terraform_data.database', severity: 'high', title: 'Database is replaced', why: 'Its data is lost unless restored.' }] : [] }
       : { cause: 'var.missing is not declared.', fixes: [] };
     return reply([{ type: 'text', text: JSON.stringify(json) }], 'end_turn');
@@ -552,4 +552,34 @@ test('AI: per-project settings in repos.yaml: off for a project means no request
     await comment(1, 'bob', 'teriac plan -p envs/prod');
     assert.equal(aiRequests.length, 1, 'envs/prod still gets its review');
   } finally { policy.projects.shift(); }
+});
+
+test('AI review timing: first reviews only the first plan; then `@teriac review` on request', async () => {
+  const policy = (app as any).deps.config.repos[0];
+  policy.ai = { review: 'first' };
+  try {
+    await comment(1, 'bob', 'teriac unlock');   // PR 1 holds the lock from the earlier tests
+    gh.prs.set(9, pr(9, 'bob'));
+    gh.files.set(9, ['envs/dev/main.tf']);
+    aiRequests.length = 0;
+    await comment(9, 'bob', 'teriac plan -p envs/dev');
+    assert.equal(aiRequests.length, 1, 'the first plan is reviewed');
+    assert.match(gh.sticky.get(9)!, /`teriac review` for an AI review/, 'the footer says how to ask');
+    aiRequests.length = 0;
+    await comment(9, 'bob', 'teriac plan -p envs/dev');
+    assert.equal(aiRequests.length, 0, 'the next plan is not');
+    aiFinding = true;
+    await comment(9, 'bob', '@teriac review');
+    aiFinding = false;
+    assert.equal(aiRequests.length, 1, 'asked for: reviewed, without planning again');
+    assert.match(gh.lastReply(), /\*\*`envs\/dev`\*\*[\s\S]*🤖 \*\*AI review\*\*[\s\S]*Database is replaced/);
+    const plan = store.latestRuns('github.com/acme/infra', 9, 'plan').find(r => r.project === 'envs/dev')!;
+    assert.equal(plan.ai?.kind, 'review');
+    assert.ok(plan.risk!.reasons.includes('AI review: Database is replaced'), 'the risk is raised by the requested review');
+    assert.match(gh.checks.get('teriac: envs/dev')!.summary, /Database is replaced/, 'and the check run updated');
+    policy.ai = { review: 'command' };
+    aiRequests.length = 0;
+    await comment(9, 'bob', 'teriac plan -p envs/dev');
+    assert.equal(aiRequests.length, 0, 'command: never on its own');
+  } finally { delete policy.ai; }
 });

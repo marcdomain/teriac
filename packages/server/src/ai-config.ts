@@ -31,7 +31,7 @@ export const loadAiConfig = (env: NodeJS.ProcessEnv): AiConfig | undefined => {
   for (const f of features) if (!AI_FEATURES.includes(f as AiFeature)) throw new Error(`TERIAC_AI_FEATURES: unknown feature "${f}" (${AI_FEATURES.join(', ')})`);
   if (provider === 'vertex' && !env.ANTHROPIC_VERTEX_PROJECT_ID) throw new Error('TERIAC_AI_PROVIDER=vertex needs ANTHROPIC_VERTEX_PROJECT_ID (and CLOUD_ML_REGION, default "global")');
   if (provider === 'bedrock' && !(env.AWS_REGION || env.AWS_DEFAULT_REGION)) throw new Error('TERIAC_AI_PROVIDER=bedrock needs AWS_REGION');
-  const model = env.TERIAC_AI_MODEL?.trim() || (provider === 'bedrock' ? `anthropic.${DEFAULT_MODEL}` : DEFAULT_MODEL);
+  const model = modelFor(provider as AiProvider, env.TERIAC_AI_MODEL?.trim() || DEFAULT_MODEL);
   return {
     provider: provider as AiProvider, model, effort: effort as AiEffort, features: features as AiFeature[],
     timeoutMs: Math.max(10, Number(env.TERIAC_AI_TIMEOUT_SECONDS || 180)) * 1000,
@@ -43,16 +43,21 @@ export const loadAiConfig = (env: NodeJS.ProcessEnv): AiConfig | undefined => {
 // An `ai:` block. In repos.yaml it can turn AI on or off and change the features, model and
 // effort; TERIAC_AI_FEATURES stays the ceiling. In teriac.yaml it can only turn AI off or drop
 // features: the server's owner pays for the requests.
-export interface AiOverride { enabled?: boolean; features?: AiFeature[]; model?: string; effort?: AiEffort }
+// When plan reviews run: every plan (push), only a PR's first plan of each project (first),
+// or only when asked with `teriac review` (command). Asking always works when review is on.
+export type AiReviewMode = 'push' | 'first' | 'command';
+export const AI_REVIEW_MODES: AiReviewMode[] = ['push', 'first', 'command'];
+export interface AiOverride { enabled?: boolean; features?: AiFeature[]; model?: string; effort?: AiEffort; review?: AiReviewMode }
 // What applies to one project; null when AI is off for it.
-export interface AiSettings { features: AiFeature[]; model: string; effort: AiEffort }
+export interface AiSettings { features: AiFeature[]; model: string; effort: AiEffort; review: AiReviewMode }
 
 export const validateAiOverride = (v: unknown, where: string): AiOverride | undefined => {
   if (v === undefined || v === null) return undefined;
   if (typeof v === 'boolean') return { enabled: v };   // `ai: false` is short for `ai: { enabled: false }`
   if (typeof v !== 'object' || Array.isArray(v)) throw new Error(`${where} must be true, false or { enabled, features, model, effort }`);
   const o = v as Record<string, unknown>;
-  for (const k of Object.keys(o)) if (!['enabled', 'features', 'model', 'effort'].includes(k)) throw new Error(`${where}: unknown setting "${k}" (enabled, features, model, effort)`);
+  for (const k of Object.keys(o)) if (!['enabled', 'features', 'model', 'effort', 'review'].includes(k)) throw new Error(`${where}: unknown setting "${k}" (enabled, features, model, effort, review)`);
+  if (o.review !== undefined && !AI_REVIEW_MODES.includes(o.review as AiReviewMode)) throw new Error(`${where}.review must be push (every plan), first (a PR's first plan, then on request) or command (only on request)`);
   if (o.enabled !== undefined && typeof o.enabled !== 'boolean') throw new Error(`${where}.enabled must be true or false`);
   if (o.features !== undefined) {
     if (!Array.isArray(o.features)) throw new Error(`${where}.features must be a list of ${AI_FEATURES.join(', ')}`);
@@ -71,23 +76,68 @@ export const resolveAi = (cfg: AiConfig | undefined, server: (AiOverride | undef
   let features = [...cfg.features];
   let model = cfg.model;
   let effort = cfg.effort;
+  let review: AiReviewMode = 'push';
   for (const o of server) {
     if (!o) continue;
     if (o.enabled !== undefined) enabled = o.enabled;
     if (o.features) features = cfg.features.filter(f => o.features!.includes(f));
-    if (o.model) model = cfg.provider === 'bedrock' && !o.model.startsWith('anthropic.') ? `anthropic.${o.model}` : o.model;
+    if (o.model) model = modelFor(cfg.provider, o.model);
     if (o.effort) effort = o.effort;
+    if (o.review) review = o.review;
   }
   for (const o of repo) {
     if (!o) continue;
     if (o.enabled === false) enabled = false;
     if (o.features) features = features.filter(f => o.features!.includes(f));
+    // Less often is fine (it costs less); more often is the server's call.
+    if (o.review && AI_REVIEW_MODES.indexOf(o.review) > AI_REVIEW_MODES.indexOf(review)) review = o.review;
   }
-  return enabled && features.length ? { features, model, effort } : null;
+  return enabled && features.length ? { features, model, effort, review } : null;
+};
+
+// A model name as each provider wants it, so one setting (claude-sonnet-4-6) works everywhere:
+// Bedrock: anthropic.claude-…, or as given when it is an inference profile (us./eu./apac./global.…)
+// or an ARN. Anthropic's API and Vertex AI: the bare name. Foundry: your deployment's name, as given.
+const BEDROCK_PREFIX = /^(?:(?:us|eu|apac|jp|au|ca|us-gov|global)\.)?anthropic\./;
+export const modelFor = (provider: AiProvider, model: string): string => {
+  const m = model.trim();
+  switch (provider) {
+    case 'bedrock': return m.startsWith('arn:') || BEDROCK_PREFIX.test(m) ? m : `anthropic.${m}`;
+    case 'anthropic': case 'vertex': return m.replace(BEDROCK_PREFIX, '');
+    case 'foundry': return m;
+  }
 };
 
 // The model's name as shown on comments and the dashboard.
-export const label = (s: AiSettings) => s.model.replace(/^anthropic\./, '');
+export const label = (s: { model: string }) => s.model.replace(/^arn:.*\//, '').replace(BEDROCK_PREFIX, '');
+
+// What to do about a refused request, per provider: shown in the log and on the dashboard.
+export const aiErrorHint = (provider: AiProvider, status: number | undefined, message: string): string => {
+  const m = message.toLowerCase();
+  if (provider === 'bedrock') {
+    if (m.includes('inference profile') || m.includes('on-demand throughput')) return 'This model needs an inference profile on Bedrock: set the model to us.anthropic.<model> (or eu., apac., global.).';
+    if (status === 403 && m.includes('not available for this account')) return 'AWS holds this model back for this account. Try another Claude model (e.g. claude-sonnet-4-6), or ask AWS for access.';
+    if (status === 403 || m.includes('access denied') || m.includes("don't have access")) return "Accept Anthropic's terms for this model in Bedrock (Model catalog), and let the server's role call bedrock:InvokeModel.";
+    if (status === 404 || m.includes('does not exist')) return 'Bedrock does not know this model name here. Use the id from the Bedrock console (e.g. anthropic.claude-sonnet-4-6) in AWS_REGION; with TERIAC_AI_BEDROCK_API=mantle, check the endpoint offers it.';
+    if (m.includes('security token') || m.includes('credential')) return "No usable AWS credentials: give the pod a role (IRSA or EKS Pod Identity), or set AWS_* credentials.";
+  }
+  if (provider === 'vertex') {
+    if (status === 404) return 'Enable this Claude model in Vertex AI Model Garden for ANTHROPIC_VERTEX_PROJECT_ID, in CLOUD_ML_REGION (global, or a region that offers it).';
+    if (status === 403 || status === 401) return 'The server\'s Google identity needs roles/aiplatform.user on the project (Workload Identity or GOOGLE_APPLICATION_CREDENTIALS).';
+  }
+  if (provider === 'foundry') {
+    if (status === 404) return 'Set the model (TERIAC_AI_MODEL or ai.model) to your Foundry deployment\'s name, and check ANTHROPIC_FOUNDRY_RESOURCE.';
+    if (status === 401 || status === 403) return 'Check ANTHROPIC_FOUNDRY_API_KEY and that it belongs to ANTHROPIC_FOUNDRY_RESOURCE.';
+  }
+  if (provider === 'anthropic') {
+    if (status === 401) return 'ANTHROPIC_API_KEY is missing or wrong (Claude Console → API keys).';
+    if (m.includes('credit balance')) return 'The Claude Console account has no credits: add some under Billing.';
+    if (status === 404) return 'Unknown model name for the Claude API (e.g. claude-opus-5-5, claude-sonnet-5-5).';
+  }
+  if (status === 429) return 'Rate limited by the provider: fewer projects with AI, a lower effort, or a higher quota.';
+  if (status === 400 && (m.includes('output_config') || m.includes('format') || m.includes('effort'))) return 'This model or provider does not support a setting teriac uses (effort or structured output): choose a newer Claude model.';
+  return '';
+};
 
 // Review findings worth a person's attention in the PR; low ones stay on the check run and dashboard.
 export const important = (f: { severity: string }) => f.severity !== 'low';

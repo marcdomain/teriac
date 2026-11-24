@@ -13,7 +13,7 @@ import { discoverProjects, affectedProjects, terragruntDependencies, mockedDepen
 import {
   repoPolicyFor, rulesFor, ruleMatches, checkPermission, applyBlockers, matchesPrincipal, type Lookup, type EffectiveRules,
 } from './policy.ts';
-import { renderComment, renderCheck, renderApplyReport, parseApplyResult, providersOf, cmdBlock, fence, tail, type ProjectView, type CommentLinks } from './render.ts';
+import { renderComment, renderCheck, renderApplyReport, aiLines, parseApplyResult, providersOf, cmdBlock, fence, tail, type ProjectView, type CommentLinks } from './render.ts';
 import { repoLinks, platformForHost } from './links.ts';
 import { avatarSource, roundAvatarPath } from './avatars.ts';
 import { plan as runPlan, apply as runApply, runTool, engineLabel, toolEnv, gitAuthEnv, type ToolResolver, type ToolSet } from './runner.ts';
@@ -940,6 +940,7 @@ export class App {
 
     if (cmd.verb === 'unlock') return this.unlock(ctx, user, cmd, reply);
     if (cmd.verb === 'ask') return this.ask(ctx, user, cmd.question ?? '', reply);
+    if (cmd.verb === 'review') return this.reviewCommand(ctx, user, cmd, reply);
     if (cmd.tool) return this.toolCommand(ctx, user, cmd, reply);
 
     if (cmd.verb === 'plan') {
@@ -1215,14 +1216,20 @@ export class App {
   private async aiReview(ctx: PrContext, project: Project, engine: string, plan: Record<string, any>, risk: Risk | null, findings: { rule: string; severity: string; address: string; message: string }[]): Promise<AiResult | null> {
     const s = this.aiFor(ctx, project, 'review');
     if (!s) return null;
+    // review: command reviews only on `teriac review`; first, only a PR's first plan of the project.
+    if (s.review === 'command') return null;
+    if (s.review === 'first' && this.deps.store.hadAiReview(ctx.repoKey, ctx.pr.number, project.name)) return null;
     const safety = this.safety(ctx);
-    return this.deps.ai!.reviewPlan({ project: project.name, production: isProduction(project, safety.risk), engine, plan, risk, findings, patterns: safety.secretPatterns }, s);
+    // AI help never fails a plan: any error just means no review.
+    return this.deps.ai!.reviewPlan({ project: project.name, production: isProduction(project, safety.risk), engine, plan, risk, findings, patterns: safety.secretPatterns }, s)
+      .catch(err => { log.warn('ai review skipped', { project: project.name, err: (err as Error).message }); return null; });
   }
 
   private async aiFailure(ctx: PrContext, project: Project, kind: 'plan' | 'apply', output: string): Promise<AiResult | null> {
     const s = this.aiFor(ctx, project, 'fix');
     if (!s) return null;
-    return this.deps.ai!.explainFailure({ project: project.name, kind, output, root: ctx.root, dir: project.dir, patterns: this.safety(ctx).secretPatterns }, s);
+    return this.deps.ai!.explainFailure({ project: project.name, kind, output, root: ctx.root, dir: project.dir, patterns: this.safety(ctx).secretPatterns }, s)
+      .catch(err => { log.warn('ai failure help skipped', { project: project.name, err: (err as Error).message }); return null; });
   }
 
   // Fixes as suggested changes on the PR's code, where the platform allows it. The PR comment
@@ -1278,6 +1285,41 @@ export class App {
     const repoConfig = policy.allow_repo_config === false ? null : await loadRepoConfigFrom(f => adapter.fileAt(repo, f, base)).catch(() => null);
     const s = this.aiSettings(policy, repoConfig, { name: run.project, dir: run.dir || run.project });
     return s?.features.includes(feature) ? s : null;
+  }
+
+  // `teriac review`: an AI review of the latest plans at the PR's head, without planning again
+  // (it reads the saved plan). Shown in full in the reply, as it was asked for.
+  private async reviewCommand(ctx: PrContext, user: string, cmd: Command, reply: Reply) {
+    if (!this.deps.ai?.has('review')) return reply.say('AI reviews are turned off on this server (`TERIAC_AI_FEATURES`).');
+    const { store } = this.deps;
+    const plans = store.latestRuns(ctx.repoKey, ctx.pr.number, 'plan').filter(r => r.headSha === ctx.pr.headSha && r.status === 'success' && r.hasChanges);
+    const planned = ctx.projects.filter(p => plans.some(r => r.project === p.name));
+    const picked = this.select(ctx, cmd, planned);
+    if (typeof picked === 'string') return reply.say(`❌ ${picked}`);
+    if (!picked.length) return reply.say(`Nothing to review: no plan with changes for this commit. Run \`${this.commandName} plan\` first.`);
+    const out: string[] = [];
+    for (const project of picked) {
+      const run = plans.find(r => r.project === project.name);
+      if (!run) { out.push(`- \`${project.name}\`: no plan with changes for this commit`); continue; }
+      const s = this.aiFor(ctx, project, 'review');
+      if (!s) { out.push(`- \`${project.name}\`: AI reviews are off for this project`); continue; }
+      if (!(await this.allowed(ctx, 'plan', user, project)).allowed) { out.push(`- \`${project.name}\`: 🚫 needs permission to plan it`); continue; }
+      let plan: Record<string, any> | null = null;
+      try { plan = run.planPath ? JSON.parse(readFileSync(`${run.planPath}.json`, 'utf-8')) : null; } catch { /* dropped */ }
+      if (!plan) { out.push(`- \`${project.name}\`: its saved plan is gone; plan it again (\`${this.commandName} plan -p ${project.name}\`)`); continue; }
+      const pol = this.policyOf(run);
+      const safety = this.safety(ctx);
+      const ruled = assessRisk(summaryOf(run), project, pol?.findings ?? [], safety.risk);
+      const review = await this.deps.ai.reviewPlan({ project: project.name, production: isProduction(project, safety.risk), engine: run.engine, plan, risk: ruled, findings: pol?.findings ?? [], patterns: safety.secretPatterns }, s);
+      if (!review) { out.push(`- \`${project.name}\`: no AI review this time (the request failed or was declined)`); continue; }
+      store.setRunReview(run.id, review, raiseRisk(ruled, review));
+      const updated = store.getRun(run.id)!;
+      await this.publishCheck(ctx, project, updated);
+      out.push(`**\`${project.name}\`**`, '', ...aiLines(updated));
+    }
+    this.deps.store.audit({ repo: ctx.repoKey, pr: ctx.pr.number, user, action: 'ai_review', project: picked.map(p => p.name).join(',') || '*', allowed: true, reason: 'teriac review' });
+    reply.say(out.join('\n'));
+    if (this.commentMode(ctx) === 'update') await this.refreshComment(ctx, new Map());
   }
 
   // The dashboard's "Ask about this run": the run and its saved plan, no checkout.
@@ -1883,7 +1925,14 @@ export class App {
     }
     views.sort((a, b) => a.name.localeCompare(b.name));
 
+    // `teriac review` goes in the footer when some project here reviews only on request.
+    const reviewCommand = views.some(v => {
+      const p = ctx.projects.find(x => x.name === v.name);
+      const s = p ? this.aiFor(ctx, p, 'review') : null;
+      return !!s && s.review !== 'push';
+    });
     const body = renderComment({
+      reviewCommand,
       marker: asReply ? '<!-- teriac:report -->' : MARKER, headSha: head, command: config.commandNames[0], projects: views,
       dashboardUrl: config.publicUrl, limit: ctx.adapter.commentLimit, warnings: ctx.warnings,
       oneProjectPerApply: this.oneAtATime(ctx),

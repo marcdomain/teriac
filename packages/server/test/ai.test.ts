@@ -193,17 +193,17 @@ test('drift: the AI adopts, reverts or leaves what the rules could not edit', as
 
 test('where AI is on: server, repo and project layers override; teriac.yaml only narrows', async () => {
   const { resolveAi, validateAiOverride } = await import('../src/ai.ts');
-  assert.deepEqual(resolveAi(cfg, []), { features: cfg.features, model: 'claude-opus-5-5', effort: 'medium' });
+  assert.deepEqual(resolveAi(cfg, []), { features: cfg.features, model: 'claude-opus-5-5', effort: 'medium', review: 'push' });
   assert.equal(resolveAi(undefined, []), null, 'no provider: off everywhere');
   // Off by default, on for one project with fewer features, a cheaper model and more effort.
   const project = resolveAi(cfg, [{ enabled: false }, undefined, { enabled: true, features: ['review', 'fix'], model: 'claude-sonnet-5-5', effort: 'high' }]);
-  assert.deepEqual(project, { features: ['review', 'fix'], model: 'claude-sonnet-5-5', effort: 'high' });
+  assert.deepEqual(project, { features: ['review', 'fix'], model: 'claude-sonnet-5-5', effort: 'high', review: 'push' });
   assert.equal(resolveAi(cfg, [{ enabled: false }]), null);
   // The server's TERIAC_AI_FEATURES is the ceiling.
   assert.deepEqual(resolveAi({ ...cfg, features: ['review'] }, [{ features: ['review', 'ask'] }])?.features, ['review']);
   // teriac.yaml can't turn it on or change the model, only switch off or drop features.
   assert.equal(resolveAi(cfg, [{ enabled: false }], [{ enabled: true }]), null);
-  assert.deepEqual(resolveAi(cfg, [], [{ features: ['review'], model: 'x' } as any]), { features: ['review'], model: 'claude-opus-5-5', effort: 'medium' });
+  assert.deepEqual(resolveAi(cfg, [], [{ features: ['review'], model: 'x' } as any]), { features: ['review'], model: 'claude-opus-5-5', effort: 'medium', review: 'push' });
   assert.equal(resolveAi(cfg, [], [{ enabled: false }]), null);
   // Bedrock model names get their prefix.
   assert.equal(resolveAi({ ...cfg, provider: 'bedrock', model: 'anthropic.claude-opus-5-5' }, [{ model: 'claude-sonnet-5-5' }])?.model, 'anthropic.claude-sonnet-5-5');
@@ -246,4 +246,63 @@ test('season: the Christmas hat from 1 December to 6 January', async () => {
   assert.equal(christmas(new Date('2026-12-01T00:00:00Z')), true);
   assert.equal(christmas(new Date('2027-01-06T12:00:00Z')), true);
   assert.equal(christmas(new Date('2027-01-07T00:00:00Z')), false);
+});
+
+test('every provider gets model names it accepts, and refusals come with what to do', async () => {
+  const { modelFor, aiErrorHint, label } = await import('../src/ai-config.ts');
+  assert.equal(modelFor('bedrock', 'claude-sonnet-4-6'), 'anthropic.claude-sonnet-4-6');
+  assert.equal(modelFor('bedrock', 'anthropic.claude-sonnet-4-6'), 'anthropic.claude-sonnet-4-6');
+  assert.equal(modelFor('bedrock', 'us.anthropic.claude-sonnet-4-6'), 'us.anthropic.claude-sonnet-4-6', 'inference profiles are kept');
+  assert.equal(modelFor('bedrock', 'global.anthropic.claude-opus-5-5'), 'global.anthropic.claude-opus-5-5');
+  assert.equal(modelFor('bedrock', 'arn:aws:bedrock:us-east-1:1:application-inference-profile/abc'), 'arn:aws:bedrock:us-east-1:1:application-inference-profile/abc');
+  assert.equal(modelFor('vertex', 'anthropic.claude-sonnet-4-6'), 'claude-sonnet-4-6');
+  assert.equal(modelFor('anthropic', 'us.anthropic.claude-opus-5-5'), 'claude-opus-5-5');
+  assert.equal(modelFor('foundry', 'my-claude-deployment'), 'my-claude-deployment', 'Foundry: the deployment name');
+  assert.equal(loadAiConfig({ TERIAC_AI_PROVIDER: 'bedrock', AWS_REGION: 'us-east-1', TERIAC_AI_MODEL: 'claude-sonnet-4-6' })!.model, 'anthropic.claude-sonnet-4-6');
+  assert.equal(label({ model: 'us.anthropic.claude-sonnet-4-6' }), 'claude-sonnet-4-6');
+  assert.match(aiErrorHint('bedrock', 403, 'anthropic.claude-sonnet-5-5 is not available for this account.'), /holds this model back/);
+  assert.match(aiErrorHint('bedrock', 400, 'Invocation with on-demand throughput isn’t supported. Retry with an inference profile'), /us\.anthropic/);
+  assert.match(aiErrorHint('bedrock', 404, "The model 'x' does not exist"), /id from the Bedrock console/);
+  assert.match(aiErrorHint('vertex', 404, 'not found'), /Model Garden/);
+  assert.match(aiErrorHint('foundry', 404, 'deployment not found'), /deployment's name/);
+  assert.match(aiErrorHint('anthropic', 400, 'Your credit balance is too low'), /no credits/);
+  assert.match(aiErrorHint('anthropic', 401, 'invalid x-api-key'), /ANTHROPIC_API_KEY/);
+});
+
+test('a refused request is kept, with its hint, for the dashboard', async () => {
+  const refused: AiCall = async () => { throw Object.assign(new Error('anthropic.claude-sonnet-5-5 is not available for this account.'), { status: 403 }); };
+  const ai = new Ai({ ...cfg, provider: 'bedrock', model: 'anthropic.claude-sonnet-5-5' }, { call: refused });
+  assert.equal(await ai.draftPolicy('x'), null);
+  assert.equal(ai.lastError?.status, 403);
+  assert.equal(ai.lastError?.model, 'claude-sonnet-5-5');
+  assert.match(ai.lastError!.hint, /holds this model back/);
+});
+
+test('review timing: push, first or command; teriac.yaml can only make it rarer', async () => {
+  const { resolveAi, validateAiOverride } = await import('../src/ai.ts');
+  assert.equal(resolveAi(cfg, [])!.review, 'push');
+  assert.equal(resolveAi(cfg, [{ review: 'first' }])!.review, 'first');
+  assert.equal(resolveAi(cfg, [{ review: 'command' }, { review: 'push' }])!.review, 'push', 'a project rule can set it back');
+  assert.equal(resolveAi(cfg, [{ review: 'first' }], [{ review: 'push' }])!.review, 'first', 'a repo cannot make it more often');
+  assert.equal(resolveAi(cfg, [], [{ review: 'command' }])!.review, 'command', 'but can make it rarer');
+  assert.throws(() => validateAiOverride({ review: 'daily' }, 'ai'), /ai\.review must be push/);
+  const r = parseCommand('@teriac review -p envs/dev', ['teriac']);
+  assert.ok(r?.ok && r.command.verb === 'review' && r.command.project === 'envs/dev');
+  const bad = parseCommand('teriac review -t aws_s3_bucket.x', ['teriac']);
+  assert.ok(bad && !bad.ok && /Only `-p`, `-d` and `-w` work with `teriac review`/.test(bad.error));
+  assert.match(helpText('teriac', false, true), /teriac review/);
+});
+
+test('a review in the wrong shape, or about resources not in the plan, never reaches the PR', async () => {
+  const plan = JSON.parse(fixture('plan-changes.json'));
+  const wrong = fake({ cause: 'not a review', fixes: [] });
+  assert.equal(await new Ai(cfg, { call: wrong.call }).reviewPlan({ project: 'p', production: false, engine: 'tf', plan, risk: null, findings: [] }), null);
+  const invented = fake({ summary: 'One. Two. Three sentences is too many.', findings: [
+    { address: 'aws_db_instance.not_in_plan', severity: 'critical', title: 'Made up', why: 'This resource is not in the plan.' },
+    { address: '`terraform_data.database`', severity: 'high', title: 'Database replaced', why: 'Its data is lost. More words here.' },
+    { address: 'terraform_data.database', severity: 'high', title: 'Database replaced', why: 'duplicate' },
+  ] });
+  const r = (await new Ai(cfg, { call: invented.call }).reviewPlan({ project: 'p', production: false, engine: 'tf', plan, risk: null, findings: [] }))!;
+  assert.equal(r.summary, 'One. Two.', 'two sentences at most');
+  assert.deepEqual(r.findings.map(f => [f.address, f.why]), [['terraform_data.database', 'Its data is lost.']]);
 });

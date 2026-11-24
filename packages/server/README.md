@@ -500,7 +500,7 @@ run and the dashboard. A fix posted as a suggested change is a one-line pointer 
 same fix is never posted twice on a PR.
 
 Credentials come from each provider's usual place: `ANTHROPIC_API_KEY` (or `ANTHROPIC_API_KEY_FILE`); the pod's AWS role and
-`AWS_REGION` for Bedrock; Workload Identity with `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION`
+`AWS_REGION` for Bedrock (the standard Bedrock API; `TERIAC_AI_BEDROCK_API=mantle` for its Messages endpoint, and model names as in the Bedrock console, e.g. `anthropic.claude-sonnet-4-6`); Workload Identity with `ANTHROPIC_VERTEX_PROJECT_ID` and `CLOUD_ML_REGION`
 for Vertex AI; `ANTHROPIC_FOUNDRY_RESOURCE` and `ANTHROPIC_FOUNDRY_API_KEY` for Microsoft Foundry.
 With Bedrock, Vertex AI or Foundry, plans stay in your own cloud account.
 

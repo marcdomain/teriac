@@ -39,15 +39,16 @@
   let aiInfo = null;
   const aiServer = async () => (aiInfo ??= await api('/api/ai').catch(() => ({ enabled: false })));
   // Where AI is on, as the Guardrails page shows it: each level of repos.yaml that sets `ai`.
-  const aiCardGuard = (a) => {
+  const aiCardGuard = (a, srv = {}) => {
     if (!a) return `<div class="card ai"><div class="card-head"><h2>AI help</h2><span class="muted small">off: set <code>TERIAC_AI_PROVIDER</code> (<code>ai.provider</code> in the chart)</span></div></div>`;
     const feats = (list) => list.map(f => `<span class="pill">${esc(f)}</span>`).join(' ');
-    const result = (r) => (r ? `${feats(r.features)} <span class="muted small">${esc(r.model.replace(/^anthropic\./, ''))} · ${esc(r.effort)}</span>` : '<span class="pill bad">off</span>');
+    const result = (r) => (r ? `${feats(r.features)} <span class="muted small">${esc(r.model.replace(/^arn:.*\//, '').replace(/^(?:[a-z-]+\.)?anthropic\./, ''))} · ${esc(r.effort)} · review on ${esc(r.review === 'push' ? 'every plan' : r.review === 'first' ? 'first plan, then on request' : 'request only')}</span>` : '<span class="pill bad">off</span>');
     const set = (o) => (o ? `<code>${esc(JSON.stringify(o).replace(/"([a-z]+)":/g, '$1: '))}</code>` : '<span class="muted">not set: on with every feature</span>');
     return `<div class="card ai"><div class="card-head"><h2>AI help</h2><span class="muted small">${esc(a.provider)} · ${esc(a.model)} · ${esc(a.effort)} · ceiling ${feats(a.features)}</span></div>
       ${table(['Level', 'Applies to', 'ai: in repos.yaml', 'Result'], a.levels.map(l => `<tr>
         <td>${esc(l.scope)}</td><td class="mono">${esc(l.match)}</td><td>${set(l.set)}</td><td>${result(l.result)}</td>
       </tr>`), '')}
+      ${srv.lastError ? `<div class="banner"><b>AI requests are failing</b> (${esc(srv.lastError.what)}, ${esc(srv.lastError.model)}, ${ago(srv.lastError.at)})${srv.lastError.hint ? `: ${esc(srv.lastError.hint)}` : ''}<div class="muted small mono">${esc(srv.lastError.status ?? '')} ${esc(srv.lastError.message)}</div></div>` : ''}
       <div class="ai-body muted small">The first matching project rule with <code>ai</code> wins over its repo entry, which wins over the server. A repo's <code>teriac.yaml</code> can still turn AI off or drop features for itself, never turn it on.</div>
     </div>`;
   };
@@ -658,7 +659,7 @@
             <td>${x.staleBase === 'block' ? '<span class="pill bad">block</span>' : x.staleBase === 'warn' ? '<span class="pill warn">warn</span>' : '<span class="muted">off</span>'}</td>
             <td>${yes(x.verifyPlan)}</td><td>${esc(x.secretScan || g.secretScan.mode)}</td>
           </tr>`), 'No repos.')}</div>
-        ${aiCardGuard(g.ai)}
+        ${aiCardGuard(g.ai, aiSrv)}
         ${canDraft ? `<div class="card ai"><div class="card-head"><h2>Draft a policy with AI</h2><span class="muted small">checked against its own tests · paste into repos.yaml yourself</span></div>
           <form class="ai-ask" data-policy><input name="q" maxlength="4000" placeholder="No public S3 buckets in prod, and RDS keeps backups for at least 7 days" autocomplete="off" required ${isAdmin() ? '' : 'disabled title="Admins only"'}><button type="submit" ${isAdmin() ? '' : 'disabled'}>Draft</button></form>
           <div class="ai-answer" hidden></div></div>` : ''}`;

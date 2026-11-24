@@ -431,7 +431,9 @@ export const createHttpServer = (deps: HttpDeps): Server => {
       if (req.method === 'GET' && url.pathname === '/api/ai') {
         const ai = deps.ai;
         const top = deps.app.aiServerSettings();
-        return send(res, 200, ai ? { enabled: true, provider: ai.cfg.provider, model: ai.label, features: ai.cfg.features, defaultOn: !!top, policy: !!top?.features.includes('policy') } : { enabled: false });
+        return send(res, 200, ai ? { enabled: true, provider: ai.cfg.provider, model: ai.label, features: ai.cfg.features, defaultOn: !!top, policy: !!top?.features.includes('policy'), lastOk: ai.lastOk,
+          // Only a refusal newer than the last answer: what's wrong now.
+          lastError: ai.lastError && (!ai.lastOk || ai.lastError.at > ai.lastOk) && need('admin') ? ai.lastError : null } : { enabled: false });
       }
       // Whether "Ask about this run" is on for this run's project (repos.yaml and teriac.yaml).
       const runAi = /^\/api\/runs\/(\d+)\/ai$/.exec(url.pathname);

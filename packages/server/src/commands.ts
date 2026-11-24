@@ -4,6 +4,7 @@
 //   teriac unlock [-p project]
 //   teriac help
 //   teriac ask <question>     (AI answer, when TERIAC_AI_PROVIDER is set)
+//   teriac review [-p project] (AI review of the latest plans)
 // Terraform commands on one project (-p is required):
 //   teriac state list [address]... | state show <address> | state rm <address>... | state mv <from> <to>
 //   teriac output [name] | show | validate | providers | fmt
@@ -12,9 +13,9 @@
 
 import type { CommandAction } from './config.ts';
 
-export type Verb = 'plan' | 'apply' | 'unlock' | 'help' | 'cancel' | 'ask'
+export type Verb = 'plan' | 'apply' | 'unlock' | 'help' | 'cancel' | 'ask' | 'review'
   | 'state' | 'output' | 'show' | 'validate' | 'providers' | 'fmt' | 'import' | 'taint' | 'untaint' | 'force-unlock';
-const VERBS: Verb[] = ['plan', 'apply', 'unlock', 'help', 'cancel', 'ask', 'state', 'output', 'show', 'validate', 'providers', 'fmt', 'import', 'taint', 'untaint', 'force-unlock'];
+const VERBS: Verb[] = ['plan', 'apply', 'unlock', 'help', 'cancel', 'ask', 'review', 'state', 'output', 'show', 'validate', 'providers', 'fmt', 'import', 'taint', 'untaint', 'force-unlock'];
 
 // Terraform commands teriac runs for a single project. Nothing else is passed through:
 // commands like `console` or flags like `-chdir` could reach beyond the project.
@@ -94,7 +95,7 @@ export const parseCommand = (body: string, names: string[]): ParseResult => {
     if (!STATE_SUBS.includes(sub)) return { ok: false, error: `\`${name} state\` needs one of: ${STATE_SUBS.join(', ')}` };
     command.tool = `state ${sub}` as ToolCommand;
     first = 3;
-  } else if (!['plan', 'apply', 'unlock', 'help', 'cancel'].includes(verb)) {
+  } else if (!['plan', 'apply', 'unlock', 'help', 'cancel', 'review'].includes(verb)) {
     command.tool = verb as ToolCommand;
   }
   const positional: string[] = [];
@@ -147,6 +148,7 @@ export const parseCommand = (body: string, names: string[]): ParseResult => {
     command.args = positional;
     return { ok: true, command };
   }
+  if (verb === 'review' && (command.targets.length || command.destroy || command.override || command.extraArgs.length || command.refreshOnly || command.replace?.length)) return { ok: false, error: `Only \`-p\`, \`-d\` and \`-w\` work with \`${name} review\`` };
   if ((command.refreshOnly || command.replace?.length) && verb !== 'plan') return { ok: false, error: '`--refresh-only` and `--replace` only work with plan' };
   if (command.refreshOnly && command.destroy) return { ok: false, error: '`--refresh-only` and `--destroy` can\'t be combined' };
   if (command.destroy && verb !== 'plan') return { ok: false, error: '`--destroy` only works with plan' };
@@ -253,7 +255,7 @@ export const helpText = (name = 'teriac', oneProjectPerApply = false, ask = fals
   ...(oneProjectPerApply ? [] : [`| \`${name} apply\` | Apply every planned project whose requirements are met |`]),
   `| \`${name} apply -p <project>\` | Apply one project${oneProjectPerApply ? ' (this server applies one project at a time)' : ''} |`,
   `| \`${name} unlock\` | Release this PR's locks and discard its plans |`,
-  ...(ask ? [`| \`${name} ask <question>\` | An AI answer about this PR's plans and code (advisory) |`] : []),
+  ...(ask ? [`| \`${name} review\` | An AI review of this PR's latest plans (\`-p <project>\` for one) |`, `| \`${name} ask <question>\` | An AI answer about this PR's plans and code (advisory) |`] : []),
   `| \`${name} cancel\` | Drop this PR's queued plans and applies, and stop running plans (running applies finish) |`,
   `| \`${name} state list -p <project> [address]\` | Resources in the state |`,
   `| \`${name} state show -p <project> <address>\` | One resource's attributes (sensitive values hidden) |`,

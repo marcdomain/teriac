@@ -222,6 +222,7 @@ export interface CommentInput {
   links?: CommentLinks;
   approvers?: string[];           // current approvals of the head commit
   carried?: string[];             // approvals kept across a rebase
+  reviewCommand?: boolean;        // footer lists `review` (AI reviews on request)
 }
 
 // A command in its own code block: GitHub shows a copy button on it.
@@ -360,7 +361,7 @@ export const renderComment = (input: CommentInput): string => {
     '---',
     `<sub>${input.oneProjectPerApply
       ? `Apply one project at a time: \`${command} apply -p <project>\``
-      : `\`${command} apply\` applies every ready project · \`${command} apply -p <project>\``} · \`${command} plan -p <project> -t <address>\` · \`${command} unlock\` · \`${command} help\`${input.dashboardUrl ? ` · [dashboard](${input.dashboardUrl})` : ''}</sub>`,
+      : `\`${command} apply\` applies every ready project · \`${command} apply -p <project>\``} · \`${command} plan -p <project> -t <address>\` · \`${command} unlock\`${input.reviewCommand ? ` · \`${command} review\` for an AI review` : ''} · \`${command} help\`${input.dashboardUrl ? ` · [dashboard](${input.dashboardUrl})` : ''}</sub>`,
   ];
 
   // Per-project details, then fit the raw output into what's left.

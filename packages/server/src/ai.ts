@@ -16,11 +16,11 @@ import { validatePolicies, evaluateRules, SEVERITIES, type PolicyRule, type Seve
 import { log } from './log.ts';
 
 import {
-  AI_PROVIDERS, AI_FEATURES, DEFAULT_MODEL, loadAiConfig, validateAiOverride, resolveAi, important, label,
-  type AiProvider, type AiFeature, type AiEffort, type AiConfig, type AiOverride, type AiSettings,
+  AI_PROVIDERS, AI_FEATURES, AI_REVIEW_MODES, DEFAULT_MODEL, loadAiConfig, validateAiOverride, resolveAi, important, label, modelFor, aiErrorHint,
+  type AiProvider, type AiFeature, type AiReviewMode, type AiEffort, type AiConfig, type AiOverride, type AiSettings,
 } from './ai-config.ts';
-export { AI_PROVIDERS, AI_FEATURES, DEFAULT_MODEL, loadAiConfig, validateAiOverride, resolveAi, important, label };
-export type { AiProvider, AiFeature, AiEffort, AiConfig, AiOverride, AiSettings };
+export { AI_PROVIDERS, AI_FEATURES, AI_REVIEW_MODES, DEFAULT_MODEL, loadAiConfig, validateAiOverride, resolveAi, important, label, modelFor, aiErrorHint };
+export type { AiProvider, AiFeature, AiReviewMode, AiEffort, AiConfig, AiOverride, AiSettings };
 
 // One request to the Messages API (beta surface: every provider client has it).
 export type AiCall = (params: MessageCreateParamsNonStreaming) => Promise<BetaMessage>;
@@ -31,8 +31,11 @@ const clientFor = async (cfg: AiConfig, env: NodeJS.ProcessEnv): Promise<AiCall>
   switch (cfg.provider) {
     case 'anthropic': client = new Anthropic(opts); break;
     case 'bedrock': {
-      const { AnthropicBedrockMantle } = await import('@anthropic-ai/bedrock-sdk');
-      client = new AnthropicBedrockMantle({ ...opts, awsRegion: env.AWS_REGION || env.AWS_DEFAULT_REGION });
+      // The standard Bedrock API (InvokeModel), where Bedrock grants model access and every
+      // account has it. TERIAC_AI_BEDROCK_API=mantle uses the newer Messages endpoint instead.
+      const { AnthropicBedrock, AnthropicBedrockMantle } = await import('@anthropic-ai/bedrock-sdk');
+      const awsRegion = env.AWS_REGION || env.AWS_DEFAULT_REGION;
+      client = env.TERIAC_AI_BEDROCK_API === 'mantle' ? new AnthropicBedrockMantle({ ...opts, awsRegion }) : new AnthropicBedrock({ ...opts, awsRegion });
       break;
     }
     case 'vertex': {
@@ -143,9 +146,20 @@ export class Ai {
   }
 
   has(feature: AiFeature): boolean { return this.cfg.features.includes(feature); }
-  get label(): string { return this.cfg.model.replace(/^anthropic\./, ''); }
+  get label(): string { return label(this.cfg); }
+  // The last refused request, with what to do about it (shown on the dashboard).
+  lastOk: string | null = null;
+  lastError: { at: string; what: string; model: string; status: number | null; message: string; hint: string } | null = null;
+
+  private failed(what: string, model: string, err: unknown) {
+    const e = err as { status?: number; message?: string };
+    const message = String(e.message ?? err).replace(/\s+/g, ' ').slice(0, 300);
+    const hint = aiErrorHint(this.cfg.provider, e.status, message);
+    this.lastError = { at: new Date().toISOString(), what, model: label({ model }), status: e.status ?? null, message, hint };
+    log.warn('ai request failed', { what, provider: this.cfg.provider, model, status: e.status ?? null, err: message, ...(hint ? { hint } : {}) });
+  }
   // The server-wide settings, for callers with no project (policy drafts).
-  get defaults(): AiSettings { return { features: this.cfg.features, model: this.cfg.model, effort: this.cfg.effort }; }
+  get defaults(): AiSettings { return { features: this.cfg.features, model: this.cfg.model, effort: this.cfg.effort, review: 'push' }; }
 
   private base(maxTokens: number, s: AiSettings) {
     return {
@@ -171,10 +185,11 @@ export class Ai {
       });
       if (msg.stop_reason === 'refusal') { log.warn('ai declined', { what, category: msg.stop_details?.category ?? null }); return null; }
       if (msg.stop_reason === 'max_tokens') { log.warn('ai answer cut off', { what }); return null; }
+      this.lastOk = new Date().toISOString();
       log.info('ai answered', { what, ms: Date.now() - started, input: msg.usage.input_tokens, output: msg.usage.output_tokens, cached: msg.usage.cache_read_input_tokens ?? 0 });
       return JSON.parse(textOf(msg)) as T;
     } catch (err) {
-      log.warn('ai request failed', { what, err: (err as Error).message });
+      this.failed(what, s.model, err);
       return null;
     }
   }
@@ -189,11 +204,12 @@ export class Ai {
     const digest = clean(planDigest(input.plan), sensitive, input.patterns);
     if (!digest.trim()) return null;
     const user = [
-      `Review this plan for project \`${input.project}\`${input.production ? ' (production)' : ''}, run with ${input.engine}.`,
-      'Write a summary of two to four sentences a reviewer can read in ten seconds: what changes, and the real-world effect.',
-      'Then list findings: only things a careful reviewer would want to know before applying, such as forced replacements and why, data that could be lost, access that gets wider, things that become public, protections turned off (deletion protection, backups, encryption, logging), and surprising side effects. Do not repeat a finding the rule-based checks below already made. An empty list is fine.',
-      `Rule-based risk: ${input.risk ? `${input.risk.level}${input.risk.reasons.length ? ` (${input.risk.reasons.join('; ')})` : ''}` : 'none'}.`,
-      input.findings.length ? `Policy findings already reported: ${input.findings.map(f => `${f.rule} on ${f.address}`).join('; ')}.` : '',
+      `Review this Terraform plan for project \`${input.project}\`${input.production ? ' (production)' : ''}, run with ${input.engine}. The reviewer already sees the list of changed resources and their counts; tell them only what that list doesn't.`,
+      `Summary: at most two sentences, under 45 words. Say what this change does in plain terms and its real-world effect (downtime, data loss, access, exposure, cost). Don't list counts or resource names one by one.`,
+      `Findings: only real risks a careful reviewer must know before applying, each tied to one resource address that appears in the plan. Good findings: a forced replacement and what it destroys (say which attribute forces it), data that will be lost, access that gets wider (IAM, security groups, public buckets, 0.0.0.0/0), protections turned off (deletion protection, backups, versioning, encryption, logging), and side effects that cause downtime. Not findings: tags, names, descriptions, formatting, things that are merely new, values shown as known after apply, generic best practices, and anything the rule-based checks below already report.`,
+      'Severity: critical = data loss or an outage in production, or something opened to the internet; high = likely downtime or data loss, or access widened; medium = worth a second look before applying; low = minor, for the record. Title: under 8 words. Why: one sentence, under 30 words, naming the concrete consequence. No findings is the right answer for a routine change; never pad.',
+      `Rule-based risk already shown: ${input.risk ? `${input.risk.level}${input.risk.reasons.length ? ` (${input.risk.reasons.join('; ')})` : ''}` : 'none'}.`,
+      input.findings.length ? `Policy findings already shown: ${input.findings.map(f => `${f.rule} on ${f.address}`).join('; ')}.` : '',
       untrusted('plan', digest),
     ].filter(Boolean).join('\n\n');
     const r = await this.json<{ summary: string; findings: AiFinding[] }>('plan review', user, obj({
@@ -201,9 +217,18 @@ export class Ai {
       findings: { type: 'array', items: obj({ address: str, severity: sev, title: str, why: str }) },
     }), s, 8000);
     if (!r) return null;
-    const findings = r.findings.filter(f => SEVERITIES.includes(f.severity)).slice(0, 15)
-      .map(f => ({ ...f, title: oneLine(f.title, 160), why: oneLine(f.why, 600), address: oneLine(f.address, 200) }));
-    return { kind: 'review', model: label(s), summary: oneLine(r.summary, 1200), findings };
+    // Keep only findings about resources this plan changes (no invented addresses), once each,
+    // most severe first, and trimmed to the lengths asked for.
+    const changed = new Set<string>((input.plan.resource_changes ?? []).map((rc: any) => rc.address));
+    const seen = new Set<string>();
+    if (typeof r.summary !== 'string' || !Array.isArray(r.findings)) { log.warn('ai answer had the wrong shape', { what: 'plan review' }); return null; }
+    const findings = r.findings
+      .filter(f => f && typeof f.address === 'string' && typeof f.title === 'string' && typeof f.why === 'string' && SEVERITIES.includes(f.severity) && changed.has(f.address.replace(/^`|`$/g, '').trim()))
+      .filter(f => { const k = `${f.address}|${f.title.toLowerCase()}`; if (seen.has(k)) return false; seen.add(k); return true; })
+      .sort((a, b) => SEVERITIES.indexOf(b.severity) - SEVERITIES.indexOf(a.severity))
+      .slice(0, 8)
+      .map(f => ({ ...f, address: f.address.replace(/^`|`$/g, '').trim(), title: sentence(f.title, 70), why: sentence(f.why, 240) }));
+    return { kind: 'review', model: label(s), summary: sentence(r.summary, 400, 2), findings };
   }
 
   // ---- 2. failed runs ----
@@ -211,7 +236,7 @@ export class Ai {
   async explainFailure(input: { project: string; kind: 'plan' | 'apply'; output: string; root: string; dir: string; sensitive?: string[]; patterns?: SecretPattern[] }, s: AiSettings = this.defaults): Promise<FailureHelp | null> {
     const files = projectFiles(input.root, input.dir);
     const user = [
-      `A ${input.kind} of project \`${input.project}\` failed. Find the cause and, when it is in these files, the smallest fix.`,
+      `A ${input.kind} of project \`${input.project}\` failed. Find the root cause and, when it is in these files, the smallest fix. Cause: one or two sentences, under 50 words, naming the file, line and what is wrong; no restating the error text. Fix reasons: one short sentence.`,
       'Each fix replaces lines start_line to end_line (1-based, inclusive) of one file with `replacement` (the new lines, without line numbers, keeping indentation). Only fix files listed below. No fix is fine when the cause is outside the code (credentials, permissions, a provider outage): then say what to check.',
       untrusted('error output', clean(tailOf(input.output, 20_000), input.sensitive, input.patterns)),
       ...files.map(f => untrusted(`file ${f.path}`, numbered(clean(f.text, input.sensitive, input.patterns)))),
@@ -220,7 +245,7 @@ export class Ai {
       cause: str,
       fixes: { type: 'array', items: obj({ path: str, start_line: { type: 'integer' }, end_line: { type: 'integer' }, replacement: str, why: str }) },
     }), s);
-    if (!r) return null;
+    if (!r || typeof r.cause !== 'string' || !Array.isArray(r.fixes)) return null;
     const byPath = new Map(files.map(f => [f.path, f.text.split('\n').length]));
     const fixes = r.fixes.filter(f => {
       const lines = byPath.get(f.path);
@@ -229,7 +254,7 @@ export class Ai {
       path: f.path, startLine: f.start_line, endLine: f.end_line,
       replacement: scanSecrets(f.replacement.replace(/\n+$/, '')).text, why: oneLine(f.why, 400),
     }));
-    return { kind: 'fix', model: label(s), cause: oneLine(r.cause, 1500), fixes };
+    return { kind: 'fix', model: label(s), cause: sentence(r.cause, 500, 2), fixes: fixes.map(f => ({ ...f, why: sentence(f.why, 200) })) };
   }
 
   // ---- 3. drift ----
@@ -261,7 +286,7 @@ export class Ai {
         }),
       },
     }), s);
-    if (!r) return null;
+    if (!r || !Array.isArray(r.decisions)) return null;
     return r.decisions.filter(d => input.addresses.includes(d.address)).map(d => ({
       address: d.address, decision: d.decision, why: oneLine(d.why, 500),
       edits: d.decision === 'adopt' ? d.edits.map(e => ({ path: e.path, startLine: e.start_line, endLine: e.end_line, replacement: scanSecrets(e.replacement.replace(/\n+$/, '')).text })) : [],
@@ -326,6 +351,7 @@ export class Ai {
         } as MessageCreateParamsNonStreaming);
         if (msg.stop_reason === 'refusal') return null;
         messages.push({ role: 'assistant', content: msg.content as Extract<BetaMessageParam['content'], unknown[]> });
+        this.lastOk = new Date().toISOString();
         if (msg.stop_reason !== 'tool_use') return scanSecrets(textOf(msg)).text.trim() || null;
         const results = [];
         for (const block of msg.content) {
@@ -340,11 +366,21 @@ export class Ai {
       }
       return null;
     } catch (err) {
-      log.warn('ai request failed', { what: 'ask', err: (err as Error).message });
+      this.failed('ask', s.model, err);
       return null;
     }
   }
 }
+
+// Text cut to whole sentences (at most `n`) within `max` characters, cleaned of secrets.
+const sentence = (text: string, max: number, n = 1): string => {
+  const t = oneLine(text, 2000).replace(/\s+/g, ' ');
+  // A sentence ends at . ! or ? followed by a space, so var.missing or 0.0.0.0/0 stay whole.
+  const parts = t.split(/(?<=[.!?])\s+/);
+  let out = parts.slice(0, n).join(' ').trim();
+  if (out.length > max) out = `${out.slice(0, max - 1).replace(/\s+\S*$/, '')}…`;
+  return out || t.slice(0, max);
+};
 
 const oneLine = (s: string, max: number) => scanSecrets(String(s ?? '')).text.replace(/\r/g, '').trim().slice(0, max);
 
