@@ -252,6 +252,10 @@ export class Ai {
     const fixes = r.fixes.filter(f => {
       const lines = byPath.get(f.path);
       return lines !== undefined && f.start_line >= 1 && f.end_line >= f.start_line && f.end_line <= lines;
+    }).filter(f => {
+      const why = unsafeCode(f.replacement);
+      if (why) log.warn('ai fix refused', { path: f.path, why });
+      return !why;
     }).slice(0, 5).map(f => ({
       path: f.path, startLine: f.start_line, endLine: f.end_line,
       replacement: scanSecrets(f.replacement.replace(/\n+$/, '')).text, why: oneLine(f.why, 400),
@@ -291,7 +295,7 @@ export class Ai {
     if (!r || !Array.isArray(r.decisions)) return null;
     return r.decisions.filter(d => input.addresses.includes(d.address)).map(d => ({
       address: d.address, decision: d.decision, why: oneLine(d.why, 500),
-      edits: d.decision === 'adopt' ? d.edits.map(e => ({ path: e.path, startLine: e.start_line, endLine: e.end_line, replacement: scanSecrets(e.replacement.replace(/\n+$/, '')).text })) : [],
+      edits: d.decision === 'adopt' ? d.edits.filter(e => !unsafeCode(e.replacement)).map(e => ({ path: e.path, startLine: e.start_line, endLine: e.end_line, replacement: scanSecrets(e.replacement.replace(/\n+$/, '')).text })) : [],
     }));
   }
 
@@ -354,7 +358,7 @@ export class Ai {
         if (msg.stop_reason === 'refusal') return null;
         messages.push({ role: 'assistant', content: msg.content as Extract<BetaMessageParam['content'], unknown[]> });
         this.lastOk = new Date().toISOString();
-        if (msg.stop_reason !== 'tool_use') return scanSecrets(textOf(msg)).text.trim() || null;
+        if (msg.stop_reason !== 'tool_use') return safeText(scanSecrets(textOf(msg)).text).trim() || null;
         const results = [];
         for (const block of msg.content) {
           if (block.type !== 'tool_use') continue;
@@ -374,6 +378,31 @@ export class Ai {
   }
 }
 
+// ---- what the AI may write ----
+
+// AI text is shown, never acted on. Before it reaches a PR or the dashboard: no HTML, no images
+// or links (no tracking pixels, no phishing), and no @mentions (nobody gets pinged by the AI).
+export const safeText = (text: string): string => String(text ?? '')
+  .replace(/!\[[^\]]*\]\([^)]*\)/g, '')                  // images
+  .replace(/\[([^\]]*)\]\((?:[^)]*)\)/g, '$1')            // links: keep the words
+  .replace(/<[^>]*>/g, '')                                  // HTML
+  .replace(/(^|[^\w`])@(?=[\w-])/g, '$1@\u200b');            // @mention → not a mention
+
+// Code the AI suggests is only ever applied by a person (a one-click suggestion) or proposed in a
+// drift-fix PR, but either way teriac plans it next, and a plan can run code. So anything that can
+// run programs, read local files or change where code comes from is refused outright.
+const UNSAFE_CODE = [
+  /\bprovisioner\b/, /local-exec|remote-exec/, /\bdata\s+"external"/, /"external"/, /\bexternal\s*=/,
+  /\b(?:file|templatefile|filebase64|filemd5|filesha\d*|fileset|fileexists|pathexpand)\s*\(/,
+  /\bsource\s*=/, /\bversion\s*=/, /^\s*(?:module|provider|terraform|backend|data|required_providers)\b/m,
+  /\bdata\s+"http"/, /\bprogram\s*=/, /\bcommand\s*=/, /\binterpreter\s*=/,
+];
+export const unsafeCode = (code: string): string | null => {
+  if (code.split('\n').length > 40) return 'too long to suggest';
+  const hit = UNSAFE_CODE.find(re => re.test(code));
+  return hit ? `contains ${hit.source.replace(/\\[bsw]|[\\^$*+?()[\]{}|]/g, '').slice(0, 30)}` : null;
+};
+
 // Text cut to whole sentences (at most `n`) within `max` characters, cleaned of secrets.
 const sentence = (text: string, max: number, n = 1): string => {
   const t = oneLine(text, 2000).replace(/\s+/g, ' ');
@@ -384,7 +413,7 @@ const sentence = (text: string, max: number, n = 1): string => {
   return out || t.slice(0, max);
 };
 
-const oneLine = (s: string, max: number) => scanSecrets(String(s ?? '')).text.replace(/\r/g, '').trim().slice(0, max);
+const oneLine = (s: string, max: number) => safeText(scanSecrets(String(s ?? '')).text).replace(/\r/g, '').trim().slice(0, max);
 
 // ---- results ----
 

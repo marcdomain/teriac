@@ -111,6 +111,12 @@ export const aiDriftFix = async (ai: Ai, root: string, projectDir: string, proje
   const decisions = await ai.driftDecisions({ project, plan, addresses, files: [...files].map(([path, text]) => ({ path, text })) }, s);
   if (!decisions?.length) return fix;
   const before = new Map(files);
+  // Each adopt may only edit inside its own resource's block.
+  for (const d of decisions) {
+    const loc = locate(root, projectDir, d.address);
+    d.edits = d.edits.filter(e => loc && e.path === loc.file && e.startLine > loc.start && e.endLine < loc.end);
+    if (d.decision === 'adopt' && !d.edits.length) { d.decision = 'unsure'; d.why = `${d.why} (no safe code change inside its resource block)`; }
+  }
   const { skipped } = applyEdits(files, decisions.flatMap(d => d.edits));
   // An adopt whose edits didn't all apply is left to a person.
   for (const d of decisions) {

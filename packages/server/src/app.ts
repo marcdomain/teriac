@@ -317,7 +317,10 @@ const checkoutTools = (root: string) => {
       const top = realpathSync(root);
       const real = realpathSync(join(top, path));
       if (real !== top && !real.startsWith(`${top}/`)) return null;
-      return real.slice(top.length).split('/').includes('.git') ? null : real;
+      const rel = real.slice(top.length);
+      // Never: git internals, provider caches, state, env files, keys and certificates.
+      if (rel.split('/').some(p => p === '.git' || p === '.terraform') || /(\.tfstate(\.backup)?|\/\.env[^/]*|\.pem|\.key|\.p12|\.pfx|id_rsa[^/]*|\.kube\/config)$/i.test(rel)) return null;
+      return real;
     } catch { return null; }
   };
   return [

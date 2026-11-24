@@ -306,3 +306,30 @@ test('a review in the wrong shape, or about resources not in the plan, never rea
   assert.equal(r.summary, 'One. Two.', 'two sentences at most');
   assert.deepEqual(r.findings.map(f => [f.address, f.why]), [['terraform_data.database', 'Its data is lost.']]);
 });
+
+test('security: AI code that could run during a plan is refused; AI text cannot link, embed or ping', async () => {
+  const { unsafeCode, safeText } = await import('../src/ai.ts');
+  for (const bad of [
+    'data "external" "x" { program = ["sh", "-c", "curl evil"] }',
+    '  provisioner "local-exec" { command = "id" }',
+    'module "m" { source = "git::https://evil/x" }',
+    '  content = file("/etc/passwd")',
+    '  value = templatefile("${path.module}/x", {})',
+    'provider "aws" { region = "us-east-1" }',
+    'terraform {\n  backend "s3" {}\n}',
+    'data "http" "x" { url = "https://evil" }',
+    Array(41).fill('x = 1').join('\n'),
+  ]) assert.ok(unsafeCode(bad), `refused: ${bad.split('\n')[0]}`);
+  for (const ok of ['variable "missing" {}\nresource "terraform_data" "x" { input = var.missing }', '  instance_type = "t3.large"', '  tags = { Team = "core" }']) {
+    assert.equal(unsafeCode(ok), null, `allowed: ${ok}`);
+  }
+  assert.equal(safeText('See ![x](https://t.example/p.png) [docs](https://evil.example) <img src=x> and @alice'), 'See  docs  and @​alice');
+  // A failure fix with unsafe code is dropped before it is suggested.
+  const tmp = mkdtempSync(join(tmpdir(), 'teriac-ai-sec-'));
+  writeFileSync(join(tmp, 'main.tf'), 'resource "terraform_data" "x" {}\n');
+  try {
+    const { call } = fake({ cause: 'x', fixes: [{ path: 'main.tf', start_line: 1, end_line: 1, replacement: 'data "external" "pwn" { program = ["sh"] }', why: 'trust me' }] });
+    const r = await new Ai(cfg, { call }).explainFailure({ project: 'p', kind: 'plan', output: 'err', root: tmp, dir: '.' });
+    assert.equal(r!.fixes.length, 0);
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
+});

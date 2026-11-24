@@ -509,6 +509,19 @@ error output and the project's `.tf`, `.hcl` and `.tfvars` files. Values Terrafo
 replaced with `(sensitive value)` and the [secret scan](#leaked-secret-scan) always runs on what is
 sent, whatever `secret_scan` is set to. Anything from the repo is marked as data, not instructions.
 
+**What the AI can't do.** It only reads and writes text; nothing it says is ever run.
+- It can't plan, apply, approve, unlock or change any setting. Its suggested fixes are comment-only
+  reviews (never approvals) that a person must choose to commit, and teriac ignores comments written
+  by bots, so an AI answer containing a teriac command does nothing.
+- It can only raise a plan's risk, never lower it.
+- Code it suggests (fixes, drift-fix edits) is refused if it could run programs or reach outside when
+  planned: provisioners, `external` and `http` data sources, any new `data`, `module`, `provider` or
+  `backend` block, `source` or `version` changes, and file functions. Drift edits must stay inside
+  the drifted resource's own block.
+- `teriac ask` can read the PR's code and saved plans, never `.git`, `.terraform`, state files,
+  `.env` files, keys or certificates. Everything it reads is cleaned before it is sent.
+- Its text has links, images, HTML and @mentions removed before it is posted.
+
 **When it can't help.** A failed, timed-out or declined request just means no AI section: plans and
 applies carry on as usual. On Anthropic's API a declined request is retried on a fallback model in
 the same call. Dashboard requests are limited to 20 per person per 15 minutes. Every question,
