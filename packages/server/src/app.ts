@@ -1260,7 +1260,9 @@ export class App {
       const diffs = (await ctx.adapter.fileDiffs(ctx.repo, ctx.pr.number)).filter(d => inProject(d.path) && /\.(tf|hcl|tfvars)$/.test(d.path));
       if (!diffs.length) return null;
       const safety = this.safety(ctx);
-      const comments = await this.deps.ai!.reviewCode({ project: project.name, production: isProduction(project, safety.risk), diffs, root: ctx.root, dir: project.dir, patterns: safety.secretPatterns }, s);
+      const review = this.deps.store.getRun(runId)?.ai;
+      const known = review?.kind === 'review' ? review.findings.map(f => ({ address: f.address, title: f.title })) : [];
+      const comments = await this.deps.ai!.reviewCode({ project: project.name, production: isProduction(project, safety.risk), diffs, root: ctx.root, dir: project.dir, known, patterns: safety.secretPatterns }, s);
       if (!comments) return null;
       // Each comment once per PR: what was posted before (same file, line and title) is skipped.
       const key = `ai_code_posted:${ctx.repoKey}#${ctx.pr.number}`;
@@ -1360,9 +1362,11 @@ export class App {
       const code = this.aiFor(ctx, project, 'code');
       if (!s && !code) { out.push(`- \`${project.name}\`: AI reviews are off for this project`); continue; }
       if (!(await this.allowed(ctx, 'plan', user, project)).allowed) { out.push(`- \`${project.name}\`: 🚫 needs permission to plan it`); continue; }
-      const codeCount = code ? await this.aiCodeReview(ctx, project, run.id, true) : null;
-      const codeLine = codeCount === null ? [] : codeCount ? [`💬 AI code review: ${codeCount} comment${codeCount === 1 ? '' : 's'} on **Files changed**`] : ['💬 AI code review: nothing to flag in the code'];
-      if (!s) { out.push(`**\`${project.name}\`**`, '', ...codeLine, ''); continue; }
+      const codeReview = async () => {
+        const n = code ? await this.aiCodeReview(ctx, project, run.id, true) : null;
+        return n === null ? [] : n ? [`💬 AI code review: ${n} comment${n === 1 ? '' : 's'} on **Files changed**`] : ['💬 AI code review: nothing more to flag in the code'];
+      };
+      if (!s) { out.push(`**\`${project.name}\`**`, '', ...await codeReview(), ''); continue; }
       let plan: Record<string, any> | null = null;
       try { plan = run.planPath ? JSON.parse(readFileSync(`${run.planPath}.json`, 'utf-8')) : null; } catch { /* dropped */ }
       if (!plan) { out.push(`- \`${project.name}\`: its saved plan is gone; plan it again (\`${this.commandName} plan -p ${project.name}\`)`); continue; }
@@ -1374,7 +1378,7 @@ export class App {
       store.setRunReview(run.id, review, raiseRisk(ruled, review));
       const updated = store.getRun(run.id)!;
       await this.publishCheck(ctx, project, updated);
-      out.push(`**\`${project.name}\`**`, '', ...aiLines(updated), ...codeLine, '');
+      out.push(`**\`${project.name}\`**`, '', ...aiLines(updated), ...await codeReview(), '');
     }
     this.deps.store.audit({ repo: ctx.repoKey, pr: ctx.pr.number, user, action: 'ai_review', project: picked.map(p => p.name).join(',') || '*', allowed: true, reason: 'teriac review' });
     reply.say(out.join('\n'));

@@ -363,3 +363,18 @@ test('code review: diff lines are numbered; comments outside the diff, repeats a
     assert.match(body, /\(production\)/);
   } finally { rmSync(tmp, { recursive: true, force: true }); }
 });
+
+test('code review never repeats what the plan review said (the live force_destroy case)', async () => {
+  const { sameIssue } = await import('../src/ai.ts');
+  assert.ok(sameIssue('force_destroy enabled on bucket', 'force_destroy will delete all objects silently'));
+  assert.ok(sameIssue('SSH open to the internet', 'Port 22 SSH open to internet'));
+  assert.ok(!sameIssue('force_destroy enabled on bucket', 'Wildcard IAM action'));
+  const patch = '@@ -0,0 +1,3 @@\n+resource "aws_s3_bucket" "this" {\n+  force_destroy = true\n+}';
+  const { call, sent } = fake({ comments: [
+    { path: 'main.tf', line: 2, end_line: 2, severity: 'medium', title: 'force_destroy will delete all objects silently', body: 'x', suggestion: '' },
+    { path: 'main.tf', line: 1, end_line: 1, severity: 'high', title: 'Bucket has no encryption', body: 'y', suggestion: '' },
+  ] });
+  const r = (await new Ai(cfg, { call }).reviewCode({ project: 'p', production: false, diffs: [{ path: 'main.tf', patch }], known: [{ address: 'aws_s3_bucket.this', title: 'force_destroy enabled on bucket' }] }))!;
+  assert.deepEqual(r.map(c => c.title), ['Bucket has no encryption']);
+  assert.match(JSON.stringify(sent[0]), /Already reported by the plan review[^"]*force_destroy enabled on bucket \(aws_s3_bucket\.this\)/);
+});
