@@ -223,11 +223,13 @@ export class Ai {
     const seen = new Set<string>();
     if (typeof r.summary !== 'string' || !Array.isArray(r.findings)) { log.warn('ai answer had the wrong shape', { what: 'plan review' }); return null; }
     const findings = r.findings
-      .filter(f => f && typeof f.address === 'string' && typeof f.title === 'string' && typeof f.why === 'string' && SEVERITIES.includes(f.severity) && changed.has(f.address.replace(/^`|`$/g, '').trim()))
+      .filter(f => f && typeof f.address === 'string' && typeof f.title === 'string' && typeof f.why === 'string' && SEVERITIES.includes(f.severity))
+      .map(f => ({ ...f, address: f.address.replace(/^`|`$/g, '').trim() }))
+      .filter(f => changed.has(f.address))
       .filter(f => { const k = `${f.address}|${f.title.toLowerCase()}`; if (seen.has(k)) return false; seen.add(k); return true; })
       .sort((a, b) => SEVERITIES.indexOf(b.severity) - SEVERITIES.indexOf(a.severity))
       .slice(0, 8)
-      .map(f => ({ ...f, address: f.address.replace(/^`|`$/g, '').trim(), title: sentence(f.title, 70), why: sentence(f.why, 240) }));
+      .map(f => ({ ...f, title: sentence(f.title, 70), why: sentence(f.why, 240) }));
     return { kind: 'review', model: label(s), summary: sentence(r.summary, 400, 2), findings };
   }
 
