@@ -583,3 +583,17 @@ test('AI review timing: first reviews only the first plan; then `@teriac review`
     assert.equal(aiRequests.length, 0, 'command: never on its own');
   } finally { delete policy.ai; }
 });
+
+test('AI: teriac ask sends nothing from a project whose AI is off', async () => {
+  const policy = (app as any).deps.config.repos[0];
+  policy.projects.unshift({ match: 'envs/prod', ai: { enabled: false } });
+  try {
+    await comment(1, 'bob', 'teriac plan');
+    aiRequests.length = 0;
+    await comment(1, 'bob', 'teriac ask what changes?');
+    const sent = aiRequests.join('\n');
+    assert.ok(sent.includes('plan of envs/dev'), 'envs/dev is seen');
+    assert.ok(!sent.includes('plan of envs/prod'), 'envs/prod is not');
+    assert.match(sent, /AI is off for any others/);
+  } finally { policy.projects.shift(); }
+});

@@ -341,7 +341,7 @@ export class Ai {
     const messages: BetaMessageParam[] = [{
       role: 'user',
       content: [
-        'Answer the question about this pull request in a few short paragraphs of GitHub Markdown. Use the tools to look things up rather than guessing; say so when the answer is not in what you can see. Never claim something was approved, applied or is safe to apply: people decide that.',
+        'Answer the question about this pull request directly, in under 150 words of plain GitHub Markdown: no headings, no horizontal rules, short bullets only when listing several items. Lead with the answer. Mention only what matters for the question; skip routine, harmless changes. Use the tools to look things up rather than guessing, and say so when the answer is not in what you can see. Never claim something was approved, applied or is safe to apply: people decide that.',
         untrusted('context', clean(cut(ctx.summary, 100_000), [], patterns)),
         untrusted('question', question.slice(0, 2000)),
       ].join('\n\n'),

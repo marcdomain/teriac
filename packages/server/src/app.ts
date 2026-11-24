@@ -311,13 +311,17 @@ const runTools = (runs: Run[]) => {
 };
 
 // Read-only tools over the PR's checkout: list a folder, read a file (never outside it, never .git).
-const checkoutTools = (root: string) => {
+// `dirs`: the project folders it may look in (projects with AI off stay out).
+const checkoutTools = (root: string, dirs: string[]) => {
   const inside = (path: string): string | null => {
     try {
       const top = realpathSync(root);
       const real = realpathSync(join(top, path));
       if (real !== top && !real.startsWith(`${top}/`)) return null;
       const rel = real.slice(top.length);
+      const relDir = rel.replace(/^\//, '');
+      // A project folder, something inside one, or a parent folder on the way to one (to list it).
+      if (!dirs.some(d => d === '.' || relDir === d || relDir.startsWith(`${d}/`) || d.startsWith(relDir ? `${relDir}/` : ''))) return null;
       // Never: git internals, provider caches, state, env files, keys and certificates.
       if (rel.split('/').some(p => p === '.git' || p === '.terraform') || /(\.tfstate(\.backup)?|\/\.env[^/]*|\.pem|\.key|\.p12|\.pfx|id_rsa[^/]*|\.kube\/config)$/i.test(rel)) return null;
       return real;
@@ -331,7 +335,9 @@ const checkoutTools = (root: string) => {
       run: ({ dir }: { dir: string }) => {
         const real = inside(dir);
         if (!real) return `${dir}: not found`;
-        return readdirSync(real, { withFileTypes: true }).filter(d => d.name !== '.git' && d.name !== '.terraform').slice(0, 300).map(d => `${d.name}${d.isDirectory() ? '/' : ''}`).join('\n');
+        const top = realpathSync(root);
+        return readdirSync(real, { withFileTypes: true }).filter(d => d.name !== '.git' && d.name !== '.terraform' && inside(join(real.slice(top.length), d.name)))
+          .slice(0, 300).map(d => `${d.name}${d.isDirectory() ? '/' : ''}`).join('\n') || '(nothing you can see here)';
       },
     },
     {
@@ -340,7 +346,8 @@ const checkoutTools = (root: string) => {
       schema: { type: 'object', properties: { path: { type: 'string' } }, required: ['path'], additionalProperties: false },
       run: ({ path }: { path: string }) => {
         const real = inside(path);
-        if (!real || !statSync(real).isFile()) return `${path}: not found`;
+        // Only files inside a visible project's folder, not the folders on the way.
+        if (!real || !statSync(real).isFile() || !dirs.some(d => d === '.' || real.slice(realpathSync(root).length + 1).startsWith(`${d}/`))) return `${path}: not found`;
         return readFileSync(real, 'utf-8').slice(0, 60_000).split('\n').map((l, i) => `${String(i + 1).padStart(4)}| ${l}`).join('\n');
       },
     },
@@ -1267,11 +1274,13 @@ export class App {
     for (const { p } of on) if ((await this.allowed(ctx, 'plan', user, p)).allowed) { may = true; break; }
     if (!may) return reply.say('🚫 Asking needs permission to plan a project in this repo.');
     const settings = on[0].s;
-    const runs = this.deps.store.latestRuns(ctx.repoKey, ctx.pr.number, 'plan').filter(r => r.headSha === ctx.pr.headSha);
+    // Only projects with `ask` on are seen: their plans, and the files in their folders.
+    const visible = new Set(on.map(x => x.p.name));
+    const runs = this.deps.store.latestRuns(ctx.repoKey, ctx.pr.number, 'plan').filter(r => r.headSha === ctx.pr.headSha && visible.has(r.project));
     const summary = [`Pull request #${ctx.pr.number}: ${ctx.pr.title} (by ${ctx.pr.author}, ${ctx.pr.headRef} → ${ctx.pr.baseRef})`,
-      `Projects in the repo: ${ctx.projects.map(p => `${p.name} (${p.dir})`).join(', ') || 'none'}`,
+      `Projects you can see (AI is off for any others): ${on.map(x => `${x.p.name} (${x.p.dir})`).join(', ')}`,
       ...runs.map(r => runDigest(r))].join('\n\n');
-    const answer = await ai.ask(question, { summary, tools: [...runTools(runs), ...checkoutTools(ctx.root)] }, this.safety(ctx).secretPatterns, settings);
+    const answer = await ai.ask(question, { summary, tools: [...runTools(runs), ...checkoutTools(ctx.root, on.map(x => x.p.dir))] }, this.safety(ctx).secretPatterns, settings);
     this.deps.store.audit({ repo: ctx.repoKey, pr: ctx.pr.number, user, action: 'ai_ask', project: '*', allowed: true, reason: question.slice(0, 300) });
     reply.say(answer ? `🤖 **AI answer** <sub>${label(settings)} · advisory, check it yourself</sub>\n\n${answer}` : '🤖 No AI answer this time (the request failed or was declined). Try rephrasing, or ask again later.');
   }
