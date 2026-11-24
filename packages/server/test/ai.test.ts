@@ -132,13 +132,17 @@ test('policy drafts: rules are built and checked against their own tests', () =>
   assert.equal(d.tests[3].error, 'no such rule');
 });
 
-test('teriac ask: free text, every line, and listed in help when on', () => {
-  const r = parseCommand('teriac ask why is the subnet replaced?\nand is it safe?', ['teriac']);
+test('teriac ask: needs the colon; free text, every line; listed in help when on', () => {
+  const r = parseCommand('teriac ask: why is the subnet replaced?\nand is it safe?', ['teriac']);
   assert.ok(r?.ok);
   assert.equal(r.ok && r.command.question, 'why is the subnet replaced?\nand is it safe?');
-  const empty = parseCommand('@teriac ask', ['teriac']);
-  assert.ok(empty && !empty.ok && /Ask a question/.test(empty.error));
-  assert.match(helpText('teriac', false, true), /teriac ask <question>/);
+  const at = parseCommand('@teriac ask:is it risky?', ['teriac']);
+  assert.ok(at?.ok && at.command.question === 'is it risky?', 'no space after the colon is fine');
+  const noColon = parseCommand('@teriac ask is it risky?', ['teriac']);
+  assert.ok(noColon && !noColon.ok && /Put a colon after `ask`/.test(noColon.error));
+  const empty = parseCommand('@teriac ask:', ['teriac']);
+  assert.ok(empty && !empty.ok && /Ask a question after the colon/.test(empty.error));
+  assert.match(helpText('teriac', false, true), /teriac ask: <question>/);
   assert.doesNotMatch(helpText('teriac', false, false), /ask/);
 });
 

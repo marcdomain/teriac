@@ -62,7 +62,7 @@ Set up the GitHub App like this:
 | `teriac apply -p <project>` | Apply one project. The Apply button does the same |
 | `teriac unlock` | Release this PR's locks and delete its saved plans and live output (`-p <project>` for one). Closing or merging the PR does the same |
 | `teriac cancel` | Stop this PR's running plans and drop its queued work. The PR author, or anyone with write access or more |
-| `teriac ask <question>` | An AI answer about this PR's plans and code, when [AI help](#ai-help) is on. Needs `plan` on a project |
+| `teriac ask: <question>` | An AI answer about this PR's plans and code, when [AI help](#ai-help) is on. Needs `plan` on a project |
 
 `-p` and `-d` take a name or a glob: `teriac plan -p 'live/prod/*'`. A repo that applies one
 project at a time refuses an apply whose glob matches more than one.
@@ -454,7 +454,7 @@ labelled with the model's name.
 | `review` | A two-to-four sentence summary in each plan's comment and check run, plus findings the rules can miss: forced replacements and why, data that could be lost, access that gets wider, things that become public, protections turned off. Findings also show on the code in **Files changed** |
 | `fix` | When a plan or apply fails: the likely cause, and the smallest code fix, posted as GitHub **suggested changes** (one click to commit) and shown in the comment |
 | `drift` | On drift-fix PRs (`fix_pr: true`), for what the mechanical fixer can't edit: **adopt** (the code is updated to match), **revert** (left alone, so applying puts it back) or **unsure** (left to a person) |
-| `ask` | `teriac ask <question>` on a PR, and **Ask about this run** on the dashboard. The AI can read the PR's code and saved plans, nothing else |
+| `ask` | `teriac ask: <question>` on a PR, and **Ask about this run** on the dashboard. The AI can read the PR's code and saved plans, nothing else |
 | `policy` | **Draft a policy with AI** on the dashboard's Guardrails page (admins): plain English in, `policies.rules` YAML out, checked against test cases it writes. You paste it into `repos.yaml` yourself |
 
 ```yaml

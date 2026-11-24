@@ -530,13 +530,13 @@ test('AI: the plan review is in the comment and the check, raises the risk, and 
 
 test('AI: teriac ask answers using the read-only tools, and is audited', async () => {
   aiRequests.length = 0;
-  await comment(1, 'bob', 'teriac ask what does envs/dev create?');
+  await comment(1, 'bob', 'teriac ask: what does envs/dev create?');
   assert.match(gh.lastReply(), /🤖 \*\*AI answer\*\*[\s\S]*The file says: a terraform_data resource\./);
   assert.equal(aiRequests.length, 2, 'one tool call, then the answer');
   assert.ok(store.searchAudit({}).items.some(a => a.action === 'ai_ask' && a.reason.includes('what does envs/dev create?')));
   // mallory has no permission to plan anything: no AI request is made.
   aiRequests.length = 0;
-  await comment(1, 'mallory', 'teriac ask anything');
+  await comment(1, 'mallory', 'teriac ask: anything');
   assert.match(gh.lastReply(), /Asking needs permission to plan/);
   assert.equal(aiRequests.length, 0);
 });
@@ -590,7 +590,7 @@ test('AI: teriac ask sends nothing from a project whose AI is off', async () => 
   try {
     await comment(1, 'bob', 'teriac plan');
     aiRequests.length = 0;
-    await comment(1, 'bob', 'teriac ask what changes?');
+    await comment(1, 'bob', 'teriac ask: what changes?');
     const sent = aiRequests.join('\n');
     assert.ok(sent.includes('plan of envs/dev'), 'envs/dev is seen');
     assert.ok(!sent.includes('plan of envs/prod'), 'envs/prod is not');

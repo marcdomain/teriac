@@ -341,7 +341,12 @@ export class Ai {
     const messages: BetaMessageParam[] = [{
       role: 'user',
       content: [
-        'Answer the question about this pull request directly, in under 150 words of plain GitHub Markdown: no headings, no horizontal rules, short bullets only when listing several items. Lead with the answer. Mention only what matters for the question; skip routine, harmless changes. Use the tools to look things up rather than guessing, and say so when the answer is not in what you can see. Never claim something was approved, applied or is safe to apply: people decide that.',
+        [
+          'Answer the question about this pull request in GitHub Markdown. Lead with the answer in the first sentence.',
+          'Length follows the question: a narrow question gets a direct answer, usually under 150 words; a broad one (every change, several projects) can take up to about 400. Every sentence must earn its place: no restating the question, no listing routine or harmless changes, no generic advice, no closing summary.',
+          'Make it easy to scan: short bullets when there are several points, resource addresses and values in code spans, the one or two things that matter most in bold. No headings, no horizontal rules, no tables.',
+          'Use the tools to look things up rather than guessing, and say so when the answer is not in what you can see. Never claim something was approved, applied or is safe to apply: people decide that.',
+        ].join(' '),
         untrusted('context', clean(cut(ctx.summary, 100_000), [], patterns)),
         untrusted('question', question.slice(0, 2000)),
       ].join('\n\n'),

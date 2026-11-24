@@ -3,7 +3,7 @@
 //   teriac apply [-p project] [-d dir] [-w workspace]
 //   teriac unlock [-p project]
 //   teriac help
-//   teriac ask <question>     (AI answer, when TERIAC_AI_PROVIDER is set)
+//   teriac ask: <question>    (AI answer, when TERIAC_AI_PROVIDER is set; the colon marks where the question starts)
 //   teriac review [-p project] (AI review of the latest plans)
 // Terraform commands on one project (-p is required):
 //   teriac state list [address]... | state show <address> | state rm <address>... | state mv <from> <to>
@@ -77,16 +77,20 @@ export const parseCommand = (body: string, names: string[]): ParseResult => {
   const name = tokens[0]?.replace(/^@/, '').toLowerCase();
   if (!name || !names.includes(name)) return null;
 
-  const verb = (tokens[1] || 'help').toLowerCase() as Verb;
+  // `ask:` (the colon ends the command; the rest is the question).
+  const askVerb = /^ask:/i.test(tokens[1] ?? '');
+  const verb = (askVerb ? 'ask' : (tokens[1] || 'help').toLowerCase()) as Verb;
   if (!VERBS.includes(verb)) {
     return { ok: false, error: `Unknown command \`${tokens[1]}\`. Try \`${name} help\`.` };
   }
 
   const command: Command = { verb, destroy: false, override: false, targets: [], extraArgs: [] };
   if (verb === 'ask') {
+    const example = `\`${name} ask: why is the subnet replaced?\``;
+    if (!askVerb) return { ok: false, error: `Put a colon after \`ask\`, then your question: ${example}` };
     // Free text: the rest of the comment, not parsed as flags.
-    const question = body.trim().replace(/^@?\S+\s+ask\b/i, '').trim();
-    if (!question) return { ok: false, error: `Ask a question: \`${name} ask why is the subnet replaced?\`` };
+    const question = body.trim().replace(/^@?\S+\s+ask:/i, '').trim();
+    if (!question) return { ok: false, error: `Ask a question after the colon: ${example}` };
     return { ok: true, command: { ...command, question: question.slice(0, 2000) } };
   }
   let first = 2;
@@ -255,7 +259,7 @@ export const helpText = (name = 'teriac', oneProjectPerApply = false, ask = fals
   ...(oneProjectPerApply ? [] : [`| \`${name} apply\` | Apply every planned project whose requirements are met |`]),
   `| \`${name} apply -p <project>\` | Apply one project${oneProjectPerApply ? ' (this server applies one project at a time)' : ''} |`,
   `| \`${name} unlock\` | Release this PR's locks and discard its plans |`,
-  ...(ask ? [`| \`${name} review\` | An AI review of this PR's latest plans (\`-p <project>\` for one) |`, `| \`${name} ask <question>\` | An AI answer about this PR's plans and code (advisory) |`] : []),
+  ...(ask ? [`| \`${name} review\` | An AI review of this PR's latest plans (\`-p <project>\` for one) |`, `| \`${name} ask: <question>\` | An AI answer about this PR's plans and code (advisory) |`] : []),
   `| \`${name} cancel\` | Drop this PR's queued plans and applies, and stop running plans (running applies finish) |`,
   `| \`${name} state list -p <project> [address]\` | Resources in the state |`,
   `| \`${name} state show -p <project> <address>\` | One resource's attributes (sensitive values hidden) |`,
