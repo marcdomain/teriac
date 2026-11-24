@@ -29,6 +29,9 @@ const fakeAi: AiCall = async (params) => {
   aiRequests.push(JSON.stringify(params));
   const reply = (content: unknown[], stop: string) => ({ id: 'm', type: 'message', role: 'assistant', model: params.model, content, stop_reason: stop, stop_details: null, usage: { input_tokens: 1, output_tokens: 1 } }) as any;
   const user = JSON.stringify(params.messages);
+  if (params.output_config?.format && user.includes('Review the code changes')) {
+    return reply([{ type: 'text', text: JSON.stringify({ comments: [{ path: 'envs/dev/main.tf', line: 1, end_line: 1, severity: 'high', title: 'Input never set', body: 'terraform_data.x has no input. Set one.', suggestion: 'resource "terraform_data" "x" { input = "v1" }' }] }) }], 'end_turn');
+  }
   if (params.output_config?.format) {
     const json = user.includes('Review this Terraform plan')
       ? { summary: 'Replaces the database and deletes the legacy queue.', findings: aiFinding ? [{ address: 'terraform_data.database', severity: 'high', title: 'Database is replaced', why: 'Its data is lost unless restored.' }] : [] }
@@ -160,7 +163,7 @@ repos:
   store = new Store(':memory:');
   gh = new FakeGitHub();
   // A server secret in the env must never reach terraform.
-  const ai = new Ai({ provider: 'anthropic', model: 'claude-opus-5-5', effort: 'medium', features: ['review', 'fix', 'drift', 'policy', 'ask'], timeoutMs: 60_000 }, { call: fakeAi });
+  const ai = new Ai({ provider: 'anthropic', model: 'claude-opus-5-5', effort: 'medium', features: ['review', 'code', 'fix', 'drift', 'policy', 'ask'], timeoutMs: 60_000 }, { call: fakeAi });
   app = new App({ config, store, resolver, ai, env: { ...process.env, TERIAC_GITHUB_PRIVATE_KEY: 'super-secret-key' } });
   gh.prs.set(1, pr(1, 'bob'));
   gh.files.set(1, ['envs/dev/main.tf', 'envs/prod/main.tf']);
@@ -596,4 +599,30 @@ test('AI: teriac ask sends nothing from a project whose AI is off', async () => 
     assert.ok(!sent.includes('plan of envs/prod'), 'envs/prod is not');
     assert.match(sent, /AI is off for any others/);
   } finally { policy.projects.shift(); }
+});
+
+test('AI code review: inline comments with a suggestion, posted once per PR, and again only via teriac review', async () => {
+  const reviews: { body: string; suggestions: any[] }[] = [];
+  (gh as any).fileDiffs = async () => [{ path: 'envs/dev/main.tf', patch: '@@ -0,0 +1 @@\n+resource "terraform_data" "x" {}' }, { path: 'README.md', patch: '@@ -0,0 +1 @@\n+hi' }];
+  (gh as any).suggestChanges = async (_r: unknown, _n: number, _sha: string, body: string, suggestions: any[]) => { reviews.push({ body, suggestions }); return true; };
+  try {
+    gh.prs.set(11, pr(11, 'bob'));
+    gh.files.set(11, ['envs/dev/main.tf']);
+    await comment(1, 'bob', 'teriac unlock');
+    await comment(9, 'bob', 'teriac unlock');   // earlier tests hold envs/dev
+    await comment(11, 'bob', 'teriac plan -p envs/dev');
+    assert.equal(reviews.length, 1, 'one review with the inline comments');
+    assert.match(reviews[0].body, /🤖 \*\*AI code review\*\* of `envs\/dev` · 1 comment/);
+    assert.deepEqual(reviews[0].suggestions.map(x => [x.path, x.startLine, x.replacement]), [['envs/dev/main.tf', 1, 'resource "terraform_data" "x" { input = "v1" }']]);
+    assert.match(reviews[0].suggestions[0].note, /\*\*Input never set\*\*: terraform_data\.x has no input/);
+    assert.match(gh.sticky.get(11)!, /💬 \*\*AI code review:\*\* 1 comment on \*\*Files changed\*\*/, 'the PR comment only points to it');
+    const sent = aiRequests.join('\n');
+    assert.ok(!sent.includes('README.md'), 'only the project\'s Terraform files are reviewed');
+    await comment(11, 'bob', 'teriac plan -p envs/dev');
+    assert.equal(reviews.length, 1, 'the same comment is not posted again on the next push');
+    const run = store.latestRuns('github.com/acme/infra', 11, 'plan').find(r => r.project === 'envs/dev')!;
+    assert.equal(run.aiCode?.comments.length, 1);
+    await comment(11, 'bob', 'teriac review -p envs/dev');
+    assert.match(gh.lastReply(), /💬 AI code review: 1 comment on \*\*Files changed\*\*/);
+  } finally { delete (gh as any).fileDiffs; delete (gh as any).suggestChanges; }
 });

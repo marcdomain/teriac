@@ -177,6 +177,18 @@ const SEV: Record<string, string> = { critical: '🔴', high: '🔴', medium: '�
 // The AI's part of a run (TERIAC_AI_PROVIDER), always labelled. `brief` (the PR comment): a
 // review shows only when it found something that matters, with at most five findings, and a
 // fix already posted on the code is a pointer, not a copy. The check run and dashboard get it all.
+// The AI code review in the PR comment: one line when its comments are on the code, the
+// important ones listed when they couldn't be posted inline; all of them on the check run.
+export const aiCodeLines = (run?: Run, opts: { brief?: boolean } = {}): string[] => {
+  const code = run?.aiCode;
+  if (!code) return [];
+  const shown = opts.brief ? code.comments.filter(important) : code.comments;
+  if (!shown.length) return [];
+  if (opts.brief && code.posted) return [`💬 **AI code review:** ${shown.length} comment${shown.length === 1 ? '' : 's'} on **Files changed** <sub>${code.model} · advisory</sub>`, ''];
+  return [`💬 **AI code review** <sub>${code.model} · advisory, check it yourself</sub>`, '',
+    ...shown.map(c => `- ${SEV[c.severity] ?? '🟡'} **${c.title}** · \`${c.path}:${c.startLine}${c.endLine > c.startLine ? `-${c.endLine}` : ''}\` · ${c.body}`), ''];
+};
+
 export const aiLines = (run?: Run, opts: { brief?: boolean } = {}): string[] => {
   const ai = run?.ai;
   if (!ai) return [];
@@ -380,7 +392,7 @@ export const renderComment = (input: CommentInput): string => {
     for (const w of v.warnings ?? []) lines.push(`> [!WARNING]\n> ${w}`, '');
     if (v.plan?.secrets?.length) lines.push(`> [!CAUTION]\n> ${secretNote(v.plan.secrets)}`, '');
     if (v.plan?.status === 'success' && hasRisk(v.plan)) lines.push(riskLine(v.plan), '');
-    lines.push(...aiLines(v.plan, { brief: true }));
+    lines.push(...aiLines(v.plan, { brief: true }), ...aiCodeLines(v.plan, { brief: true }));
     const pol = policyOf(v.plan);
     if (pol && pol.mode !== 'off') {
       if (pol.findings.length) {
@@ -558,7 +570,7 @@ export const renderCheck = (projectName: string, run: Run, blockers: string[] | 
     if (outs) summary.push('', '**Outputs:**', fence(tail(outs, 4000)));
   }
   if (ok && hasRisk(run)) summary.push('', riskLine(run));
-  const ai = aiLines(run);
+  const ai = [...aiLines(run), ...aiCodeLines(run)];
   if (ai.length) summary.push('', ...ai);
   if (run.secrets?.length) summary.push('', secretNote(run.secrets));
   const pol = policyOf(run);

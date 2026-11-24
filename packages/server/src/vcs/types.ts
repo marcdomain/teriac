@@ -85,8 +85,11 @@ export interface Annotation {
   message: string;
 }
 
-// A replacement for lines start..end (1-based, inclusive) of a file at the PR's head.
-export interface Suggestion { path: string; startLine: number; endLine: number; replacement: string; note: string }
+// A note on lines start..end (1-based, inclusive) of a file at the PR's head; with `replacement`,
+// a suggested change that can be committed in one click.
+export interface Suggestion { path: string; startLine: number; endLine: number; replacement?: string; note: string }
+// A changed file and its unified diff (absent for binary or very large files).
+export interface FileDiff { path: string; patch: string | null }
 
 export interface CloneAuth {
   url: string;
@@ -147,4 +150,6 @@ export interface VcsAdapter {
   // Suggested changes on the PR's code, in one review (GitHub: one-click "Commit suggestion").
   // False when the platform refuses them (a line outside the PR's diff, say).
   suggestChanges?(repo: Repo, number: number, sha: string, body: string, suggestions: Suggestion[]): Promise<boolean>;
+  // The PR's changed files with their diffs (for the AI code review).
+  fileDiffs?(repo: Repo, number: number): Promise<FileDiff[]>;
 }

@@ -233,6 +233,47 @@ export class Ai {
     return { kind: 'review', model: label(s), summary: sentence(r.summary, 400, 2), findings };
   }
 
+  // ---- code review: inline comments on the PR's Terraform diff ----
+
+  // `root`/`dir`: the checkout, so the whole project is read for context (variables, references).
+  async reviewCode(input: { project: string; production: boolean; diffs: { path: string; patch: string | null }[]; root?: string; dir?: string; patterns?: SecretPattern[] }, s: AiSettings = this.defaults): Promise<CodeComment[] | null> {
+    const files = input.diffs.filter(d => d.patch).map(d => ({ path: d.path, ...diffLines(d.patch!) }));
+    if (!files.length) return null;
+    const view = files.map(f => untrusted(`diff ${f.path}`, clean(cut(f.view, 40_000), [], input.patterns))).join('\n\n');
+    const context = input.root && input.dir ? projectFiles(input.root, input.dir, 100_000) : [];
+    const user = [
+      `Review the code changes of project \`${input.project}\`${input.production ? ' (production)' : ''} as a senior infrastructure engineer would before approving. Lines are numbered on the new side ("12 +" added, "12  " unchanged context, "   -" removed).`,
+      'Comment only on problems a reviewer must fix or consciously accept: security (public access, 0.0.0.0/0, wildcard IAM actions or principals, encryption or logging off, secrets or keys hard-coded in code), things that will break (wrong references, types, missing required arguments, invalid values), data safety (prevent_destroy or deletion protection removed, lifecycle ignore_changes hiding real drift), and costly or surprising choices (huge instance sizes, unbounded counts). Comment on added lines, or on context lines only when the change causes the problem.',
+      'Never comment on style, formatting, naming, ordering, missing comments, tags, or anything a linter would catch; never praise; never repeat the same point on several lines. At most 8 comments; none is the right answer for a clean change.',
+      'Each comment: path; line (and end_line for a range, else the same line) on the new side; severity (critical, high, medium, low as in a plan review); title under 8 words; body of one or two sentences saying what is wrong and what to do. suggestion: the replacement for lines line..end_line when the fix is a small, certain edit to those exact lines, otherwise an empty string.',
+      'Before commenting, check the claim against the whole project below (variable definitions, defaults, other resources and modules): a comment that the full code proves wrong is worse than none. Comments may only point at lines in the diffs.',
+      view,
+      ...context.map(f => untrusted(`project file ${f.path} (for reference)`, clean(f.text, [], input.patterns))),
+    ].join('\n\n');
+    const r = await this.json<{ comments: { path: string; line: number; end_line: number; severity: Severity; title: string; body: string; suggestion: string }[] }>('code review', user, obj({
+      comments: { type: 'array', items: obj({ path: str, line: { type: 'integer' }, end_line: { type: 'integer' }, severity: sev, title: str, body: str, suggestion: str }) },
+    }), s);
+    if (!r || !Array.isArray(r.comments)) return null;
+    const byPath = new Map(files.map(f => [f.path, f.lines]));
+    const seen = new Set<string>();
+    return r.comments
+      .filter(c => c && typeof c.path === 'string' && SEVERITIES.includes(c.severity) && Number.isInteger(c.line))
+      .map(c => ({ ...c, end_line: Number.isInteger(c.end_line) && c.end_line >= c.line ? c.end_line : c.line }))
+      // Every line of the range must be in the diff, or GitHub refuses the whole review.
+      .filter(c => { const lines = byPath.get(c.path); if (!lines) return false; for (let n = c.line; n <= c.end_line; n++) if (!lines.has(n)) return false; return true; })
+      .filter(c => { const k = `${c.path}:${c.line}`; if (seen.has(k)) return false; seen.add(k); return true; })
+      .sort((a, b) => SEVERITIES.indexOf(b.severity) - SEVERITIES.indexOf(a.severity))
+      .slice(0, 8)
+      .map(c => {
+        const suggestion = c.suggestion?.trim() ? scanSecrets(c.suggestion.replace(/\n+$/, '')).text : '';
+        return {
+          path: c.path, startLine: c.line, endLine: c.end_line, severity: c.severity,
+          title: sentence(c.title, 70), body: sentence(c.body, 300, 2),
+          ...(suggestion && !unsafeCode(suggestion) ? { suggestion } : {}),
+        };
+      });
+  }
+
   // ---- 2. failed runs ----
 
   async explainFailure(input: { project: string; kind: 'plan' | 'apply'; output: string; root: string; dir: string; sensitive?: string[]; patterns?: SecretPattern[] }, s: AiSettings = this.defaults): Promise<FailureHelp | null> {
@@ -423,6 +464,26 @@ const oneLine = (s: string, max: number) => safeText(scanSecrets(String(s ?? '')
 // ---- results ----
 
 export interface AiFinding { address: string; severity: Severity; title: string; why: string }
+// An inline comment on the PR's code (new-side lines), with an optional one-click suggestion.
+export interface CodeComment { path: string; startLine: number; endLine: number; severity: Severity; title: string; body: string; suggestion?: string }
+
+// A unified diff as numbered lines for the AI, and the new-side lines GitHub accepts comments on.
+export const diffLines = (patch: string): { view: string; lines: Set<number> } => {
+  const out: string[] = [];
+  const lines = new Set<number>();
+  let n = 0;
+  for (const raw of patch.split('\n')) {
+    const h = /^@@ -\d+(?:,\d+)? \+(\d+)(?:,\d+)? @@/.exec(raw);
+    if (h) { n = Number(h[1]); out.push(raw); continue; }
+    if (raw.startsWith('\\')) continue;            // "\ No newline at end of file"
+    if (raw.startsWith('-')) { out.push(`     - ${raw.slice(1)}`); continue; }
+    const added = raw.startsWith('+');
+    out.push(`${String(n).padStart(4)} ${added ? '+' : ' '} ${raw.slice(1)}`);
+    lines.add(n);
+    n++;
+  }
+  return { view: out.join('\n'), lines };
+};
 export interface PlanReview { kind: 'review'; model: string; summary: string; findings: AiFinding[] }
 export interface CodeFix { path: string; startLine: number; endLine: number; replacement: string; why: string }
 export interface FailureHelp { kind: 'fix'; model: string; cause: string; fixes: CodeFix[]; posted?: boolean }  // posted: as suggested changes on the code

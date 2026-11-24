@@ -46,7 +46,7 @@ one clear comment, and applies when someone comments `teriac apply`:
 - **Terragrunt and OpenTofu built in:** dependencies run in order, and only the affected units run.
 - **Drift:** scheduled checks that name who changed what, alerts in Slack, Teams, Discord or Google Chat, and optional fix PRs.
 - **Dashboard:** runs, locks, drift, the audit log, guardrails, and delivery metrics (PR to applied, failure rate, time to fix), plus a weekly summary in chat.
-- **AI help (optional):** a plain-English review in every plan comment, one-click fixes for failed runs, drift decisions, `teriac ask` and policy drafts, from Claude on Anthropic's API, Bedrock, Vertex AI or Foundry. Advisory only.
+- **AI help (optional):** a plain-English review of every plan, inline code review with one-click suggestions, one-click fixes for failed runs, drift decisions, `teriac ask` and policy drafts, from Claude on Anthropic's API, Bedrock, Vertex AI or Foundry. Advisory only.
 - **Easy to run:** a Helm chart or one Docker image (signed, amd64 and arm64), with scheduled database backups to S3, GCS or Azure.
 
 ```sh

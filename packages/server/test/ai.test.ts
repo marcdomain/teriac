@@ -30,7 +30,7 @@ test('config: off by default; provider, effort and features are checked', () => 
   assert.equal(loadAiConfig({}), undefined);
   assert.equal(loadAiConfig({ TERIAC_AI_PROVIDER: 'off' }), undefined);
   const c = loadAiConfig({ TERIAC_AI_PROVIDER: 'anthropic' })!;
-  assert.deepEqual([c.model, c.effort, c.features.length], ['claude-opus-5-5', 'medium', 5]);
+  assert.deepEqual([c.model, c.effort, c.features.length], ['claude-opus-5-5', 'medium', 6]);
   assert.equal(loadAiConfig({ TERIAC_AI_PROVIDER: 'bedrock', AWS_REGION: 'eu-west-1' })!.model, 'anthropic.claude-opus-5-5');
   assert.deepEqual(loadAiConfig({ TERIAC_AI_PROVIDER: 'anthropic', TERIAC_AI_FEATURES: 'review, ask' })!.features, ['review', 'ask']);
   assert.throws(() => loadAiConfig({ TERIAC_AI_PROVIDER: 'openai' }), /must be one of anthropic, bedrock, vertex, foundry/);
@@ -335,5 +335,31 @@ test('security: AI code that could run during a plan is refused; AI text cannot 
     const { call } = fake({ cause: 'x', fixes: [{ path: 'main.tf', start_line: 1, end_line: 1, replacement: 'data "external" "pwn" { program = ["sh"] }', why: 'trust me' }] });
     const r = await new Ai(cfg, { call }).explainFailure({ project: 'p', kind: 'plan', output: 'err', root: tmp, dir: '.' });
     assert.equal(r!.fixes.length, 0);
+  } finally { rmSync(tmp, { recursive: true, force: true }); }
+});
+
+test('code review: diff lines are numbered; comments outside the diff, repeats and unsafe suggestions are dropped', async () => {
+  const { diffLines } = await import('../src/ai.ts');
+  const patch = '@@ -1,3 +1,4 @@\n resource "aws_s3_bucket" "b" {\n-  acl = "private"\n+  acl = "public-read"\n+  force_destroy = true\n }';
+  const d = diffLines(patch);
+  assert.deepEqual([...d.lines], [1, 2, 3, 4]);
+  assert.match(d.view, /   2 \+   acl = "public-read"/);
+  assert.match(d.view, /     -   acl = "private"/);
+  const tmp = mkdtempSync(join(tmpdir(), 'teriac-ai-code-'));
+  mkdirSync(join(tmp, 'live'), { recursive: true });
+  writeFileSync(join(tmp, 'live/variables.tf'), 'variable "env" { default = "prod" }\n');
+  try {
+    const { call, sent } = fake({ comments: [
+      { path: 'live/main.tf', line: 2, end_line: 2, severity: 'critical', title: 'Bucket made public', body: 'public-read exposes every object. Keep it private and serve through CloudFront.', suggestion: '  acl = "private"' },
+      { path: 'live/main.tf', line: 2, end_line: 2, severity: 'high', title: 'Bucket made public', body: 'repeat', suggestion: '' },
+      { path: 'live/main.tf', line: 9, end_line: 9, severity: 'high', title: 'Not in the diff', body: 'x', suggestion: '' },
+      { path: 'live/main.tf', line: 3, end_line: 3, severity: 'medium', title: 'force_destroy on', body: 'A destroy would delete every object.', suggestion: '  provisioner "local-exec" { command = "x" }' },
+      { path: 'other/x.tf', line: 1, end_line: 1, severity: 'high', title: 'Other file', body: 'x', suggestion: '' },
+    ] });
+    const r = (await new Ai(cfg, { call }).reviewCode({ project: 'live', production: true, diffs: [{ path: 'live/main.tf', patch }], root: tmp, dir: 'live' }))!;
+    assert.deepEqual(r.map(c => [c.startLine, c.title, c.suggestion ?? null]), [[2, 'Bucket made public', '  acl = "private"'], [3, 'force_destroy on', null]], 'unsafe suggestion dropped, comment kept');
+    const body = JSON.stringify(sent[0]);
+    assert.match(body, /variable \\"env\\"/, 'the whole project is sent for context');
+    assert.match(body, /\(production\)/);
   } finally { rmSync(tmp, { recursive: true, force: true }); }
 });

@@ -3,8 +3,8 @@
 // config loaders don't pull in the policy engine.
 export type AiProvider = 'anthropic' | 'bedrock' | 'vertex' | 'foundry';
 export const AI_PROVIDERS: AiProvider[] = ['anthropic', 'bedrock', 'vertex', 'foundry'];
-export type AiFeature = 'review' | 'fix' | 'drift' | 'policy' | 'ask';
-export const AI_FEATURES: AiFeature[] = ['review', 'fix', 'drift', 'policy', 'ask'];
+export type AiFeature = 'review' | 'code' | 'fix' | 'drift' | 'policy' | 'ask';
+export const AI_FEATURES: AiFeature[] = ['review', 'code', 'fix', 'drift', 'policy', 'ask'];
 export type AiEffort = 'low' | 'medium' | 'high' | 'xhigh' | 'max';
 const EFFORTS: AiEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
 

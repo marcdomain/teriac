@@ -2,7 +2,7 @@
 // No SDK: App JWTs are signed with node:crypto and the REST API is plain fetch.
 import { createHash, createHmac, createSign, timingSafeEqual } from 'node:crypto';
 import type {
-  CheckRun, CloneAuth, Comparison, Permission, PullRequest, PullRequestState, Reaction, Repo, Review, VcsAdapter, VcsEvent, Suggestion,
+  CheckRun, CloneAuth, Comparison, Permission, PullRequest, PullRequestState, Reaction, Repo, Review, VcsAdapter, VcsEvent, Suggestion, FileDiff,
 } from './types.ts';
 import type { GitHubConfig } from '../config.ts';
 import { addSecret, log } from '../log.ts';
@@ -369,6 +369,11 @@ export class GitHubAdapter implements VcsAdapter {
     return files.flatMap(f => (f.previous_filename ? [f.filename, f.previous_filename] : [f.filename]));
   }
 
+  async fileDiffs(repo: Repo, number: number): Promise<FileDiff[]> {
+    const files = await this.paginate<any>(repo, `/repos/${repo.fullName}/pulls/${number}/files`);
+    return files.filter(f => f.status !== 'removed').map(f => ({ path: f.filename, patch: typeof f.patch === 'string' ? f.patch : null }));
+  }
+
   async cloneAuth(repo: Repo): Promise<CloneAuth> {
     const token = await this.installationToken(repo);
     const basic = Buffer.from(`x-access-token:${token}`).toString('base64');
@@ -405,7 +410,7 @@ export class GitHubAdapter implements VcsAdapter {
     const comments = suggestions.map(s => ({
       path: s.path, line: s.endLine, side: 'RIGHT',
       ...(s.startLine < s.endLine ? { start_line: s.startLine, start_side: 'RIGHT' } : {}),
-      body: `${s.note}\n\n${fence(s.replacement)}suggestion\n${s.replacement}\n${fence(s.replacement)}`,
+      body: s.replacement === undefined ? s.note : `${s.note}\n\n${fence(s.replacement)}suggestion\n${s.replacement}\n${fence(s.replacement)}`,
     }));
     // 422: a line isn't part of the PR's diff; the caller shows the fix in its comment instead.
     const { status } = await this.api(repo, 'POST', `/repos/${repo.fullName}/pulls/${number}/reviews`, { commit_id: sha, event: 'COMMENT', body, comments }, [422]);

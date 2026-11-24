@@ -42,15 +42,34 @@
   const aiCardGuard = (a, srv = {}) => {
     if (!a) return `<div class="card ai"><div class="card-head"><h2>AI help</h2><span class="muted small">off: set <code>TERIAC_AI_PROVIDER</code> (<code>ai.provider</code> in the chart)</span></div></div>`;
     const feats = (list) => list.map(f => `<span class="pill">${esc(f)}</span>`).join(' ');
-    const result = (r) => (r ? `${feats(r.features)} <span class="muted small">${esc(r.model.replace(/^arn:.*\//, '').replace(/^(?:[a-z-]+\.)?anthropic\./, ''))} · ${esc(r.effort)} · review on ${esc(r.review === 'push' ? 'every plan' : r.review === 'first' ? 'first plan, then on request' : 'request only')}</span>` : '<span class="pill bad">off</span>');
-    const set = (o) => (o ? `<code>${esc(JSON.stringify(o).replace(/"([a-z]+)":/g, '$1: '))}</code>` : '<span class="muted">not set: on with every feature</span>');
+    const model = (m) => m.replace(/^arn:.*\//, '').replace(/^(?:[a-z-]+\.)?anthropic\./, '');
+    const when = { push: 'every plan', first: 'first plan, then on request', command: 'on request only' };
+    const result = (r) => (r ? `<div>${feats(r.features)}</div><div class="muted small">${esc(model(r.model))} · ${esc(r.effort)} effort · reviews ${esc(when[r.review] || r.review)}</div>` : '<span class="pill bad">off</span>');
+    // What the level sets, in words: "on · reviews on request · claude-sonnet-5-5".
+    const set = (o) => {
+      if (!o) return '<span class="muted">not set (on, every feature)</span>';
+      const parts = [];
+      if (o.enabled !== undefined) parts.push(o.enabled ? 'on' : '<b>off</b>');
+      if (o.features) parts.push(`only ${o.features.map(esc).join(', ')}`);
+      if (o.review) parts.push(`reviews ${esc(when[o.review] || o.review)}`);
+      if (o.model) parts.push(esc(model(o.model)));
+      if (o.effort) parts.push(`${esc(o.effort)} effort`);
+      return parts.join(' · ');
+    };
     return `<div class="card ai"><div class="card-head"><h2>AI help</h2><span class="muted small">${esc(a.provider)} · ${esc(a.model)} · ${esc(a.effort)} · ceiling ${feats(a.features)}</span></div>
-      ${table(['Level', 'Applies to', 'ai: in repos.yaml', 'Result'], a.levels.map(l => `<tr>
+      ${table(['Level', 'Applies to', 'Sets (ai: in repos.yaml)', 'Result'], a.levels.map(l => `<tr class="wrap">
         <td>${esc(l.scope)}</td><td class="mono">${esc(l.match)}</td><td>${set(l.set)}</td><td>${result(l.result)}</td>
       </tr>`), '')}
       ${srv.lastError ? `<div class="banner"><b>AI requests are failing</b> (${esc(srv.lastError.what)}, ${esc(srv.lastError.model)}, ${ago(srv.lastError.at)})${srv.lastError.hint ? `: ${esc(srv.lastError.hint)}` : ''}<div class="muted small mono">${esc(srv.lastError.status ?? '')} ${esc(srv.lastError.message)}</div></div>` : ''}
       <div class="ai-body muted small">The first matching project rule with <code>ai</code> wins over its repo entry, which wins over the server. A repo's <code>teriac.yaml</code> can still turn AI off or drop features for itself, never turn it on.</div>
     </div>`;
+  };
+  // The AI's inline code review of the run's PR: each comment, with its suggested change.
+  const aiCodeCard = (code) => {
+    if (!code || !code.comments.length) return '';
+    return `<div class="card ai"><div class="card-head"><h2>AI code review</h2><span class="muted small">${esc(code.model)} · advisory${code.posted ? ' · on the pull request' : ''}</span></div><div class="ai-body">
+      <ul class="ai-findings">${code.comments.map(c => `<li><span class="pill ${SEV_PILL[c.severity] || ''}">${esc(c.severity)}</span> <b>${esc(c.title)}</b> · <code>${esc(c.path)}:${c.startLine}${c.endLine > c.startLine ? `–${c.endLine}` : ''}</code><div class="muted">${esc(c.body)}</div>${c.suggestion ? `<pre class="changes">${esc(c.suggestion)}</pre>` : ''}</li>`).join('')}</ul>
+    </div></div>`;
   };
   // The AI's part of a run: a plan review, or why it failed and the suggested fixes.
   const aiCard = (ai) => {
@@ -64,6 +83,7 @@
     }
     return `<div class="card ai"><div class="card-head"><h2>AI: why it failed</h2>${tag}</div><div class="ai-body">
       <p>${esc(ai.cause)}</p>
+      ${ai.posted && ai.fixes.length ? '<div class="muted small">Posted on the pull request as a suggested change, ready to commit.</div>' : ''}
       ${ai.fixes.map(f => `<div class="ai-fix"><div><b>Suggested fix</b> · <code>${esc(f.path)}</code> line${f.startLine === f.endLine ? ` ${f.startLine}` : `s ${f.startLine}–${f.endLine}`}: ${esc(f.why)}</div><pre class="changes">${esc(f.replacement)}</pre></div>`).join('')}
     </div></div>`;
   };
@@ -574,9 +594,10 @@
         </div>
         ${r.targets?.length ? `<div class="banner note">Targeted plan: only ${r.targets.map(t => `<code>${esc(t)}</code>`).join(', ')}.</div>` : ''}
         ${dangerous.length ? `<div class="banner"><b>${dangerous.length} resource${dangerous.length === 1 ? '' : 's'} will be destroyed or replaced.</b></div>` : ''}
-        ${r.kind === 'plan' && r.status === 'success' && r.risk && RISK[r.risk.level] ? `<div class="banner ${r.risk.level === 'medium' ? 'warn' : ''}"><b>Risk: ${RISK[r.risk.level][1]}</b> · ${r.risk.reasons.map(reasonHtml).join(' · ')}</div>` : ''}
+        ${r.kind === 'plan' && r.status === 'success' && r.risk && RISK[r.risk.level] ? `<div class="banner ${r.risk.level === 'medium' ? 'warn' : ''}"><b>Risk: ${RISK[r.risk.level][1]}</b>${(() => { const own = r.risk.reasons.filter(x => !x.startsWith('AI review: ')); return own.length ? ` · ${own.map(reasonHtml).join(' · ')}` : r.ai ? ' · see the AI review' : ''; })()}</div>` : ''}
         ${r.secrets?.length ? `<div class="banner warn"><b>Something that looks like a secret was hidden from this output</b> (${r.secrets.map(esc).join(', ')}). Check where it came from.</div>` : ''}
         ${aiCard(r.ai)}
+        ${aiCodeCard(r.aiCode)}
         ${canAsk && r.status !== 'running' && r.status !== 'queued' ? `<div class="card ai"><div class="card-head"><h2>Ask about this run</h2><span class="muted small">${esc(ai.model)} · advisory</span></div>
           <form class="ai-ask" data-ask="${r.id}"><input name="q" maxlength="2000" placeholder="Why is the database replaced?" autocomplete="off" required><button type="submit">Ask</button></form>
           <div class="ai-answer" hidden></div></div>` : ''}

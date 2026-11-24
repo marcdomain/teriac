@@ -452,6 +452,7 @@ labelled with the model's name.
 | Feature | What it does |
 |---|---|
 | `review` | A two-to-four sentence summary in each plan's comment and check run, plus findings the rules can miss: forced replacements and why, data that could be lost, access that gets wider, things that become public, protections turned off. Findings also show on the code in **Files changed** |
+| `code` | A code review of the PR's Terraform changes: inline comments on the changed lines, only for what matters (security, things that will break, data safety, costly surprises), each with a one-click suggested change when the fix is small and certain. It reads the whole project for context but comments only on the diff. No style or naming comments; each comment is posted once per PR |
 | `fix` | When a plan or apply fails: the likely cause, and the smallest code fix, posted as GitHub **suggested changes** (one click to commit) and shown in the comment |
 | `drift` | On drift-fix PRs (`fix_pr: true`), for what the mechanical fixer can't edit: **adopt** (the code is updated to match), **revert** (left alone, so applying puts it back) or **unsure** (left to a person) |
 | `ask` | `teriac ask: <question>` on a PR, and **Ask about this run** on the dashboard. The AI can read the PR's code and saved plans, nothing else |
@@ -463,7 +464,7 @@ ai:
   provider: anthropic           # anthropic, bedrock, vertex or foundry
   existingSecret: claude-api    # Secret with key api-key (provider anthropic)
   effort: medium                # low … max: deeper reviews take longer and cost more
-  features: [review, fix, drift, ask, policy]   # default: all
+  features: [review, code, fix, drift, ask, policy]   # default: all
 ```
 
 | Variable | |
@@ -471,7 +472,7 @@ ai:
 | `TERIAC_AI_PROVIDER` | `anthropic`, `bedrock`, `vertex` or `foundry`. Empty or `off`: no AI |
 | `TERIAC_AI_MODEL` | Default `claude-opus-5-5` (`anthropic.claude-opus-5-5` on Bedrock) |
 | `TERIAC_AI_EFFORT` | `low`, `medium` (default), `high`, `xhigh`, `max` |
-| `TERIAC_AI_FEATURES` | Comma list; default `review,fix,drift,policy,ask` |
+| `TERIAC_AI_FEATURES` | Comma list; default `review,code,fix,drift,policy,ask` |
 | `TERIAC_AI_TIMEOUT_SECONDS` | Per request, default 180 |
 
 **Per repo and per project.** `ai:` in `repos.yaml` turns AI on or off and changes the features,

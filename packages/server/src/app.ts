@@ -25,7 +25,7 @@ import { metrics } from './metrics.ts';
 import { scanSecrets, secretNote } from './secrets.ts';
 import { securityFindings } from './security-rules.ts';
 import { assessRisk, extraApprovalFor, isProduction, type Risk } from './risk.ts';
-import { raiseRisk, resolveAi, label, important, type Ai, type AiResult, type AiSettings, type AiFeature } from './ai.ts';
+import { raiseRisk, resolveAi, label, important, type Ai, type AiResult, type AiSettings, type AiFeature, type CodeComment } from './ai.ts';
 import { activeFreezes, protectedHits } from './freeze.ts';
 import { changeFingerprint, countApprovals, staleFor, staleText } from './safety.ts';
 import { stricterMode, DEFAULT_SIZE_LIMITS, type StaleBaseMode, type SecretScanMode, type RiskConfig, type FreezeConfig, type ProtectedConfig, type SecretPattern } from './safety-config.ts';
@@ -864,6 +864,7 @@ export class App {
     const released = this.deps.store.releasePrLocks(this.repoKey(repo), number);
     this.deps.store.forgetPrComments(this.repoKey(repo), number);
     this.deps.store.deleteSetting(`ai_suggested:${this.repoKey(repo)}#${number}`);
+    this.deps.store.deleteSetting(`ai_code_posted:${this.repoKey(repo)}#${number}`);
     this.forgetPlans(this.repoKey(repo), number);
     rmSync(this.workDir(repo, number), { recursive: true, force: true });
     rmSync(this.planDir(repo, number), { recursive: true, force: true });
@@ -1194,6 +1195,7 @@ export class App {
       });
       if (policy?.findings.length) store.saveFindings(store.getRun(runId)!, policy.mode, policy.findings);
       if (ai?.kind === 'fix' && await this.suggestFixes(ctx, project, ai)) store.setRunAi(runId, { ...ai, posted: true });
+      await this.aiCodeReview(ctx, project, runId, false);
     } catch (err) {
       store.finishRun(runId, { status: 'failed', engine, output: `teriac could not run this project: ${(err as Error).message}` });
     } finally {
@@ -1227,8 +1229,7 @@ export class App {
     const s = this.aiFor(ctx, project, 'review');
     if (!s) return null;
     // review: command reviews only on `teriac review`; first, only a PR's first plan of the project.
-    if (s.review === 'command') return null;
-    if (s.review === 'first' && this.deps.store.hadAiReview(ctx.repoKey, ctx.pr.number, project.name)) return null;
+    if (!this.reviewDue(ctx, project, s, 'plan', false)) return null;
     const safety = this.safety(ctx);
     // AI help never fails a plan: any error just means no review.
     return this.deps.ai!.reviewPlan({ project: project.name, production: isProduction(project, safety.risk), engine, plan, risk, findings, patterns: safety.secretPatterns }, s)
@@ -1240,6 +1241,48 @@ export class App {
     if (!s) return null;
     return this.deps.ai!.explainFailure({ project: project.name, kind, output, root: ctx.root, dir: project.dir, patterns: this.safety(ctx).secretPatterns }, s)
       .catch(err => { log.warn('ai failure help skipped', { project: project.name, err: (err as Error).message }); return null; });
+  }
+
+  // `teriac review` (asked) always reviews; otherwise the project's timing decides.
+  private reviewDue(ctx: PrContext, project: Project, s: AiSettings, what: 'plan' | 'code', asked: boolean): boolean {
+    if (asked) return true;
+    if (s.review === 'command') return false;
+    return !(s.review === 'first' && this.deps.store.hadAiReview(ctx.repoKey, ctx.pr.number, project.name, what));
+  }
+
+  // The AI code review: inline comments on the project's changed Terraform files, posted once as
+  // one comment-only review (medium or worse only). Never fails the run.
+  private async aiCodeReview(ctx: PrContext, project: Project, runId: number, asked: boolean): Promise<number | null> {
+    const s = this.aiFor(ctx, project, 'code');
+    if (!s || !ctx.adapter.fileDiffs || !this.reviewDue(ctx, project, s, 'code', asked)) return null;
+    try {
+      const inProject = (p: string) => project.dir === '.' || p.startsWith(`${project.dir}/`);
+      const diffs = (await ctx.adapter.fileDiffs(ctx.repo, ctx.pr.number)).filter(d => inProject(d.path) && /\.(tf|hcl|tfvars)$/.test(d.path));
+      if (!diffs.length) return null;
+      const safety = this.safety(ctx);
+      const comments = await this.deps.ai!.reviewCode({ project: project.name, production: isProduction(project, safety.risk), diffs, root: ctx.root, dir: project.dir, patterns: safety.secretPatterns }, s);
+      if (!comments) return null;
+      // Each comment once per PR: what was posted before (same file, line and title) is skipped.
+      const key = `ai_code_posted:${ctx.repoKey}#${ctx.pr.number}`;
+      const seen = this.deps.store.getSetting<string[]>(key) ?? [];
+      const id = (c: CodeComment) => `${c.path}:${c.startLine}:${c.title.toLowerCase()}`;
+      const fresh = comments.filter(c => important(c) && !seen.includes(id(c)));
+      let posted = !fresh.length;
+      if (fresh.length && ctx.adapter.suggestChanges) {
+        const SEVS: Record<string, string> = { critical: '🔴', high: '🔴', medium: '🟠', low: '🟡' };
+        posted = await ctx.adapter.suggestChanges(ctx.repo, ctx.pr.number, ctx.pr.headSha,
+          `🤖 **AI code review** of \`${project.name}\` · ${fresh.length} comment${fresh.length === 1 ? '' : 's'} <sub>${label(s)} · advisory, check it yourself</sub>`,
+          fresh.map(c => ({ path: c.path, startLine: c.startLine, endLine: c.endLine, note: `${SEVS[c.severity] ?? '🟡'} **${c.title}**: ${c.body}`, ...(c.suggestion ? { replacement: c.suggestion } : {}) })),
+        ).catch(err => { log.warn('could not post the AI code review', { err: (err as Error).message }); return false; });
+        if (posted) this.deps.store.setSetting(key, [...seen, ...fresh.map(id)].slice(-200));
+      }
+      this.deps.store.setRunAiCode(runId, { comments, model: label(s), posted });
+      this.deps.store.audit({ repo: ctx.repoKey, pr: ctx.pr.number, user: 'teriac', action: 'ai_code_review', project: project.name, allowed: true, reason: `${comments.length} comments (${fresh.length} new, important) by ${label(s)}${posted ? '' : '; not posted inline, shown in the comment'}` });
+      return comments.length;
+    } catch (err) {
+      log.warn('ai code review skipped', { project: project.name, err: (err as Error).message });
+      return null;
+    }
   }
 
   // Fixes as suggested changes on the PR's code, where the platform allows it. The PR comment
@@ -1314,8 +1357,12 @@ export class App {
       const run = plans.find(r => r.project === project.name);
       if (!run) { out.push(`- \`${project.name}\`: no plan with changes for this commit`); continue; }
       const s = this.aiFor(ctx, project, 'review');
-      if (!s) { out.push(`- \`${project.name}\`: AI reviews are off for this project`); continue; }
+      const code = this.aiFor(ctx, project, 'code');
+      if (!s && !code) { out.push(`- \`${project.name}\`: AI reviews are off for this project`); continue; }
       if (!(await this.allowed(ctx, 'plan', user, project)).allowed) { out.push(`- \`${project.name}\`: 🚫 needs permission to plan it`); continue; }
+      const codeCount = code ? await this.aiCodeReview(ctx, project, run.id, true) : null;
+      const codeLine = codeCount === null ? [] : codeCount ? [`💬 AI code review: ${codeCount} comment${codeCount === 1 ? '' : 's'} on **Files changed**`] : ['💬 AI code review: nothing to flag in the code'];
+      if (!s) { out.push(`**\`${project.name}\`**`, '', ...codeLine, ''); continue; }
       let plan: Record<string, any> | null = null;
       try { plan = run.planPath ? JSON.parse(readFileSync(`${run.planPath}.json`, 'utf-8')) : null; } catch { /* dropped */ }
       if (!plan) { out.push(`- \`${project.name}\`: its saved plan is gone; plan it again (\`${this.commandName} plan -p ${project.name}\`)`); continue; }
@@ -1327,7 +1374,7 @@ export class App {
       store.setRunReview(run.id, review, raiseRisk(ruled, review));
       const updated = store.getRun(run.id)!;
       await this.publishCheck(ctx, project, updated);
-      out.push(`**\`${project.name}\`**`, '', ...aiLines(updated));
+      out.push(`**\`${project.name}\`**`, '', ...aiLines(updated), ...codeLine, '');
     }
     this.deps.store.audit({ repo: ctx.repoKey, pr: ctx.pr.number, user, action: 'ai_review', project: picked.map(p => p.name).join(',') || '*', allowed: true, reason: 'teriac review' });
     reply.say(out.join('\n'));

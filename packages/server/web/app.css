@@ -470,3 +470,4 @@ form.ai-ask { display: flex; gap: 8px; }
 form.ai-ask input { flex: 1; min-width: 0; font: 14px var(--font); padding: 9px 12px; border: 1px solid var(--line-strong); border-radius: var(--radius-sm); background: var(--bg-elev); color: var(--ink); }
 .card.ai .ai-answer { border-top: 1px solid var(--line); display: grid; gap: 10px; }
 .card.ai .answer { white-space: pre-wrap; line-height: 1.55; }
+tr.wrap td { white-space: normal; vertical-align: top; }

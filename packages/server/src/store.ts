@@ -2,7 +2,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
-import type { AiResult } from './ai.ts';
+import type { AiResult, CodeComment } from './ai.ts';
 
 export type RunKind = 'plan' | 'apply';
 export type RunStatus = 'queued' | 'running' | 'success' | 'failed';
@@ -47,6 +47,7 @@ export interface Run {
   risk: { level: string; reasons: string[] } | null;
   secrets: string[];          // kinds of possible secrets found (and handled) in the output
   ai: AiResult | null;        // the AI review of a plan, or help with a failed run
+  aiCode: { comments: CodeComment[]; model: string; posted: boolean } | null; // the AI's inline review of the code
   outputExpiredAt: string | null; // the log was cleared then (log_retention_days); the rest stays
 }
 
@@ -202,6 +203,7 @@ const toRun = (r: Record<string, any>): Run => ({
   risk: r.risk ? JSON.parse(r.risk) : null,
   secrets: r.secrets ? JSON.parse(r.secrets) : [],
   ai: r.ai ? JSON.parse(r.ai) : null,
+  aiCode: r.ai_code ? JSON.parse(r.ai_code) : null,
   outputExpiredAt: r.output_expired_at ?? null,
 });
 
@@ -241,6 +243,7 @@ export class Store {
     if (!cols.includes('risk')) this.db.exec('ALTER TABLE runs ADD COLUMN risk TEXT');
     if (!cols.includes('secrets')) this.db.exec('ALTER TABLE runs ADD COLUMN secrets TEXT');
     if (!cols.includes('ai')) this.db.exec('ALTER TABLE runs ADD COLUMN ai TEXT');
+    if (!cols.includes('ai_code')) this.db.exec('ALTER TABLE runs ADD COLUMN ai_code TEXT');
     // The Metrics page reads runs by start time.
     this.db.exec('CREATE INDEX IF NOT EXISTS runs_started ON runs (started_at)');
     this.db.exec('CREATE INDEX IF NOT EXISTS audit_at ON audit (at)');
@@ -401,8 +404,15 @@ export class Store {
   }
 
   // Whether a plan of this PR's project already had an AI review (review: first).
-  hadAiReview(repo: string, pr: number, project: string): boolean {
-    return !!this.db.prepare(`SELECT 1 FROM runs WHERE repo = ? AND pr = ? AND project = ? AND kind = 'plan' AND ai LIKE '{"kind":"review"%' LIMIT 1`).get(repo, pr, project);
+  hadAiReview(repo: string, pr: number, project: string, what: 'plan' | 'code' = 'plan'): boolean {
+    const sql = what === 'plan'
+      ? `SELECT 1 FROM runs WHERE repo = ? AND pr = ? AND project = ? AND kind = 'plan' AND ai LIKE '{"kind":"review"%' LIMIT 1`
+      : `SELECT 1 FROM runs WHERE repo = ? AND pr = ? AND project = ? AND kind = 'plan' AND ai_code IS NOT NULL LIMIT 1`;
+    return !!this.db.prepare(sql).get(repo, pr, project);
+  }
+
+  setRunAiCode(id: number, code: { comments: CodeComment[]; model: string; posted: boolean }): void {
+    this.db.prepare('UPDATE runs SET ai_code = ? WHERE id = ?').run(JSON.stringify(code), id);
   }
 
   // A review asked for after the plan (`teriac review`): its result and the raised risk.
