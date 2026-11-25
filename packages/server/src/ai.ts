@@ -246,7 +246,7 @@ export class Ai {
       `Review the code changes of project \`${input.project}\`${input.production ? ' (production)' : ''} as a senior infrastructure engineer would before approving. Lines are numbered on the new side ("12 +" added, "12  " unchanged context, "   -" removed).`,
       'Comment only on problems a reviewer must fix or consciously accept: security (public access, 0.0.0.0/0, wildcard IAM actions or principals, encryption or logging off, secrets or keys hard-coded in code), things that will break (wrong references, types, missing required arguments, invalid values), data safety (prevent_destroy or deletion protection removed, lifecycle ignore_changes hiding real drift), and costly or surprising choices (huge instance sizes, unbounded counts). Comment on added lines, or on context lines only when the change causes the problem.',
       'Never comment on style, formatting, naming, ordering, missing comments, tags, or anything a linter would catch; never praise; never repeat the same point on several lines. At most 8 comments; none is the right answer for a clean change.',
-      'Each comment: path; line (and end_line for a range, else the same line) on the new side; severity (critical, high, medium, low as in a plan review); title under 8 words; body of one or two sentences saying what is wrong and what to do. suggestion: the replacement for lines line..end_line when the fix is a small, certain edit to those exact lines, otherwise an empty string.',
+      'Each comment: path; line (and end_line for a range, else the same line) on the new side; severity (critical, high, medium, low as in a plan review); title under 8 words; body of one to three sentences (under 70 words) saying what is wrong and what to do. suggestion: the replacement for lines line..end_line when the fix is a small, certain edit to those exact lines, otherwise an empty string. A suggestion must remove the problem completely, never a variant that keeps it (narrowing ignore_changes to the very attribute at risk is not a fix). To delete lines, cover them together with a neighbouring line that stays and give only what remains. Before answering, re-read each suggestion against its body: if applying it would leave the problem, give an empty suggestion instead.',
       input.known?.length ? `Already reported by the plan review, so do not raise these again, even in other words: ${input.known.map(k => `${k.title} (${k.address})`).join('; ')}.` : '',
       'Before commenting, check the claim against the whole project below (variable definitions, defaults, other resources and modules): a comment that the full code proves wrong is worse than none. Comments may only point at lines in the diffs.',
       view,
@@ -272,7 +272,7 @@ export class Ai {
         const suggestion = c.suggestion?.trim() ? scanSecrets(c.suggestion.replace(/\n+$/, '')).text : '';
         return {
           path: c.path, startLine: c.line, endLine: c.end_line, severity: c.severity,
-          title: sentence(c.title, 70), body: sentence(c.body, 300, 2),
+          title: sentence(c.title, 70), body: sentence(c.body, 520, 3),
           ...(suggestion && !unsafeCode(suggestion) ? { suggestion } : {}),
         };
       });
