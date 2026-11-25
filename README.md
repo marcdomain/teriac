@@ -19,7 +19,7 @@ teriac comes in two parts. Use either one, or both together:
 
 ## teriac CLI
 
-![teriac CLI: signed installs, OpenTofu and Terragrunt, switching versions, auto-switch on cd, pinning, plan and apply by file, and doctor](https://raw.githubusercontent.com/marcdomain/teriac/main/demo.gif)
+![teriac CLI: signed installs, OpenTofu and Terragrunt, switching versions, auto-switch on cd, pinning, plan and apply by file, doctor, and AI: teriac explain reviews a plan, teriac fix repairs a failed one](https://raw.githubusercontent.com/marcdomain/teriac/main/demo.gif)
 
 `teriac` is one command for **Terraform**, **OpenTofu** and **Terragrunt**, with no `sudo`:
 
@@ -35,7 +35,7 @@ Everything lives in `~/.teriac/`; upgrading `teriac` itself never touches your i
 
 ## teriac server
 
-![teriac server: install with Helm or Docker, the PR comment with risk and approvals, apply, sign in with GitHub, and the dashboard with live output, runs, the emergency stop, metrics and unlocking](https://raw.githubusercontent.com/marcdomain/teriac/main/charts/teriac-server/docs/flow.gif)
+![teriac server: install with Helm or Docker, the PR comment with risk and approvals, apply, sign in with GitHub, and the dashboard with live output, runs, the emergency stop, metrics and unlocking, then AI help: the plan review, inline code review, teriac ask, AI on the dashboard, per-project settings and policy drafts](https://raw.githubusercontent.com/marcdomain/teriac/main/charts/teriac-server/docs/flow.gif)
 
 A self-hosted service for pull requests. It plans every project a pull request changes, posts
 one clear comment, and applies when someone comments `teriac apply`:
