@@ -1214,6 +1214,8 @@
     const { name, arg } = current();
     if (name === 'runs' && arg) return;
     timer = setTimeout(async () => {
+      // An AI box with a question typed, a request running or an answer showing is never wiped.
+      if ([...document.querySelectorAll('form.ai-ask')].some(f => f.q.value.trim() || f.querySelector('button').disabled || !f.parentElement.querySelector('.ai-answer').hidden)) return schedule();
       const c = current();
       const list = listName(c.name, c.params);
       if (list && !c.arg && $('#results')) {

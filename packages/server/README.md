@@ -62,6 +62,7 @@ Set up the GitHub App like this:
 | `teriac apply -p <project>` | Apply one project. The Apply button does the same |
 | `teriac unlock` | Release this PR's locks and delete its saved plans and live output (`-p <project>` for one). Closing or merging the PR does the same |
 | `teriac cancel` | Stop this PR's running plans and drop its queued work. The PR author, or anyone with write access or more |
+| `teriac review` | AI review of the latest plans and code, when [AI help](#ai-help) is on (`-p <project>` for one). Reuses the saved plan; plan review first, then inline code review. Needs `plan` on the project |
 | `teriac ask: <question>` | An AI answer about this PR's plans and code, when [AI help](#ai-help) is on. Needs `plan` on a project |
 
 `-p` and `-d` take a name or a glob: `teriac plan -p 'live/prod/*'`. A repo that applies one
