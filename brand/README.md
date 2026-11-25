@@ -33,3 +33,9 @@ and wordmark are drawn as shapes, not type, so they look the same everywhere.
 
 Leave clear space around the logo of at least half the mark's height. Don't recolour,
 stretch or add effects to it. The PNGs have transparent backgrounds.
+
+**Christmas**
+
+`teriac-logo-christmas.svg`, `teriac-logo-christmas-dark.svg` and `favicon-christmas.svg`: the
+same logo wearing a Santa hat. The server's dashboard switches to it on its own from 1 December
+to 6 January (`TERIAC_SEASONAL_LOGO=false` keeps the usual one).

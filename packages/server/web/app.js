@@ -8,6 +8,17 @@
   try { token = sessionStorage.getItem('teriac-token'); } catch { /* storage blocked */ }
   let me = null;
 
+  // ---- Seasonal logo: a Christmas hat when the server says it's the season ----
+  const HAT = '<g class="hat" transform="rotate(-8 32 12)"><path d="M13 16 C14 2 26 -10 42 -12 C50 -13 57 -8 60 -1 C55 -5 49 -4 46 0 C50 4 51 10 51 16 Z" fill="#dc2626"/><path d="M42 -12 C50 -13 57 -8 60 -1 C55 -5 49 -4 46 0 C44 -5 43 -9 42 -12 Z" fill="#b91c1c"/><rect x="9" y="12" width="46" height="10" rx="5" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/><circle cx="60" cy="1" r="5" fill="#ffffff" stroke="#cbd5e1" stroke-width="1.5"/></g>';
+  fetch('/auth/config').then(r => r.json()).then((cfg) => {
+    if (!cfg.festive) return;
+    const logo = document.querySelector('.brand svg.logo');
+    if (!logo || logo.classList.contains('festive')) return;
+    logo.setAttribute('viewBox', '0 -16 250 80');
+    logo.insertAdjacentHTML('beforeend', HAT);
+    logo.classList.add('festive');
+  }).catch(() => {});
+
   // ---- API ----------------------------------------------------------------
   const api = async (path, opts = {}) => {
     const res = await fetch(path, {
@@ -24,6 +35,58 @@
     return res.json();
   };
   const isAdmin = () => me?.role === 'admin';
+  // What AI help this server has (TERIAC_AI_PROVIDER), asked once.
+  let aiInfo = null;
+  const aiServer = async () => (aiInfo ??= await api('/api/ai').catch(() => ({ enabled: false })));
+  // Where AI is on, as the Guardrails page shows it: each level of repos.yaml that sets `ai`.
+  const aiCardGuard = (a, srv = {}) => {
+    if (!a) return `<div class="card ai"><div class="card-head"><h2>AI help</h2><span class="muted small">off: set <code>TERIAC_AI_PROVIDER</code> (<code>ai.provider</code> in the chart)</span></div></div>`;
+    const feats = (list) => list.map(f => `<span class="pill">${esc(f)}</span>`).join(' ');
+    const model = (m) => m.replace(/^arn:.*\//, '').replace(/^(?:[a-z-]+\.)?anthropic\./, '');
+    const when = { push: 'every plan', first: 'first plan, then on request', command: 'on request only' };
+    const result = (r) => (r ? `<div>${feats(r.features)}</div><div class="muted small">${esc(model(r.model))} · ${esc(r.effort)} effort · reviews ${esc(when[r.review] || r.review)}</div>` : '<span class="pill bad">off</span>');
+    // What the level sets, in words: "on · reviews on request · claude-sonnet-5-5".
+    const set = (o) => {
+      if (!o) return '<span class="muted">not set (on, every feature)</span>';
+      const parts = [];
+      if (o.enabled !== undefined) parts.push(o.enabled ? 'on' : '<b>off</b>');
+      if (o.features) parts.push(`only ${o.features.map(esc).join(', ')}`);
+      if (o.review) parts.push(`reviews ${esc(when[o.review] || o.review)}`);
+      if (o.model) parts.push(esc(model(o.model)));
+      if (o.effort) parts.push(`${esc(o.effort)} effort`);
+      return parts.join(' · ');
+    };
+    return `<div class="card ai"><div class="card-head"><h2>AI help</h2><span class="muted small">${esc(a.provider)} · ${esc(a.model)} · ${esc(a.effort)} · ceiling ${feats(a.features)}</span></div>
+      ${table(['Level', 'Applies to', 'Sets (ai: in repos.yaml)', 'Result'], a.levels.map(l => `<tr class="wrap">
+        <td>${esc(l.scope)}</td><td class="mono">${esc(l.match)}</td><td>${set(l.set)}</td><td>${result(l.result)}</td>
+      </tr>`), '')}
+      ${srv.lastError ? `<div class="banner"><b>AI requests are failing</b> (${esc(srv.lastError.what)}, ${esc(srv.lastError.model)}, ${ago(srv.lastError.at)})${srv.lastError.hint ? `: ${esc(srv.lastError.hint)}` : ''}<div class="muted small mono">${esc(srv.lastError.status ?? '')} ${esc(srv.lastError.message)}</div></div>` : ''}
+      <div class="ai-body muted small">The first matching project rule with <code>ai</code> wins over its repo entry, which wins over the server. A repo's <code>teriac.yaml</code> can still turn AI off or drop features for itself, never turn it on.</div>
+    </div>`;
+  };
+  // The AI's inline code review of the run's PR: each comment, with its suggested change.
+  const aiCodeCard = (code) => {
+    if (!code || !code.comments.length) return '';
+    return `<div class="card ai"><div class="card-head"><h2>AI code review</h2><span class="muted small">${esc(code.model)} · advisory${code.posted ? ' · on the pull request' : ''}</span></div><div class="ai-body">
+      <ul class="ai-findings">${code.comments.map(c => `<li><span class="pill ${SEV_PILL[c.severity] || ''}">${esc(c.severity)}</span> <b>${esc(c.title)}</b> · <code>${esc(c.path)}:${c.startLine}${c.endLine > c.startLine ? `–${c.endLine}` : ''}</code><div class="muted">${esc(c.body)}</div>${c.suggestion ? `<pre class="changes">${esc(c.suggestion)}</pre>` : ''}</li>`).join('')}</ul>
+    </div></div>`;
+  };
+  // The AI's part of a run: a plan review, or why it failed and the suggested fixes.
+  const aiCard = (ai) => {
+    if (!ai) return '';
+    const tag = `<span class="muted small">${esc(ai.model)} · advisory</span>`;
+    if (ai.kind === 'review') {
+      return `<div class="card ai"><div class="card-head"><h2>AI review</h2>${tag}</div><div class="ai-body">
+        <p>${esc(ai.summary)}</p>
+        ${ai.findings.length ? `<ul class="ai-findings">${ai.findings.map(f => `<li><span class="pill ${SEV_PILL[f.severity] || ''}">${esc(f.severity)}</span> <b>${esc(f.title)}</b> · <code>${esc(f.address)}</code><div class="muted">${esc(f.why)}</div></li>`).join('')}</ul>` : ''}
+      </div></div>`;
+    }
+    return `<div class="card ai"><div class="card-head"><h2>AI: why it failed</h2>${tag}</div><div class="ai-body">
+      <p>${esc(ai.cause)}</p>
+      ${ai.posted && ai.fixes.length ? '<div class="muted small">Posted on the pull request as a suggested change, ready to commit.</div>' : ''}
+      ${ai.fixes.map(f => `<div class="ai-fix"><div><b>Suggested fix</b> · <code>${esc(f.path)}</code> line${f.startLine === f.endLine ? ` ${f.startLine}` : `s ${f.startLine}–${f.endLine}`}: ${esc(f.why)}</div><pre class="changes">${esc(f.replacement)}</pre></div>`).join('')}
+    </div></div>`;
+  };
   const adminButton = (label, attrs) => isAdmin()
     ? `<button class="ghost small" type="button" ${attrs}>${label}</button>`
     : `<button class="ghost small" type="button" disabled title="Admins only">${label}</button>`;
@@ -501,7 +564,8 @@
 
     async run(arg) {
       const id = /(\d+)$/.exec(arg)?.[1] ?? arg;
-      const r = await api(`/api/runs/${encodeURIComponent(id)}`);
+      const [r, ai] = await Promise.all([api(`/api/runs/${encodeURIComponent(id)}`), api(`/api/runs/${encodeURIComponent(id)}/ai`).catch(() => ({ ask: false }))]);
+      const canAsk = ai.ask;
       // Show the full address (repo, PR, run), also when opened from an old #runs/<run> link.
       const canonical = `#${runPath(r)}`;
       if (location.hash.split('?')[0] !== canonical) history.replaceState(null, '', canonical);
@@ -530,8 +594,13 @@
         </div>
         ${r.targets?.length ? `<div class="banner note">Targeted plan: only ${r.targets.map(t => `<code>${esc(t)}</code>`).join(', ')}.</div>` : ''}
         ${dangerous.length ? `<div class="banner"><b>${dangerous.length} resource${dangerous.length === 1 ? '' : 's'} will be destroyed or replaced.</b></div>` : ''}
-        ${r.kind === 'plan' && r.status === 'success' && r.risk && RISK[r.risk.level] ? `<div class="banner ${r.risk.level === 'medium' ? 'warn' : ''}"><b>Risk: ${RISK[r.risk.level][1]}</b> · ${r.risk.reasons.map(reasonHtml).join(' · ')}</div>` : ''}
+        ${r.kind === 'plan' && r.status === 'success' && r.risk && RISK[r.risk.level] ? `<div class="banner ${r.risk.level === 'medium' ? 'warn' : ''}"><b>Risk: ${RISK[r.risk.level][1]}</b>${(() => { const own = r.risk.reasons.filter(x => !x.startsWith('AI review: ')); return own.length ? ` · ${own.map(reasonHtml).join(' · ')}` : r.ai ? ' · see the AI review' : ''; })()}</div>` : ''}
         ${r.secrets?.length ? `<div class="banner warn"><b>Something that looks like a secret was hidden from this output</b> (${r.secrets.map(esc).join(', ')}). Check where it came from.</div>` : ''}
+        ${aiCard(r.ai)}
+        ${aiCodeCard(r.aiCode)}
+        ${canAsk && r.status !== 'running' && r.status !== 'queued' ? `<div class="card ai"><div class="card-head"><h2>Ask about this run</h2><span class="muted small">${esc(ai.model)} · advisory</span></div>
+          <form class="ai-ask" data-ask="${r.id}"><input name="q" maxlength="2000" placeholder="Why is the database replaced?" autocomplete="off" required><button type="submit">Ask</button></form>
+          <div class="ai-answer" hidden></div></div>` : ''}
         ${s && s.changes.length ? `<div class="card"><div class="card-head"><h2>Changes</h2>${counts(s)}</div><pre class="changes">${changeLines(s.changes)}</pre></div>` : ''}
         ${s && (s.drift.length || s.outputs.length) ? `<div class="grid2">
           <div class="card"><div class="card-head"><h2>Changed outside Terraform</h2></div>${s.drift.length ? `<pre class="changes">${changeLines(s.drift)}</pre>` : '<div class="empty">None</div>'}</div>
@@ -561,7 +630,8 @@
     },
 
     async guardrails() {
-      const [g, b, applies] = await Promise.all([api('/api/safety'), api('/api/backups').catch(() => ({ enabled: false })), api('/api/applies').catch(() => null)]);
+      const [g, b, applies, aiSrv] = await Promise.all([api('/api/safety'), api('/api/backups').catch(() => ({ enabled: false })), api('/api/applies').catch(() => null), aiServer()]);
+      const canDraft = aiSrv.enabled && aiSrv.policy;
       if (g.error) return `<div class="page-head"><h1>Guardrails</h1></div><div class="card"><div class="empty">Not available on this server.</div></div>`;
       const people = (list) => (list.length ? list.map(p => `<span class="pill">${esc(p)}</span>`).join(' ') : '<span class="muted">nobody</span>');
       const globs = (list) => (list.length ? list.map(x => `<code>${esc(x)}</code>`).join(', ') : '<span class="muted">all projects</span>');
@@ -609,7 +679,11 @@
             <td class="mono">${esc(x.id)}</td><td>${yes(x.reapproveOnChange)}</td><td>${yes(x.keepApprovalOnRebase)}</td>
             <td>${x.staleBase === 'block' ? '<span class="pill bad">block</span>' : x.staleBase === 'warn' ? '<span class="pill warn">warn</span>' : '<span class="muted">off</span>'}</td>
             <td>${yes(x.verifyPlan)}</td><td>${esc(x.secretScan || g.secretScan.mode)}</td>
-          </tr>`), 'No repos.')}</div>`;
+          </tr>`), 'No repos.')}</div>
+        ${aiCardGuard(g.ai, aiSrv)}
+        ${canDraft ? `<div class="card ai"><div class="card-head"><h2>Draft a policy with AI</h2><span class="muted small">checked against its own tests · paste into repos.yaml yourself</span></div>
+          <form class="ai-ask" data-policy><input name="q" maxlength="4000" placeholder="No public S3 buckets in prod, and RDS keeps backups for at least 7 days" autocomplete="off" required ${isAdmin() ? '' : 'disabled title="Admins only"'}><button type="submit" ${isAdmin() ? '' : 'disabled'}>Draft</button></form>
+          <div class="ai-answer" hidden></div></div>` : ''}`;
     },
 
     async access() {
@@ -1202,6 +1276,39 @@
       return;
     }
     if (e.target.closest('form.filters')) e.preventDefault();
+  });
+
+  // AI forms: a question about a run, or a policy draft.
+  view.addEventListener('submit', async (e) => {
+    const form = e.target.closest('form.ai-ask');
+    if (!form) return;
+    e.preventDefault();
+    const q = form.q.value.trim();
+    if (!q) return;
+    const out = form.parentElement.querySelector('.ai-answer');
+    const button = form.querySelector('button');
+    button.disabled = true;
+    out.hidden = false;
+    out.innerHTML = '<span class="muted">Thinking… this can take a minute.</span>';
+    try {
+      if (form.dataset.ask) {
+        const r = await api(`/api/runs/${encodeURIComponent(form.dataset.ask)}/ask`, { method: 'POST', body: JSON.stringify({ question: q }) });
+        out.innerHTML = `<div class="answer">${esc(r.answer)}</div>`;
+      } else {
+        const d = await api('/api/ai/policy', { method: 'POST', body: JSON.stringify({ request: q }) });
+        const passed = d.tests.filter(t => t.passed).length;
+        out.innerHTML = `
+          ${d.error ? `<div class="banner warn">${esc(d.error)}</div>` : ''}
+          <div class="small"><b>${d.rules.length}</b> rule${d.rules.length === 1 ? '' : 's'} · tests <b>${passed}/${d.tests.length}</b> passed${passed < d.tests.length ? ' <span class="pill warn">check the failing ones</span>' : ''}</div>
+          <pre class="changes">${esc(d.yaml)}</pre>
+          ${d.tests.length ? `<ul class="ai-findings">${d.tests.map(t => `<li><span class="pill ${t.passed ? '' : 'bad'}">${t.passed ? 'pass' : 'fail'}</span> <code>${esc(t.rule)}</code> ${t.shouldFail ? 'flags' : 'allows'} <code>${esc(t.resourceType)}</code>: ${esc(t.description)}${t.error ? ` <span class="muted">(${esc(t.error)})</span>` : ''}</li>`).join('')}</ul>` : ''}
+          ${d.notes ? `<p class="muted">${esc(d.notes)}</p>` : ''}`;
+      }
+    } catch (err) {
+      out.innerHTML = `<div class="banner">${esc(err.message)}</div>`;
+    } finally {
+      button.disabled = false;
+    }
   });
 
   view.addEventListener('click', async (e) => {

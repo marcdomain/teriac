@@ -3,6 +3,8 @@
 //   teriac apply [-p project] [-d dir] [-w workspace]
 //   teriac unlock [-p project]
 //   teriac help
+//   teriac ask: <question>    (AI answer, when TERIAC_AI_PROVIDER is set; the colon marks where the question starts)
+//   teriac review [-p project] (AI review of the latest plans)
 // Terraform commands on one project (-p is required):
 //   teriac state list [address]... | state show <address> | state rm <address>... | state mv <from> <to>
 //   teriac output [name] | show | validate | providers | fmt
@@ -11,9 +13,9 @@
 
 import type { CommandAction } from './config.ts';
 
-export type Verb = 'plan' | 'apply' | 'unlock' | 'help' | 'cancel'
+export type Verb = 'plan' | 'apply' | 'unlock' | 'help' | 'cancel' | 'ask' | 'review'
   | 'state' | 'output' | 'show' | 'validate' | 'providers' | 'fmt' | 'import' | 'taint' | 'untaint' | 'force-unlock';
-const VERBS: Verb[] = ['plan', 'apply', 'unlock', 'help', 'cancel', 'state', 'output', 'show', 'validate', 'providers', 'fmt', 'import', 'taint', 'untaint', 'force-unlock'];
+const VERBS: Verb[] = ['plan', 'apply', 'unlock', 'help', 'cancel', 'ask', 'review', 'state', 'output', 'show', 'validate', 'providers', 'fmt', 'import', 'taint', 'untaint', 'force-unlock'];
 
 // Terraform commands teriac runs for a single project. Nothing else is passed through:
 // commands like `console` or flags like `-chdir` could reach beyond the project.
@@ -45,6 +47,7 @@ export interface Command {
   replace?: string[];         // plan -replace=<address>
   tool?: ToolCommand;         // a Terraform command such as "state list"
   args?: string[];            // its positional arguments, checked below
+  question?: string;          // `ask`: everything after the verb, every line
 }
 
 // Resource addresses only: no leading "-", no spaces, so a target can never
@@ -74,19 +77,29 @@ export const parseCommand = (body: string, names: string[]): ParseResult => {
   const name = tokens[0]?.replace(/^@/, '').toLowerCase();
   if (!name || !names.includes(name)) return null;
 
-  const verb = (tokens[1] || 'help').toLowerCase() as Verb;
+  // `ask:` (the colon ends the command; the rest is the question).
+  const askVerb = /^ask:/i.test(tokens[1] ?? '');
+  const verb = (askVerb ? 'ask' : (tokens[1] || 'help').toLowerCase()) as Verb;
   if (!VERBS.includes(verb)) {
     return { ok: false, error: `Unknown command \`${tokens[1]}\`. Try \`${name} help\`.` };
   }
 
   const command: Command = { verb, destroy: false, override: false, targets: [], extraArgs: [] };
+  if (verb === 'ask') {
+    const example = `\`${name} ask: why is the subnet replaced?\``;
+    if (!askVerb) return { ok: false, error: `Put a colon after \`ask\`, then your question: ${example}` };
+    // Free text: the rest of the comment, not parsed as flags.
+    const question = body.trim().replace(/^@?\S+\s+ask:/i, '').trim();
+    if (!question) return { ok: false, error: `Ask a question after the colon: ${example}` };
+    return { ok: true, command: { ...command, question: question.slice(0, 2000) } };
+  }
   let first = 2;
   if (verb === 'state') {
     const sub = (tokens[2] ?? '').toLowerCase();
     if (!STATE_SUBS.includes(sub)) return { ok: false, error: `\`${name} state\` needs one of: ${STATE_SUBS.join(', ')}` };
     command.tool = `state ${sub}` as ToolCommand;
     first = 3;
-  } else if (!['plan', 'apply', 'unlock', 'help', 'cancel'].includes(verb)) {
+  } else if (!['plan', 'apply', 'unlock', 'help', 'cancel', 'review'].includes(verb)) {
     command.tool = verb as ToolCommand;
   }
   const positional: string[] = [];
@@ -139,6 +152,7 @@ export const parseCommand = (body: string, names: string[]): ParseResult => {
     command.args = positional;
     return { ok: true, command };
   }
+  if (verb === 'review' && (command.targets.length || command.destroy || command.override || command.extraArgs.length || command.refreshOnly || command.replace?.length)) return { ok: false, error: `Only \`-p\`, \`-d\` and \`-w\` work with \`${name} review\`` };
   if ((command.refreshOnly || command.replace?.length) && verb !== 'plan') return { ok: false, error: '`--refresh-only` and `--replace` only work with plan' };
   if (command.refreshOnly && command.destroy) return { ok: false, error: '`--refresh-only` and `--destroy` can\'t be combined' };
   if (command.destroy && verb !== 'plan') return { ok: false, error: '`--destroy` only works with plan' };
@@ -232,7 +246,7 @@ export const toolArgs = (c: Command): string[] => {
 
 // Lists only what this server allows: a bare `apply` is left out when
 // projects must be applied one at a time.
-export const helpText = (name = 'teriac', oneProjectPerApply = false): string => [
+export const helpText = (name = 'teriac', oneProjectPerApply = false, ask = false): string => [
   '### teriac commands',
   '| Command | What it does |',
   '|---|---|',
@@ -245,6 +259,7 @@ export const helpText = (name = 'teriac', oneProjectPerApply = false): string =>
   ...(oneProjectPerApply ? [] : [`| \`${name} apply\` | Apply every planned project whose requirements are met |`]),
   `| \`${name} apply -p <project>\` | Apply one project${oneProjectPerApply ? ' (this server applies one project at a time)' : ''} |`,
   `| \`${name} unlock\` | Release this PR's locks and discard its plans |`,
+  ...(ask ? [`| \`${name} review\` | An AI review of this PR's latest plans (\`-p <project>\` for one) |`, `| \`${name} ask: <question>\` | An AI answer about this PR's plans and code (advisory) |`] : []),
   `| \`${name} cancel\` | Drop this PR's queued plans and applies, and stop running plans (running applies finish) |`,
   `| \`${name} state list -p <project> [address]\` | Resources in the state |`,
   `| \`${name} state show -p <project> <address>\` | One resource's attributes (sensitive values hidden) |`,

@@ -2,6 +2,7 @@
 import { DatabaseSync } from 'node:sqlite';
 import { mkdirSync } from 'node:fs';
 import { dirname } from 'node:path';
+import type { AiResult, CodeComment } from './ai.ts';
 
 export type RunKind = 'plan' | 'apply';
 export type RunStatus = 'queued' | 'running' | 'success' | 'failed';
@@ -45,6 +46,8 @@ export interface Run {
   planSha: string | null;     // sha256 of the plan file when it was made (applied only if unchanged)
   risk: { level: string; reasons: string[] } | null;
   secrets: string[];          // kinds of possible secrets found (and handled) in the output
+  ai: AiResult | null;        // the AI review of a plan, or help with a failed run
+  aiCode: { comments: CodeComment[]; model: string; posted: boolean } | null; // the AI's inline review of the code
   outputExpiredAt: string | null; // the log was cleared then (log_retention_days); the rest stays
 }
 
@@ -199,6 +202,8 @@ const toRun = (r: Record<string, any>): Run => ({
   planSha: r.plan_sha ?? null,
   risk: r.risk ? JSON.parse(r.risk) : null,
   secrets: r.secrets ? JSON.parse(r.secrets) : [],
+  ai: r.ai ? JSON.parse(r.ai) : null,
+  aiCode: r.ai_code ? JSON.parse(r.ai_code) : null,
   outputExpiredAt: r.output_expired_at ?? null,
 });
 
@@ -237,6 +242,8 @@ export class Store {
     if (!cols.includes('plan_sha')) this.db.exec('ALTER TABLE runs ADD COLUMN plan_sha TEXT');
     if (!cols.includes('risk')) this.db.exec('ALTER TABLE runs ADD COLUMN risk TEXT');
     if (!cols.includes('secrets')) this.db.exec('ALTER TABLE runs ADD COLUMN secrets TEXT');
+    if (!cols.includes('ai')) this.db.exec('ALTER TABLE runs ADD COLUMN ai TEXT');
+    if (!cols.includes('ai_code')) this.db.exec('ALTER TABLE runs ADD COLUMN ai_code TEXT');
     // The Metrics page reads runs by start time.
     this.db.exec('CREATE INDEX IF NOT EXISTS runs_started ON runs (started_at)');
     this.db.exec('CREATE INDEX IF NOT EXISTS audit_at ON audit (at)');
@@ -390,10 +397,32 @@ export class Store {
     return Number(res.lastInsertRowid);
   }
 
-  finishRun(id: number, r: { status: RunStatus; engine?: string; summary?: string | null; output: string; planPath?: string | null; hasChanges?: boolean; destroys?: number; policy?: string | null; mocks?: string[]; providers?: string[]; usage?: object | null; applied?: object | null; planSha?: string | null; risk?: object | null; secrets?: string[] }): void {
+  finishRun(id: number, r: { status: RunStatus; engine?: string; summary?: string | null; output: string; planPath?: string | null; hasChanges?: boolean; destroys?: number; policy?: string | null; mocks?: string[]; providers?: string[]; usage?: object | null; applied?: object | null; planSha?: string | null; risk?: object | null; secrets?: string[]; ai?: AiResult | null }): void {
     this.db.prepare(
-      'UPDATE runs SET status = ?, finished_at = ?, engine = ?, summary = ?, output = ?, plan_path = ?, has_changes = ?, destroys = ?, policy = ?, mocks = ?, providers = ?, usage = ?, applied = ?, plan_sha = ?, risk = ?, secrets = ? WHERE id = ?',
-    ).run(r.status, now(), r.engine ?? '', r.summary ?? null, r.output, r.planPath ?? null, r.hasChanges ? 1 : 0, r.destroys ?? 0, r.policy ?? null, r.mocks?.length ? JSON.stringify(r.mocks) : null, r.providers?.length ? JSON.stringify(r.providers) : null, r.usage ? JSON.stringify(r.usage) : null, r.applied ? JSON.stringify(r.applied) : null, r.planSha ?? null, r.risk ? JSON.stringify(r.risk) : null, r.secrets?.length ? JSON.stringify(r.secrets) : null, id);
+      'UPDATE runs SET status = ?, finished_at = ?, engine = ?, summary = ?, output = ?, plan_path = ?, has_changes = ?, destroys = ?, policy = ?, mocks = ?, providers = ?, usage = ?, applied = ?, plan_sha = ?, risk = ?, secrets = ?, ai = ? WHERE id = ?',
+    ).run(r.status, now(), r.engine ?? '', r.summary ?? null, r.output, r.planPath ?? null, r.hasChanges ? 1 : 0, r.destroys ?? 0, r.policy ?? null, r.mocks?.length ? JSON.stringify(r.mocks) : null, r.providers?.length ? JSON.stringify(r.providers) : null, r.usage ? JSON.stringify(r.usage) : null, r.applied ? JSON.stringify(r.applied) : null, r.planSha ?? null, r.risk ? JSON.stringify(r.risk) : null, r.secrets?.length ? JSON.stringify(r.secrets) : null, r.ai ? JSON.stringify(r.ai) : null, id);
+  }
+
+  // Whether a plan of this PR's project already had an AI review (review: first).
+  hadAiReview(repo: string, pr: number, project: string, what: 'plan' | 'code' = 'plan'): boolean {
+    const sql = what === 'plan'
+      ? `SELECT 1 FROM runs WHERE repo = ? AND pr = ? AND project = ? AND kind = 'plan' AND ai LIKE '{"kind":"review"%' LIMIT 1`
+      : `SELECT 1 FROM runs WHERE repo = ? AND pr = ? AND project = ? AND kind = 'plan' AND ai_code IS NOT NULL LIMIT 1`;
+    return !!this.db.prepare(sql).get(repo, pr, project);
+  }
+
+  setRunAiCode(id: number, code: { comments: CodeComment[]; model: string; posted: boolean }): void {
+    this.db.prepare('UPDATE runs SET ai_code = ? WHERE id = ?').run(JSON.stringify(code), id);
+  }
+
+  // A review asked for after the plan (`teriac review`): its result and the raised risk.
+  setRunReview(id: number, ai: AiResult, risk: object | null): void {
+    this.db.prepare('UPDATE runs SET ai = ?, risk = ? WHERE id = ?').run(JSON.stringify(ai), risk ? JSON.stringify(risk) : null, id);
+  }
+
+  // The AI's result changed after the run finished (its fixes were posted on the code).
+  setRunAi(id: number, ai: AiResult): void {
+    this.db.prepare('UPDATE runs SET ai = ? WHERE id = ?').run(JSON.stringify(ai), id);
   }
 
   // ---- emergency access ----

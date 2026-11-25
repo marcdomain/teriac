@@ -8,6 +8,7 @@ import type { ApprovalRule, ProjectRule, Requirement, Action, Principal, DriftSc
 import { REQUIREMENTS, validateDrift } from './config.ts';
 import type { Provider } from './teriac.ts';
 import { validateStaleBase, type StaleBaseMode } from './safety-config.ts';
+import { validateAiOverride, type AiOverride } from './ai-config.ts';
 
 export interface ProjectConfig {
   name?: string;
@@ -22,6 +23,7 @@ export interface ProjectConfig {
   approvals?: ApprovalRule[];
   permissions?: Partial<Record<Action, Principal[]>>;
   apply_requirements?: Requirement[];
+  ai?: AiOverride;                // can only turn AI off or drop features for this project
 }
 
 export interface RepoConfig {
@@ -35,6 +37,7 @@ export interface RepoConfig {
   reapprove_on_change?: boolean;  // a repo can turn this on, never off
   keep_approval_on_rebase?: boolean; // a repo can turn this off, never on
   stale_base?: StaleBaseMode;     // a repo can make this stricter
+  ai?: AiOverride;                // a repo can turn AI off or drop features, never turn it on
   warnings: string[];
 }
 
@@ -68,13 +71,15 @@ const parseConfig = (doc: Record<string, any>): RepoConfig => {
       depends_on: p.depends_on === undefined ? undefined : (Array.isArray(p.depends_on) ? p.depends_on : [p.depends_on]).map((d: unknown) => String(d).replace(/^\.\/|\/+$/g, '')),
       approvals: p.approvals, permissions: p.permissions,
       apply_requirements: requirements(p.apply_requirements, `projects[${i}]`, warnings),
+      ai: validateAiOverride(p.ai, `projects[${i}].ai`),
     };
   });
+  for (const [i, r] of (doc.rules ?? []).entries()) if (r) r.ai = validateAiOverride(r.ai, `rules[${i}].ai`);
   const rules: ProjectRule[] = [
     ...(doc.rules ?? []),
     // Per-project rules match the project's name (or dir).
-    ...projects.filter(p => p.approvals || p.permissions || p.apply_requirements?.length)
-      .map(p => ({ match: p.name ?? p.dir, approvals: p.approvals, permissions: p.permissions, apply_requirements: p.apply_requirements })),
+    ...projects.filter(p => p.approvals || p.permissions || p.apply_requirements?.length || p.ai)
+      .map(p => ({ match: p.name ?? p.dir, approvals: p.approvals, permissions: p.permissions, apply_requirements: p.apply_requirements, ai: p.ai })),
   ];
   return {
     source: 'teriac.yaml',
@@ -88,6 +93,7 @@ const parseConfig = (doc: Record<string, any>): RepoConfig => {
     reapprove_on_change: doc.reapprove_on_change === true ? true : undefined,
     keep_approval_on_rebase: doc.keep_approval_on_rebase === false ? false : undefined,
     stale_base: validateStaleBase(doc.stale_base, 'stale_base'),
+    ai: validateAiOverride(doc.ai, 'ai'),
     warnings,
   };
 };

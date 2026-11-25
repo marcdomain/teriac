@@ -118,9 +118,40 @@ spec:
               value: {{ .Values.config.verifySignatures | quote }}
             - name: TERIAC_MODULE_AUTH
               value: {{ .Values.config.moduleAuth | quote }}
+            - name: TERIAC_SEASONAL_LOGO
+              value: {{ .Values.config.seasonalLogo | default false | quote }}
             {{- with .Values.config.logRetentionDays }}
             - name: TERIAC_LOG_RETENTION_DAYS
               value: {{ . | quote }}
+            {{- end }}
+            {{- with .Values.ai.provider }}
+            - name: TERIAC_AI_PROVIDER
+              value: {{ . | quote }}
+            - name: TERIAC_AI_EFFORT
+              value: {{ $.Values.ai.effort | default "medium" | quote }}
+            {{- with $.Values.ai.model }}
+            - name: TERIAC_AI_MODEL
+              value: {{ . | quote }}
+            {{- end }}
+            {{- with $.Values.ai.features }}
+            - name: TERIAC_AI_FEATURES
+              value: {{ join "," . | quote }}
+            {{- end }}
+            {{- if and (eq . "anthropic") $.Values.ai.existingSecret }}
+            - name: ANTHROPIC_API_KEY
+              valueFrom:
+                secretKeyRef: { name: {{ $.Values.ai.existingSecret | quote }}, key: api-key }
+            {{- end }}
+            {{- if and (eq . "bedrock") $.Values.ai.bedrock.region }}
+            - name: AWS_REGION
+              value: {{ $.Values.ai.bedrock.region | quote }}
+            {{- end }}
+            {{- if eq . "vertex" }}
+            - name: ANTHROPIC_VERTEX_PROJECT_ID
+              value: {{ required "ai.vertex.projectId is required with ai.provider=vertex" $.Values.ai.vertex.projectId | quote }}
+            - name: CLOUD_ML_REGION
+              value: {{ $.Values.ai.vertex.region | default "global" | quote }}
+            {{- end }}
             {{- end }}
             {{- if .Values.backup.enabled }}
             {{- $type := include "teriac.backupType" . }}

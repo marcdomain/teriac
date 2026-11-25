@@ -116,7 +116,9 @@ const cookieOf = (res: Response) => res.headers.getSetCookie().map(c => c.split(
 
 describe('dashboard HTTP auth', () => {
   test('sign-in options reflect the server config', async () => {
-    assert.deepEqual(await (await fetch(`${base}/auth/config`)).json(), { password: true, oidc: { name: 'Okta' }, github: false, token: true });
+    const { festive, ...signIn } = await (await fetch(`${base}/auth/config`)).json();
+    assert.deepEqual(signIn, { password: true, oidc: { name: 'Okta' }, github: false, token: true });
+    assert.equal(typeof festive, 'boolean');
   });
 
   test('API needs a session or token', async () => {

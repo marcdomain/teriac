@@ -22,6 +22,9 @@ import {
   RateLimiter, cookie, SESSION_COOKIE, OIDC_COOKIE, GITHUB_COOKIE, type GitHubLogin, type GitHubUserToken,
 } from './auth.ts';
 import { metrics } from './metrics.ts';
+import YAML from 'yaml';
+import { label, resolveAi, type Ai } from './ai.ts';
+import { christmas } from './season.ts';
 import { log } from './log.ts';
 
 const MAX_BODY = 25 * 1024 * 1024; // GitHub's webhook limit
@@ -44,6 +47,9 @@ for (const f of ['geist-latin-wght-normal.woff2', 'geist-mono-latin-wght-normal.
   try { FONTS[`/fonts/${f}`] = readFileSync(join(WEB_DIR, 'fonts', f)); } catch { /* not shipped */ }
 }
 // The spinner GitHub shows in teriac's "Running…" replies (fetched by GitHub, so no auth).
+// The tab icon with a Christmas hat, served instead in season (season.ts).
+let FESTIVE_ICON: string | null = null;
+try { FESTIVE_ICON = readFileSync(join(WEB_DIR, 'logo-christmas.svg'), 'utf-8'); } catch { /* not shipped */ }
 let SPINNER: Buffer | null = null;
 try { SPINNER = readFileSync(join(WEB_DIR, 'spinner.gif')); } catch { /* not shipped */ }
 
@@ -102,6 +108,8 @@ export interface HttpDeps {
   grants?: NotifyDeps;                        // emergency access (break_glass in repos.yaml)
   config?: ServerConfig;                      // for the Guardrails page (settings only, no secrets)
   backups?: BackupScheduler;                  // scheduled database backups (TERIAC_BACKUP_*)
+  ai?: Ai;                                    // AI answers and policy drafts (TERIAC_AI_PROVIDER)
+  aiLimiter?: RateLimiter;
 }
 
 // The guardrails in force, for the dashboard: freezes (on now or not), protected resources,
@@ -125,10 +133,24 @@ const safetySummary = (c: ServerConfig | undefined, now = new Date()) => {
       id: r.id, reapproveOnChange: r.reapprove_on_change ?? true, keepApprovalOnRebase: r.keep_approval_on_rebase ?? false,
       staleBase: r.stale_base ?? 'warn', verifyPlan: r.verify_plan ?? true, secretScan: r.secret_scan ?? null,
     })),
+    // Where AI help is on: the server's ceiling, then each level of repos.yaml that sets `ai`,
+    // each with what it resolves to (teriac.yaml can still narrow it in the repo).
+    ai: c.ai ? {
+      provider: c.ai.provider, model: c.ai.model.replace(/^anthropic\./, ''), effort: c.ai.effort, features: c.ai.features,
+      levels: [
+        { scope: 'server', match: '*', set: c.aiPolicy ?? null, result: resolveAi(c.ai, [c.aiPolicy]) },
+        ...c.repos.flatMap(r => [
+          ...(r.ai ? [{ scope: 'repo', match: r.id, set: r.ai, result: resolveAi(c.ai, [c.aiPolicy, r.ai]) }] : []),
+          ...(r.projects ?? []).filter(p => p.ai).map(p => ({ scope: 'project', match: `${r.id} · ${p.match}`, set: p.ai!, result: resolveAi(c.ai, [c.aiPolicy, r.ai, p.ai]) })),
+        ]),
+      ],
+    } : null,
   };
 };
 
 const defaultLimiter = new RateLimiter(10, 15 * 60_000);
+// AI requests cost money: 20 per person per 15 minutes.
+const aiLimiter = new RateLimiter(20, 15 * 60_000);
 
 // Who is calling: an API token (automation, admin) or a dashboard session cookie. A session
 // from a sign-in method that has since been turned off no longer counts. GitHub sessions
@@ -167,6 +189,7 @@ const RECHECK_MS = 10 * 60_000;
 const GITHUB_SESSION_HOURS = 8;
 
 export const createHttpServer = (deps: HttpDeps): Server => {
+  const festive = () => deps.config?.seasonalLogo !== false && christmas();
   const show = presenter(deps.platforms ?? {}, deps.people ?? []);
   const ghTokens = new Map<string, GitHubUserToken>();
   const rechecking = new Set<string>();
@@ -249,6 +272,7 @@ export const createHttpServer = (deps: HttpDeps): Server => {
         oidc: auth.oidc ? { name: auth.oidc.name } : null,
         github: !!deps.github,
         token: !!auth.apiToken,
+        festive: festive(),
       });
     }
     if (req.method === 'POST' && url.pathname === '/auth/login') {
@@ -401,6 +425,51 @@ export const createHttpServer = (deps: HttpDeps): Server => {
         const adapter = deps.adapters[platformForHost(host, deps.platforms ?? {})];
         const notified = await deps.app.dashboardUnlock(adapter, lock, who);
         return send(res, 200, { released: lock, notified });
+      }
+
+      // ---- AI: what is on, questions about a run, policy drafts ----
+      if (req.method === 'GET' && url.pathname === '/api/ai') {
+        const ai = deps.ai;
+        const top = deps.app.aiServerSettings();
+        return send(res, 200, ai ? { enabled: true, provider: ai.cfg.provider, model: ai.label, features: ai.cfg.features, defaultOn: !!top, policy: !!top?.features.includes('policy'), lastOk: ai.lastOk,
+          // Only a refusal newer than the last answer: what's wrong now.
+          lastError: ai.lastError && (!ai.lastOk || ai.lastError.at > ai.lastOk) && need('admin') ? ai.lastError : null } : { enabled: false });
+      }
+      // Whether "Ask about this run" is on for this run's project (repos.yaml and teriac.yaml).
+      const runAi = /^\/api\/runs\/(\d+)\/ai$/.exec(url.pathname);
+      if (runAi && req.method === 'GET') {
+        const r = deps.store.getRun(Number(runAi[1]));
+        if (!r || !inScope(r.repo)) return send(res, 404, { error: 'not found' });
+        const s = await deps.app.aiForRun(deps.adapters[platformForHost(r.repo.split('/')[0], deps.platforms ?? {})], r, 'ask');
+        return send(res, 200, { ask: !!s, model: s ? label(s) : null });
+      }
+      const askRun = /^\/api\/runs\/(\d+)\/ask$/.exec(url.pathname);
+      if ((askRun || url.pathname === '/api/ai/policy') && req.method === 'POST') {
+        const ai = deps.ai;
+        if (!ai) return send(res, 404, { error: 'AI help is not set up (TERIAC_AI_PROVIDER).' });
+        // Every request is billed to the server's AI account: a few per person per quarter hour.
+        if (!(deps.aiLimiter ?? aiLimiter).allow(`${who.via}:${who.name}`)) return send(res, 429, { error: 'Too many AI requests; try again in a few minutes.' });
+        const body = JSON.parse((await readBody(req)).toString('utf-8') || '{}') as { question?: unknown; request?: unknown };
+        if (askRun) {
+          const r = deps.store.getRun(Number(askRun[1]));
+          if (!r || !inScope(r.repo)) return send(res, 404, { error: 'not found' });
+          const question = typeof body.question === 'string' ? body.question.trim().slice(0, 2000) : '';
+          if (!question) return send(res, 400, { error: 'question is required' });
+          const s = await deps.app.aiForRun(deps.adapters[platformForHost(r.repo.split('/')[0], deps.platforms ?? {})], r, 'ask');
+          if (!s) return send(res, 404, { error: 'AI answers are turned off for this project (ai in repos.yaml or teriac.yaml).' });
+          const answer = await deps.app.askAboutRun(r, question, s);
+          deps.store.audit({ repo: r.repo, pr: r.pr, user: who.name, action: 'ai_ask', project: r.project, allowed: true, reason: `dashboard, run ${r.id}: ${question.slice(0, 300)}` });
+          return answer ? send(res, 200, { answer, model: label(s) }) : send(res, 502, { error: 'No AI answer this time (the request failed or was declined).' });
+        }
+        if (!need('admin')) return send(res, 403, { error: 'Drafting policies needs the admin role.' });
+        const top = deps.app.aiServerSettings();
+        if (!top?.features.includes('policy')) return send(res, 404, { error: 'AI policy drafts are turned off (TERIAC_AI_FEATURES, or ai at the top of repos.yaml).' });
+        const request = typeof body.request === 'string' ? body.request.trim() : '';
+        if (!request) return send(res, 400, { error: 'request is required' });
+        const draft = await ai.draftPolicy(request, top);
+        if (!draft) return send(res, 502, { error: 'No AI draft this time (the request failed or was declined).' });
+        deps.store.audit({ repo: '*', pr: 0, user: who.name, action: 'ai_policy_draft', project: '*', allowed: true, reason: `${draft.rules.length} rules for: ${request.slice(0, 300)}` });
+        return send(res, 200, { ...draft, model: label(top), yaml: YAML.stringify({ policies: { rules: draft.rules } }) });
       }
 
       // ---- emergency access ----
@@ -628,6 +697,10 @@ export const createHttpServer = (deps: HttpDeps): Server => {
     if (font) {
       res.writeHead(200, { 'Content-Type': 'font/woff2', 'Cache-Control': 'public, max-age=604800, immutable', 'X-Content-Type-Options': 'nosniff' });
       return res.end(font);
+    }
+    if (req.method === 'GET' && url.pathname === '/favicon.svg' && FESTIVE_ICON && festive()) {
+      res.writeHead(200, { 'Content-Type': 'image/svg+xml', ...WEB_HEADERS });
+      return res.end(FESTIVE_ICON);
     }
     const page = req.method === 'GET' ? WEB[url.pathname] : undefined;
     if (page) {

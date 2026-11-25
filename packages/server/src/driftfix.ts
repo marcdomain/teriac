@@ -6,10 +6,11 @@ import { readFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { locate } from './blame.ts';
 import type { Author } from './blame.ts';
+import { applyEdits, label, type Ai, type AiSettings, type DriftDecision } from './ai.ts';
 
 export interface DriftEdit { address: string; file: string; attribute: string; from: unknown; to: unknown }
 export interface DriftManual { address: string; reason: string; author?: Author | null }
-export interface DriftFix { files: { path: string; content: string }[]; edits: DriftEdit[]; manual: DriftManual[] }
+export interface DriftFix { files: { path: string; content: string }[]; edits: DriftEdit[]; manual: DriftManual[]; ai?: { model: string; decisions: DriftDecision[] } }
 
 type Scalar = string | number | boolean;
 const isScalar = (v: unknown): v is Scalar => typeof v === 'string' || typeof v === 'number' || typeof v === 'boolean';
@@ -93,6 +94,44 @@ export const planDriftFix = (
   return { files, edits, manual };
 };
 
+// For what the rules above leave to a person: the AI decides adopt (edits the code), revert
+// (the PR leaves it, so applying the base branch puts it back) or unsure. Its edits go in the
+// same PR, listed apart from the mechanical ones.
+export const aiDriftFix = async (ai: Ai, root: string, projectDir: string, project: string, plan: Record<string, any>, fix: DriftFix, s: AiSettings = ai.defaults): Promise<DriftFix> => {
+  const addresses = [...new Set(fix.manual.map(m => m.address))];
+  if (!addresses.length) return fix;
+  const files = new Map(fix.files.map(f => [f.path, f.content]));
+  for (const a of addresses) {
+    const loc = locate(root, projectDir, a);
+    if (loc && !files.has(loc.file)) {
+      try { files.set(loc.file, readFileSync(join(root, loc.file), 'utf-8')); } catch { /* unreadable */ }
+    }
+  }
+  if (!files.size) return fix;
+  const decisions = await ai.driftDecisions({ project, plan, addresses, files: [...files].map(([path, text]) => ({ path, text })) }, s);
+  if (!decisions?.length) return fix;
+  const before = new Map(files);
+  // Each adopt may only edit inside its own resource's block.
+  for (const d of decisions) {
+    const loc = locate(root, projectDir, d.address);
+    d.edits = d.edits.filter(e => loc && e.path === loc.file && e.startLine > loc.start && e.endLine < loc.end);
+    if (d.decision === 'adopt' && !d.edits.length) { d.decision = 'unsure'; d.why = `${d.why} (no safe code change inside its resource block)`; }
+  }
+  const { skipped } = applyEdits(files, decisions.flatMap(d => d.edits));
+  // An adopt whose edits didn't all apply is left to a person.
+  for (const d of decisions) {
+    if (d.decision === 'adopt' && d.edits.some(e => skipped.includes(e))) { d.decision = 'unsure'; d.why = `${d.why} (its code change could not be applied cleanly)`; }
+  }
+  const changed = [...files].filter(([path, text]) => before.get(path) !== text || fix.files.some(f => f.path === path));
+  const decided = new Set(decisions.filter(d => d.decision !== 'unsure').map(d => d.address));
+  return {
+    ...fix,
+    files: changed.map(([path, content]) => ({ path, content })),
+    manual: fix.manual.filter(m => !decided.has(m.address)),
+    ai: { model: label(s), decisions },
+  };
+};
+
 export const driftFixBody = (project: string, branch: string, fix: DriftFix, schedule: string): string => {
   const lines = [
     `Drift check \`${schedule}\` found changes made outside Terraform in \`${project}\` on \`${branch}\`.`,
@@ -102,6 +141,14 @@ export const driftFixBody = (project: string, branch: string, fix: DriftFix, sch
     '**Updated in code**',
     ...fix.edits.map(e => `- \`${e.address}\` · \`${e.attribute}\`: ${JSON.stringify(e.from)} → ${JSON.stringify(e.to)} (\`${e.file}\`)`),
   ];
+  const adopt = fix.ai?.decisions.filter(d => d.decision === 'adopt') ?? [];
+  const revert = fix.ai?.decisions.filter(d => d.decision === 'revert') ?? [];
+  if (adopt.length) {
+    lines.push('', `**🤖 Updated in code by AI** <sub>${fix.ai!.model} · check each change</sub>`, ...adopt.map(d => `- \`${d.address}\`: ${d.why}`));
+  }
+  if (revert.length) {
+    lines.push('', `**🤖 Left for applying back** <sub>${fix.ai!.model}: looks accidental or unsafe, so the code is not changed; apply \`${branch}\` to put it back</sub>`, ...revert.map(d => `- \`${d.address}\`: ${d.why}`));
+  }
   if (fix.manual.length) {
     lines.push('', '**Needs a person** (teriac does not edit these)');
     for (const m of fix.manual) lines.push(`- \`${m.address}\`: ${m.reason}${m.author ? `. Last changed by ${m.author.name} in ${m.author.sha.slice(0, 7)}` : ''}`);

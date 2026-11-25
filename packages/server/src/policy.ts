@@ -57,7 +57,7 @@ const needs = (action: Action, project: Project, list: Principal[], where = '') 
 export const repoPolicyFor = (policies: RepoPolicy[], repo: Repo): RepoPolicy | null =>
   policies.find(p => matchGlob(p.id, `${repo.host}/${repo.fullName}`)) ?? null;
 
-const ruleMatches = (rule: ProjectRule, project: Project) =>
+export const ruleMatches = (rule: ProjectRule, project: Project) =>
   matchGlob(rule.match, project.name) || matchGlob(rule.match, project.dir);
 
 export interface EffectiveRules {

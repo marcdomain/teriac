@@ -5,6 +5,7 @@ import { join, resolve } from 'node:path';
 import YAML from 'yaml';
 import { parseCron, validTimeZone } from './cron.ts';
 import { parseBackup, type BackupConfig } from './backup.ts';
+import { loadAiConfig, validateAiOverride, type AiConfig, type AiOverride } from './ai-config.ts';
 import { randomBytes } from 'node:crypto';
 import type { AuthConfig, DashboardUser } from './auth.ts';
 import { REACTIONS, type Ack } from './vcs/types.ts';
@@ -42,6 +43,7 @@ export interface ProjectRule {
   approvals?: ApprovalRule[];
   apply_requirements?: Requirement[];
   two_person_rule?: boolean;                  // the PR author may not apply
+  ai?: AiOverride;                            // AI help for matching projects (first matching rule with one)
 }
 
 export interface RepoPolicy {
@@ -80,6 +82,7 @@ export interface RepoPolicy {
   protected?: ProtectedConfig;
   projects?: ProjectRule[];
   drift?: DriftSchedule[];                    // server-side schedules (id must be one repo)
+  ai?: AiOverride;                            // AI help for this repo
 }
 
 // ---- drift detection ----
@@ -129,6 +132,7 @@ export interface ServerPolicy {
   breakGlass?: BreakGlassConfig;
   summary?: SummaryConfig;
   keyRotation?: KeyRotationConfig;
+  aiPolicy?: AiOverride;                      // `ai`: AI help everywhere, before repo and project settings
 }
 
 // key_rotation in repos.yaml: remind people to rotate the GitHub App key every N days.
@@ -179,6 +183,9 @@ export interface ServerConfig {
   summary?: SummaryConfig;
   keyRotation?: KeyRotationConfig;        // key_rotation in repos.yaml
   backup?: BackupConfig;                  // scheduled database backups (TERIAC_BACKUP_*)
+  ai?: AiConfig;                          // AI reviews and help (TERIAC_AI_*), off unless a provider is set
+  aiPolicy?: AiOverride;                  // `ai` at the top of repos.yaml
+  seasonalLogo?: boolean;                 // TERIAC_SEASONAL_LOGO (default on): the Christmas hat in season
 }
 
 // A secret that may change while the server runs: re-read from its file when the file
@@ -291,6 +298,7 @@ export const parseServerPolicy = (text: string): ServerPolicy => {
     breakGlass: validateBreakGlass(doc.break_glass, 'break_glass', channels),
     summary: validateSummary(doc.summary, 'summary', channels),
     keyRotation: validateKeyRotation(doc.key_rotation, channels),
+    aiPolicy: validateAiOverride(doc.ai, 'ai'),
   };
 };
 
@@ -412,8 +420,10 @@ export const parseReposYaml = (text: string): RepoPolicy[] => {
     validateRisk(repo.risk, `${at}.risk`);
     validateFreezes(repo.freezes, `${at}.freezes`);
     validateProtected(repo.protected, `${at}.protected`);
+    repo.ai = validateAiOverride(repo.ai, `${at}.ai`);
     for (const [j, p] of asList<ProjectRule>(repo.projects, `repos[${i}].projects`).entries()) {
       if (typeof p.match !== 'string') throw new Error(`repos[${i}].projects[${j}].match is required`);
+      p.ai = validateAiOverride(p.ai, `repos[${i}].projects[${j}].ai`);
       for (const action of Object.keys(p.permissions ?? {})) {
         if (!ACTIONS.includes(action as Action)) throw new Error(`repos[${i}].projects[${j}]: unknown action "${action}"`);
       }
@@ -534,5 +544,8 @@ export const loadConfig = (env: NodeJS.ProcessEnv = process.env): ServerConfig =
     keyRotation: policy.keyRotation,
     backup: parseBackup({ ...env, TERIAC_BACKUP_AZURE_KEY: readSecret(env, 'TERIAC_BACKUP_AZURE_KEY') }, policy.channels),
     auth: loadAuth(env, publicUrl, policy.users),
+    ai: loadAiConfig(env),
+    aiPolicy: policy.aiPolicy,
+    seasonalLogo: parseBool(env.TERIAC_SEASONAL_LOGO, 'TERIAC_SEASONAL_LOGO') ?? true,
   };
 };

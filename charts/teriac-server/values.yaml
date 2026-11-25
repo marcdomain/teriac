@@ -52,7 +52,25 @@ config:
   logLevel: info
   verifySignatures: true        # check vendor signatures on downloaded Terraform/OpenTofu/Terragrunt; false for mirrors without .sig files
   moduleAuth: true              # Terraform's git::https:// module downloads sign in with a read-only App token (private modules work); false to turn off
+  seasonalLogo: true            # a Christmas hat on the dashboard logo from 1 December to 6 January
   logRetentionDays: ""          # clear run logs this many days after a PR's last apply (summaries and PR comments stay); per repo: log_retention_days
+
+# AI help from Claude (off unless provider is set): a plain-English review in every plan
+# comment, the cause and a suggested fix for failed runs, drift-fix decisions, `teriac ask`,
+# and policy drafts on the dashboard. Advisory only: it can raise a plan's risk, never lower
+# it, and never approves or applies. Sensitive values and secrets are hidden before sending.
+ai:
+  provider: ""                  # anthropic, bedrock, vertex or foundry; empty: off
+  model: ""                     # default claude-opus-5-5 (anthropic.claude-opus-5-5 on Bedrock)
+  effort: medium                # low, medium, high, xhigh, max: deeper reviews cost more
+  features: []                  # default all: review, code, fix, drift, policy, ask
+  existingSecret: ""            # anthropic: Secret with key `api-key` (ANTHROPIC_API_KEY)
+  bedrock:
+    region: ""                  # e.g. eu-west-1; credentials from the pod's role (serviceAccount.annotations)
+  vertex:
+    projectId: ""               # Google Cloud project; credentials from Workload Identity
+    region: global
+  # foundry: set ANTHROPIC_FOUNDRY_RESOURCE and ANTHROPIC_FOUNDRY_API_KEY in extraEnv / extraEnvFrom
 
 # Contents of repos.yaml: rules, approvers, channels, people, drift schedules, and the
 # safety settings (risk, freezes, protected resources, secret scan, emergency access,

@@ -27,6 +27,7 @@ teriac comes in two parts. Use either one, or both together:
 - **Projects:** each project gets the version it asks for (`.terraform-version`, `required_version`, Terragrunt config), automatically on `cd`.
 - **Runs:** `teriac plan`, `apply`, `destroy`, `init`, `fmt` and `validate`, with targets taken from files, and `teriac exec` to run one command with any version.
 - **Speed and health:** a shared provider cache across projects, and `teriac doctor` to check the setup.
+- **AI help (optional):** `teriac explain` reviews a plan in plain English; `teriac fix` finds why a plan failed and suggests the fix.
 
 Everything lives in `~/.teriac/`; upgrading `teriac` itself never touches your installed versions. [Install it](#installation).
 
@@ -45,6 +46,7 @@ one clear comment, and applies when someone comments `teriac apply`:
 - **Terragrunt and OpenTofu built in:** dependencies run in order, and only the affected units run.
 - **Drift:** scheduled checks that name who changed what, alerts in Slack, Teams, Discord or Google Chat, and optional fix PRs.
 - **Dashboard:** runs, locks, drift, the audit log, guardrails, and delivery metrics (PR to applied, failure rate, time to fix), plus a weekly summary in chat.
+- **AI help (optional):** a plain-English review of every plan, inline code review with one-click suggestions, one-click fixes for failed runs, drift decisions, `teriac ask` and policy drafts, from Claude on Anthropic's API, Bedrock, Vertex AI or Foundry. Advisory only.
 - **Easy to run:** a Helm chart or one Docker image (signed, amd64 and arm64), with scheduled database backups to S3, GCS or Azure.
 
 ```sh
@@ -384,6 +386,22 @@ teriac destroy --file main.tf -- -auto-approve
 `--file` parses `.tf` files and auto-generates `-target` flags for every `resource`, `data`, and `module` block found. Comments are stripped before parsing.
 
 All commands support `--provider tofu` to use OpenTofu instead.
+
+### AI review and fixes
+
+```sh
+export ANTHROPIC_API_KEY=sk-ant-...
+teriac explain                     # plan, then a plain-English review of what will happen
+teriac explain -- -var="env=prod"
+teriac fix                         # validate and plan; on failure, the cause and a suggested fix
+teriac fix --write                 # write the fix into the files (otherwise it asks)
+teriac fix --log ci-output.txt     # diagnose a failure from CI
+```
+
+Uses Claude (`claude-opus-5-5`; change with `TERIAC_AI_MODEL`). For Amazon Bedrock or Google Vertex
+AI, set `TERIAC_AI_PROVIDER=bedrock` or `vertex` and install `@anthropic-ai/bedrock-sdk` or
+`@anthropic-ai/vertex-sdk`. Values Terraform marks sensitive, and anything that looks like a key or
+token, are hidden before anything is sent. The AI only advises: check its review and fixes yourself.
 
 ---
 

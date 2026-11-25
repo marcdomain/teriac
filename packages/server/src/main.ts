@@ -1,6 +1,6 @@
 // teriac-server entry point.
 import { join } from 'node:path';
-import { existsSync, mkdirSync } from 'node:fs';
+import { existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { loadConfig } from './config.ts';
 import { log, addSecret, addSecretsFromEnv } from './log.ts';
 
@@ -18,6 +18,10 @@ try {
 // teriac's core keeps tool binaries under TERIAC_HOME; it must be set before the core loads.
 process.env.TERIAC_HOME = join(config.dataDir, 'teriac');
 mkdirSync(join(config.dataDir, 'plugin-cache'), { recursive: true });
+// The Claude API key can come from a mounted file (the SDK reads only ANTHROPIC_API_KEY).
+if (process.env.ANTHROPIC_API_KEY_FILE && !process.env.ANTHROPIC_API_KEY) {
+  try { process.env.ANTHROPIC_API_KEY = readFileSync(process.env.ANTHROPIC_API_KEY_FILE, 'utf-8').trim(); } catch (err) { log.error(`teriac-server cannot start: cannot read ANTHROPIC_API_KEY_FILE: ${(err as Error).message}`); process.exit(1); }
+}
 addSecretsFromEnv(process.env);
 addSecret(config.github?.privateKey);
 
@@ -56,12 +60,17 @@ if (config.backup && remote && !existsSync(dbPath)) {
 }
 
 const store = new Store(dbPath);
-const app = new App({ config, store, resolver: teriacResolver(config.defaultVersion) });
+const { Ai } = await import('./ai.ts');
+const ai = config.ai ? new Ai(config.ai) : undefined;
+if (config.ai) log.info('AI help on', { provider: config.ai.provider, model: config.ai.model, features: config.ai.features });
+const app = new App({ config, store, resolver: teriacResolver(config.defaultVersion), ai });
 const adapters = { github: config.github ? new GitHubAdapter(config.github) : undefined };
 const drift = new DriftScheduler({
   config, store, resolver: teriacResolver(config.defaultVersion),
   adapters: Object.values(adapters).filter(a => a !== undefined),
   limited: fn => app.limited(fn),
+  ai,
+  aiSettings: (policy, repoConfig, project) => app.aiSettings(policy, repoConfig, project),
 });
 // Downloads of OpenTofu and Terragrunt from GitHub use the App's token (higher limits,
 // and no anonymous-request timeouts), unless GITHUB_TOKEN is set. Installation tokens
@@ -100,7 +109,7 @@ const backups = config.backup && remote ? new BackupScheduler({
 let ready = false;
 let stopping = false;
 const server = createHttpServer({
-  app, store, adapters, drift, auth: config.auth,
+  app, store, adapters, drift, auth: config.auth, ai,
   platforms: config.github ? { [config.github.host]: 'github' } : {},
   people: config.people,
   avatars: new Avatars(config.dataDir, config.github ? { [config.github.host]: 'github' } : {}),
