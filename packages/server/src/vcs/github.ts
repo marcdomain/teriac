@@ -511,6 +511,15 @@ export class GitHubAdapter implements VcsAdapter {
   async openPullRequest(repo: Repo, pr: { base: string; branch: string; title: string; body: string; files: { path: string; content: string }[] }): Promise<string | null> {
     const ref = await this.api(repo, 'GET', `/repos/${repo.fullName}/git/ref/heads/${pr.branch.split('/').map(encodeURIComponent).join('/')}`, undefined, [404]);
     if (ref.status === 200) return null;
+    try {
+      return await this.createPullRequest(repo, pr);
+    } catch (err) {
+      if (/HTTP 403/.test((err as Error).message)) throw new Error('the GitHub App needs Contents: Read & write to open pull requests (App settings → Permissions, then accept the change on the installation)');
+      throw err;
+    }
+  }
+
+  private async createPullRequest(repo: Repo, pr: { base: string; branch: string; title: string; body: string; files: { path: string; content: string }[] }): Promise<string | null> {
     const { data: baseRef } = await this.api(repo, 'GET', `/repos/${repo.fullName}/git/ref/heads/${encodeURIComponent(pr.base)}`);
     const baseSha = baseRef.object.sha;
     const { data: baseCommit } = await this.api(repo, 'GET', `/repos/${repo.fullName}/git/commits/${baseSha}`);

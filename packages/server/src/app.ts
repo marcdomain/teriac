@@ -1412,10 +1412,17 @@ export class App {
       }
       const branch = adoptBranch(project.name, result.resources);
       const n = result.resources.length;
-      const url = await a.adapter.openPullRequest!(a.repo, {
-        base: a.base, branch, title: `Bring ${n === 1 ? result.resources[0].address : `${n} resources`} under Terraform in ${project.name}`,
-        body: adoptBody(project.name, a.base, result, { user: who, from: a.from }), files: [result.file!],
-      });
+      let url: string | null;
+      try {
+        url = await a.adapter.openPullRequest!(a.repo, {
+          base: a.base, branch, title: `Bring ${n === 1 ? result.resources[0].address : `${n} resources`} under Terraform in ${project.name}`,
+          body: adoptBody(project.name, a.base, result, { user: who, from: a.from }), files: [result.file!],
+        });
+      } catch (err) {
+        const why = (err as Error).message.slice(0, 300);
+        audit(true, project.name, `planned clean, but the PR could not be opened: ${why}`);
+        return { ok: false, result, message: `❌ The code for ${result.resources.map(r => `\`${r.address}\``).join(', ')} plans cleanly, but the PR could not be opened: ${why}.` };
+      }
       audit(true, project.name, url ? `opened ${url} (${result.resources.map(r => r.address).join(', ')}${result.model ? `, by ${result.model}` : ''})` : `skipped: branch ${branch} exists`);
       if (!url) return { ok: false, result, message: `ℹ️ A PR for these resources is already open (branch \`${branch}\`). Merge or close it first.` };
       const changes = result.changes.length ? ` ⚠️ Applying it also changes ${result.changes.map(c => `\`${c.address}\``).join(', ')}; see the PR.` : ' Applying it imports them and changes nothing.';

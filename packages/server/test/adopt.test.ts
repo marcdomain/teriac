@@ -347,6 +347,13 @@ test('server: permission, a PR against the base branch, audit; a second request 
   assert.equal(job.status, 'failed'); // the fake adapter opens only one PR
   assert.match(job.message!, /already open/);
 
+  // The App without Contents: write: said plainly, after the clean plan.
+  const real = adapter.openPullRequest;
+  adapter.openPullRequest = async () => { throw new Error('the GitHub App needs Contents: Read & write to open pull requests'); };
+  const denied2 = await app.adoptResources({ adapter, repo, policy, base: 'main', select: { project: 'envs/prod' }, targets: targets('aws_s3_bucket', 'acme-logs'), user: null });
+  assert.match(denied2.message, /plans cleanly, but the PR could not be opened: the GitHub App needs Contents: Read & write/);
+  adapter.openPullRequest = real;
+
   const audit = store.auditLog(20);
   assert.ok(audit.some(a => a.action === 'adopt' && a.user === 'carol' && /opened https/.test(a.reason)));
   assert.ok(audit.some(a => a.action === 'adopt' && a.user === 'bob' && !a.allowed));
