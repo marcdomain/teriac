@@ -358,6 +358,14 @@ const checkoutTools = (root: string, dirs: string[]) => {
 
 const summaryOf = (run: Run | undefined): PlanSummary | null => (run?.summary ? JSON.parse(run.summary) as PlanSummary : null);
 
+// PRs teriac opened itself, by branch: the commit it made and who it was for.
+export const rememberOwnPr = (store: Store, repo: Repo, branch: string, sha: string, forUser: string) =>
+  store.setSetting(`own_pr:${repo.host}/${repo.fullName}@${branch}`, { sha, for: forUser });
+const ownPr = (store: Store, repo: Repo, branch: string, headSha: string): string | null => {
+  const o = store.getSetting<{ sha: string; for: string }>(`own_pr:${repo.host}/${repo.fullName}@${branch}`);
+  return o && o.sha === headSha ? o.for : null;
+};
+
 export class App {
   private queue = new KeyedQueue();
   // Check page per PR project (where GitHub shows the Apply button).
@@ -846,19 +854,23 @@ export class App {
     if (!targets.length && !hadRuns) return;
 
     // Autoplan runs the PR's code, so the author needs plan rights
-    // (stops strangers' fork PRs from running anything).
+    // (stops strangers' fork PRs from running anything). A PR teriac opened itself (adopt,
+    // drift fix) is planned for the person or schedule that asked, while its head is still
+    // teriac's own commit: a later push puts the usual author check back.
+    const own = ownPr(this.deps.store, repo, ctx.pr.headRef, ctx.pr.headSha);
+    const author = own ?? ctx.pr.author;
     const notes = new Map<string, string>();
     const allowedTargets: Project[] = [];
     for (const p of targets) {
-      const d = await this.allowed(ctx, 'plan', ctx.pr.author, p);
+      const d = own ? { allowed: true, reason: '' } : await this.allowed(ctx, 'plan', author, p);
       if (d.allowed) allowedTargets.push(p);
       else notes.set(p.name, `not planned automatically: ${d.reason}. Someone allowed can comment \`teriac plan\`.`);
     }
-    if (this.commentMode(ctx) === 'update') return this.plans(ctx, allowedTargets, ctx.pr.author, {}, notes);
+    if (this.commentMode(ctx) === 'update') return this.plans(ctx, allowedTargets, author, {}, notes);
     if (!targets.length) return;
     const reply = new Reply(adapter, repo, number, this.spinner(policy));
     await reply.start(`Planning ${targets.length} project${targets.length === 1 ? '' : 's'} for \`${ctx.pr.headSha.slice(0, 7)}\`…`);
-    await this.respond(reply, () => this.plans(ctx, allowedTargets, ctx.pr.author, {}, notes, reply));
+    await this.respond(reply, () => this.plans(ctx, allowedTargets, author, {}, notes, reply));
   }
 
   private async closed(repo: Repo, number: number, merged = false) {
@@ -1412,14 +1424,22 @@ export class App {
       }
       const branch = adoptBranch(project.name, result.resources);
       const n = result.resources.length;
-      const url = await a.adapter.openPullRequest!(a.repo, {
-        base: a.base, branch, title: `Bring ${n === 1 ? result.resources[0].address : `${n} resources`} under Terraform in ${project.name}`,
-        body: adoptBody(project.name, a.base, result, { user: who, from: a.from }), files: [result.file!],
-      });
+      let url: string | null;
+      try {
+        url = await a.adapter.openPullRequest!(a.repo, {
+          base: a.base, branch, title: `Bring ${n === 1 ? result.resources[0].address : `${n} resources`} under Terraform in ${project.name}`,
+          body: adoptBody(project.name, a.base, result, { user: who, from: a.from }), files: [result.file!],
+          onCommit: sha => rememberOwnPr(this.deps.store, a.repo, branch, sha, who),
+        });
+      } catch (err) {
+        const why = (err as Error).message.slice(0, 300);
+        audit(true, project.name, `planned clean, but the PR could not be opened: ${why}`);
+        return { ok: false, result, message: `❌ The code for ${result.resources.map(r => `\`${r.address}\``).join(', ')} plans cleanly, but the PR could not be opened: ${why}.` };
+      }
       audit(true, project.name, url ? `opened ${url} (${result.resources.map(r => r.address).join(', ')}${result.model ? `, by ${result.model}` : ''})` : `skipped: branch ${branch} exists`);
       if (!url) return { ok: false, result, message: `ℹ️ A PR for these resources is already open (branch \`${branch}\`). Merge or close it first.` };
-      const changes = result.changes.length ? ` ⚠️ Applying it also changes ${result.changes.map(c => `\`${c.address}\``).join(', ')}; see the PR.` : ' Applying it imports them and changes nothing.';
-      return { ok: true, url, result, message: `✅ Opened ${url}: \`${result.file!.path}\` brings ${result.resources.map(r => `\`${r.address}\``).join(', ')} under Terraform${result.model ? ` (written by AI, ${result.model})` : ''}.${changes}` };
+      const changes = result.changes.length ? ` ⚠️ Applying it also changes ${result.changes.map(c => `\`${c.address}\``).join(', ')}; see the PR.` : ` Applying it imports ${n === 1 ? 'it' : 'them'} and changes nothing.`;
+      return { ok: true, url, result, message: `✅ Opened ${url}: \`${result.file!.path}\` brings ${result.resources.map(r => `\`${r.address}\``).join(', ')} under Terraform${result.model ? ` (written by AI, ${result.model})` : result.aiFailed ? ' (Terraform\'s generated code: the AI request failed)' : ''}.${changes}` };
     });
   }
 

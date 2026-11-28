@@ -196,7 +196,7 @@ test('without AI: Terraform\'s generated code, planned clean, into a new file', 
   assert.deepEqual(readdirSync(join(root, 'envs/prod')), ['main.tf']);
   const body = adoptBody('envs/prod', 'main', r, { user: 'bob', from: '#12' });
   assert.match(body, /asked by bob in #12/);
-  assert.match(body, /applying imports them and changes nothing/);
+  assert.match(body, /applying imports it and changes nothing/);
   assert.match(body, /Tidy it before merging/);
   assert.equal(adoptBranch('envs/prod', r.resources), 'teriac/adopt/envs_prod-aws_s3_bucket-acme_logs');
 });
@@ -213,6 +213,10 @@ test('a name already in the code is refused; Terraform that reads nothing says s
   assert.match(clash.error!, /already in the code.*teriac import/);
   const none = await run(repoDir(), targets('aws_s3_bucket', 'nope'), { GEN: '' });
   assert.match(none.error!, /could not read the resources/);
+  // One of two read: the other is named, with Terraform's error.
+  const half = await run(repoDir(), targets('aws_s3_bucket', 'acme-logs', 'aws_iam_role.exporter', 'raw-exports-writer'), { GEN_FAIL: '1' });
+  assert.match(half.error!, /could not read aws_iam_role.exporter \(`raw-exports-writer`\): check the ID and that the project's credentials may read it/);
+  assert.match(half.output!, /Conflicting configuration/);
 });
 
 test('with AI: the tidy version, with notes; it sees the first plan\'s error and the project files', async () => {
@@ -343,8 +347,28 @@ test('server: permission, a PR against the base branch, audit; a second request 
   assert.equal(job.status, 'failed'); // the fake adapter opens only one PR
   assert.match(job.message!, /already open/);
 
+  // The App without Contents: write: said plainly, after the clean plan.
+  const real = adapter.openPullRequest;
+  adapter.openPullRequest = async () => { throw new Error('the GitHub App needs Contents: Read & write to open pull requests'); };
+  const denied2 = await app.adoptResources({ adapter, repo, policy, base: 'main', select: { project: 'envs/prod' }, targets: targets('aws_s3_bucket', 'acme-logs'), user: null });
+  assert.match(denied2.message, /plans cleanly, but the PR could not be opened: the GitHub App needs Contents: Read & write/);
+  adapter.openPullRequest = real;
+
   const audit = store.auditLog(20);
   assert.ok(audit.some(a => a.action === 'adopt' && a.user === 'carol' && /opened https/.test(a.reason)));
   assert.ok(audit.some(a => a.action === 'adopt' && a.user === 'bob' && !a.allowed));
   store.close();
+});
+
+test('with AI: a failed AI request falls back to Terraform\'s own code, and says so', async () => {
+  const call: AiCall = async () => { throw Object.assign(new Error('Access to Bedrock models is not allowed for this account'), { status: 400 }); };
+  const ai = new Ai({ provider: 'bedrock', model: 'claude-opus-5-5', effort: 'medium', features: ['import'], timeoutMs: 1000 }, { call });
+  const r = await run(repoDir(), targets('aws_s3_bucket', 'acme-logs'), {}, { ai, settings: { features: ['import'], model: 'claude-opus-5-5', effort: 'medium', review: 'push' } });
+  assert.ok(r.ok, r.error ?? '');
+  assert.equal(r.aiFailed, true);
+  assert.equal(r.model, undefined);
+  assert.equal(r.rounds, 1);
+  assert.match(r.file!.content, /resource "aws_s3_bucket" "acme_logs"/);
+  assert.match(adoptBody('envs/prod', 'main', r, { user: 'bob' }), /The AI request failed, so this is what Terraform generated/);
+  assert.ok(ai.lastError, 'the failure shows on the dashboard');
 });

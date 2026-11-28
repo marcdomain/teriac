@@ -550,7 +550,7 @@ do the same from the dashboard's **Projects** page, for any branch, without a PR
    and write its configuration (`plan -generate-config-out`).
 2. With the AI `import` feature on, Claude turns that into code a person would write: no computed or
    default arguments, references instead of copied IDs, the project's naming and tags. Without AI,
-   Terraform's output is used as it is.
+   or when the AI request fails, Terraform's output is used as it is, and the PR says so.
 3. teriac plans the result against the real resources. If the plan fails, or shows a change, the
    AI gets the plan's output and tries again (up to three tries).
 4. Only a plan that imports every resource and deletes or replaces nothing becomes a PR, against the

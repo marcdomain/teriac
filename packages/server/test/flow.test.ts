@@ -6,7 +6,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, chmodSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { App, MARKER } from '../src/app.ts';
+import { rememberOwnPr, App, MARKER } from '../src/app.ts';
 import { Store } from '../src/store.ts';
 import { parseReposYaml, type ServerConfig } from '../src/config.ts';
 import type { ToolResolver } from '../src/runner.ts';
@@ -251,6 +251,24 @@ test('6. read-only users cannot run code; fork-style autoplan is held', async ()
   assert.equal(store.latestRuns('github.com/acme/infra', 3, 'plan').length, 0);
   await comment(3, 'mallory', 'teriac plan');
   assert.match(gh.sticky.get(3)!, /🚫 plan on `envs\/prod` needs write/);
+});
+
+test('6b. a PR teriac opened itself is planned for whoever asked, until someone else pushes', async () => {
+  const own = (n: number) => ({ ...pr(n, 'teriac-app[bot]'), headRef: `teriac/adopt/envs_dev-${n}` });
+  for (const n of [31, 32, 33]) { gh.prs.set(n, own(n)); gh.files.set(n, ['envs/dev/main.tf']); }
+  const held = /not planned automatically: plan on `envs\/dev` needs write/;
+  // Not opened by teriac: the bot author has no write access.
+  await app.handle(gh, { kind: 'pr_opened', repo, pr: own(31) });
+  assert.match(gh.sticky.get(31)!, held);
+  // Opened by teriac, head still its commit: planned (here it meets #2's lock, as anyone's plan would).
+  rememberOwnPr(store, repo, own(32).headRef, head, 'carol');
+  await app.handle(gh, { kind: 'pr_opened', repo, pr: own(32) });
+  assert.doesNotMatch(gh.sticky.get(32)!, held);
+  assert.match(gh.sticky.get(32)!, /locked by #2/);
+  // Someone pushed after teriac: the usual author check again.
+  rememberOwnPr(store, repo, own(33).headRef, 'f'.repeat(40), 'carol');
+  await app.handle(gh, { kind: 'pr_opened', repo, pr: own(33) });
+  assert.match(gh.sticky.get(33)!, held);
 });
 
 test('7. every decision is audited; unlock and help work', async () => {

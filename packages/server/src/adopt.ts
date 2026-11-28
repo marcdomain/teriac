@@ -30,6 +30,7 @@ export interface AdoptResult {
   others: number;                            // pending changes in the project not from this PR
   notes: string[];
   model?: string;                            // the AI that wrote it, when it did
+  aiFailed?: boolean;                        // AI was on but didn't answer: Terraform's own output
   rounds: number;                            // plans run to check it
   error?: string;
   output?: string;                           // the last plan's output, when it failed
@@ -246,9 +247,14 @@ export const adopt = async (r: AdoptRun): Promise<AdoptResult> => {
     rmSync(abs(GENERATED), { force: true });
     rmSync(abs(IMPORTS), { force: true });
     if (!generated.trim()) return fail('Terraform could not read the resources: check the IDs and the project\'s credentials', { output: lastLines(gen.output) });
+    // A resource Terraform couldn't read (wrong ID, no permission) has no block: say which.
+    const got = new Set([...generated.matchAll(/^resource\s+"([^"]+)"\s+"([^"]+)"/gm)].map(m => `${m[1]}.${m[2]}`));
+    const unread = resources.filter(x => !got.has(x.address)).map(x => `${x.address} (\`${x.id}\`)`);
+    if (unread.length) return fail(`Terraform could not read ${unread.join(', ')}: check the ID and that the project's credentials may read it`, { output: lastLines(gen.output) });
     const sensitive = gen.sensitive ?? (gen.plan ? sensitiveValues(gen.plan) : []);
 
-    const ai = r.settings && r.ai ? r.ai : null;
+    let ai = r.settings && r.ai ? r.ai : null;
+    let aiFailed = false;
     let content = `${importBlocks(resources)}\n${generated.replace(/^# __generated__ by (?:Terraform|OpenTofu)\n# Please review[^\n]*\n\n?/m, '')}`;
     const types = [...new Set(r.targets.map(t => t.type))];
     let name = fileName(dir, types.length > 1 ? 'imported' : `imported-${types[0].replace(/^[a-z0-9]+_/, '').replace(/_/g, '-')}${r.targets.length > 1 ? 's' : ''}`, r.root);
@@ -258,16 +264,20 @@ export const adopt = async (r: AdoptRun): Promise<AdoptResult> => {
     let last: { output: string; outcome?: ReturnType<typeof importOutcome> } = { output: '' };
     let ran = 0;
     for (let round = 1; round <= rounds; round++) {
+      if (round > 1 && !ai) break; // nothing new to try without the AI
       // 2. Claude turns it into code a person would write (each round sees the last plan's problems).
       if (ai) {
         const draft = await ai.adoptCode({
           project: project.name, engine: `${r.ctx.tools.tool.provider} ${r.ctx.tools.tool.version}`, resources, generated, draft: round > 1 ? content : null,
           problems, files: projectFiles(r.root, project.dir), sensitive, patterns: r.patterns,
         }, r.settings!).catch(err => { log.warn('ai adopt failed', { project: project.name, err: (err as Error).message }); return null; });
-        if (!draft) { if (round === 1) return fail('the AI request failed; try again, or turn off `import` in the AI features to use Terraform\'s own output'); break; }
-        content = draft.content;
-        if (round === 1) name = fileName(dir, draft.file, r.root);
-        notes = draft.notes;
+        // AI help never blocks: without an answer, Terraform's own output is used (as with AI off).
+        if (!draft) { if (round > 1) break; ai = null; aiFailed = true; }
+        else {
+          content = draft.content;
+          if (round === 1) name = fileName(dir, draft.file, r.root);
+          notes = draft.notes;
+        }
       }
       const checked = checkAdoptCode(content, r.targets);
       if (!checked.ok) {
@@ -299,7 +309,7 @@ export const adopt = async (r: AdoptRun): Promise<AdoptResult> => {
     // Changes in place are allowed (shown in the PR); the attempt with the fewest wins.
     if (!best) {
       const o = last.outcome;
-      return fail(o?.missing.length ? `the plan does not import ${o.missing.join(', ')}` : o?.changes.length ? `the plan would replace or delete ${o.changes.map(c => c.address).join(', ')}` : problems.startsWith('teriac refused') ? problems.replace(/ Fix that.*$/, '') : 'the generated code does not plan cleanly', { output: lastLines(last.output), rounds: ran, model: ai ? label(r.settings!) : undefined });
+      return fail(o?.missing.length ? `the plan does not import ${o.missing.join(', ')}` : o?.changes.length ? `the plan would replace or delete ${o.changes.map(c => c.address).join(', ')}` : problems.startsWith('teriac refused') ? problems.replace(/ Fix that.*$/, '') : 'the generated code does not plan cleanly', { output: lastLines(last.output), rounds: ran, model: ai ? label(r.settings!) : undefined, aiFailed });
     }
     // 4. Nothing secret goes into the PR.
     const final = best.content;
@@ -308,7 +318,7 @@ export const adopt = async (r: AdoptRun): Promise<AdoptResult> => {
     if (leaked.length || scanned.found.length) return fail(`the code would contain ${scanned.found.length ? `something that looks like a secret (${scanned.found.join(', ')})` : 'a value Terraform marks sensitive'}; adopt this resource by hand`);
     return {
       ok: true, file: { path: rel(name), content: final.replace(/\n*$/, '\n') }, resources: best.resources, changes: best.outcome.changes, others: best.outcome.others,
-      notes, model: ai ? label(r.settings!) : undefined, rounds: ran,
+      notes, model: ai ? label(r.settings!) : undefined, rounds: ran, ...(aiFailed ? { aiFailed } : {}),
     };
   } finally {
     for (const f of [GENERATED, IMPORTS]) rmSync(abs(f), { force: true });
@@ -328,14 +338,14 @@ export const adoptBody = (project: string, base: string, result: AdoptResult, by
     '',
     result.changes.length
       ? `⚠️ **Applying also changes ${result.changes.length === 1 ? 'one resource' : `${result.changes.length} resources`}**, because the code differs from what is running: ${result.changes.map(c => `\`${c.address}\`${c.attributes.length ? ` (${c.attributes.map(a => `\`${a}\``).join(', ')})` : ''}`).join(', ')}. Edit the code to match if that isn't wanted.`
-      : '✅ teriac planned this against the real resources: **applying imports them and changes nothing.**',
+      : `✅ teriac planned this against the real resource${result.resources.length === 1 ? '' : 's'}: **applying imports ${result.resources.length === 1 ? 'it' : 'them'} and changes nothing.**`,
   ];
   if (result.others) lines.push('', `ℹ️ \`${project}\` has ${result.others} other pending change${result.others === 1 ? '' : 's'} on \`${base}\` that are not from this PR; they show in the plan too.`);
   if (result.model) {
     lines.push('', `🤖 **Written by AI** from Terraform's generated configuration <sub>${result.model} · check it yourself</sub>`);
     for (const n of result.notes) lines.push(`- ${n}`);
   } else {
-    lines.push('', 'The configuration is what Terraform generated (`plan -generate-config-out`). Tidy it before merging: drop arguments that only repeat defaults.');
+    lines.push('', `${result.aiFailed ? 'The AI request failed, so this' : 'The configuration'} is what Terraform generated (\`plan -generate-config-out\`). Tidy it before merging: drop arguments that only repeat defaults.`);
   }
   lines.push('', '**Next:** review the plan teriac posts here, then apply as usual. The `import` blocks can be deleted after the apply; leaving them does nothing.',
     '', `<sub>Opened by \`teriac adopt\`. Nothing has been imported yet.</sub>`);

@@ -18,7 +18,7 @@ import type { Ai, AiSettings } from './ai.ts';
 import type { RepoConfig } from './repoConfig.ts';
 import { notifyAll, type DriftReport, type ProjectDrift } from './notify.ts';
 import { matchGlob } from './glob.ts';
-import { KeyedQueue } from './app.ts';
+import { KeyedQueue, rememberOwnPr } from './app.ts';
 import { log } from './log.ts';
 
 export interface ScheduleEntry {
@@ -216,6 +216,7 @@ export class DriftScheduler {
       const url = await e.adapter.openPullRequest(e.repo, {
         base: e.branch, branch, title: `Accept drift in ${project.name}`,
         body: driftFixBody(project.name, e.branch, fix, e.spec.name ?? e.spec.schedule), files: fix.files,
+        onCommit: sha => rememberOwnPr(this.deps.store, e.repo, branch, sha, 'teriac'),
       });
       if (url) result.fixPr = url;
       else result.fixNote = `a drift-fix PR is already open (branch \`${branch}\`)`;

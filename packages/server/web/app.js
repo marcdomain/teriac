@@ -125,6 +125,7 @@
     if (s.change) parts.push(`<span class="c">~${s.change}</span>`);
     if (s.replace) parts.push(`<span class="d">±${s.replace}</span>`);
     if (s.destroy) parts.push(`<span class="d">−${s.destroy}</span>`);
+    if (s.imports) parts.push(`<span class="a">←${s.imports} import${s.imports === 1 ? '' : 's'}</span>`);
     return `<span class="counts">${parts.join(' ') || 'outputs'}</span>`;
   };
   const PAST = { create: 'created', update: 'changed', delete: 'deleted', replace: 'replaced' };
