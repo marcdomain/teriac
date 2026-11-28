@@ -196,7 +196,7 @@ test('without AI: Terraform\'s generated code, planned clean, into a new file', 
   assert.deepEqual(readdirSync(join(root, 'envs/prod')), ['main.tf']);
   const body = adoptBody('envs/prod', 'main', r, { user: 'bob', from: '#12' });
   assert.match(body, /asked by bob in #12/);
-  assert.match(body, /applying imports them and changes nothing/);
+  assert.match(body, /applying imports it and changes nothing/);
   assert.match(body, /Tidy it before merging/);
   assert.equal(adoptBranch('envs/prod', r.resources), 'teriac/adopt/envs_prod-aws_s3_bucket-acme_logs');
 });

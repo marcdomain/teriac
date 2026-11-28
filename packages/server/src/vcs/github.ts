@@ -508,7 +508,7 @@ export class GitHubAdapter implements VcsAdapter {
     };
   }
 
-  async openPullRequest(repo: Repo, pr: { base: string; branch: string; title: string; body: string; files: { path: string; content: string }[] }): Promise<string | null> {
+  async openPullRequest(repo: Repo, pr: { base: string; branch: string; title: string; body: string; files: { path: string; content: string }[]; onCommit?: (sha: string) => void }): Promise<string | null> {
     const ref = await this.api(repo, 'GET', `/repos/${repo.fullName}/git/ref/heads/${pr.branch.split('/').map(encodeURIComponent).join('/')}`, undefined, [404]);
     if (ref.status === 200) return null;
     try {
@@ -519,7 +519,7 @@ export class GitHubAdapter implements VcsAdapter {
     }
   }
 
-  private async createPullRequest(repo: Repo, pr: { base: string; branch: string; title: string; body: string; files: { path: string; content: string }[] }): Promise<string | null> {
+  private async createPullRequest(repo: Repo, pr: { base: string; branch: string; title: string; body: string; files: { path: string; content: string }[]; onCommit?: (sha: string) => void }): Promise<string | null> {
     const { data: baseRef } = await this.api(repo, 'GET', `/repos/${repo.fullName}/git/ref/heads/${encodeURIComponent(pr.base)}`);
     const baseSha = baseRef.object.sha;
     const { data: baseCommit } = await this.api(repo, 'GET', `/repos/${repo.fullName}/git/commits/${baseSha}`);
@@ -528,6 +528,7 @@ export class GitHubAdapter implements VcsAdapter {
       tree: pr.files.map(f => ({ path: f.path, mode: '100644', type: 'blob', content: f.content })),
     });
     const { data: commit } = await this.api(repo, 'POST', `/repos/${repo.fullName}/git/commits`, { message: pr.title, tree: tree.sha, parents: [baseSha] });
+    pr.onCommit?.(commit.sha);
     await this.api(repo, 'POST', `/repos/${repo.fullName}/git/refs`, { ref: `refs/heads/${pr.branch}`, sha: commit.sha });
     const { data: opened } = await this.api(repo, 'POST', `/repos/${repo.fullName}/pulls`, { title: pr.title, head: pr.branch, base: pr.base, body: pr.body });
     return opened?.html_url ?? null;

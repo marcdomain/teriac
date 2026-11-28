@@ -338,7 +338,7 @@ export const adoptBody = (project: string, base: string, result: AdoptResult, by
     '',
     result.changes.length
       ? `⚠️ **Applying also changes ${result.changes.length === 1 ? 'one resource' : `${result.changes.length} resources`}**, because the code differs from what is running: ${result.changes.map(c => `\`${c.address}\`${c.attributes.length ? ` (${c.attributes.map(a => `\`${a}\``).join(', ')})` : ''}`).join(', ')}. Edit the code to match if that isn't wanted.`
-      : '✅ teriac planned this against the real resources: **applying imports them and changes nothing.**',
+      : `✅ teriac planned this against the real resource${result.resources.length === 1 ? '' : 's'}: **applying imports ${result.resources.length === 1 ? 'it' : 'them'} and changes nothing.**`,
   ];
   if (result.others) lines.push('', `ℹ️ \`${project}\` has ${result.others} other pending change${result.others === 1 ? '' : 's'} on \`${base}\` that are not from this PR; they show in the plan too.`);
   if (result.model) {
