@@ -213,6 +213,10 @@ test('a name already in the code is refused; Terraform that reads nothing says s
   assert.match(clash.error!, /already in the code.*teriac import/);
   const none = await run(repoDir(), targets('aws_s3_bucket', 'nope'), { GEN: '' });
   assert.match(none.error!, /could not read the resources/);
+  // One of two read: the other is named, with Terraform's error.
+  const half = await run(repoDir(), targets('aws_s3_bucket', 'acme-logs', 'aws_iam_role.exporter', 'raw-exports-writer'), { GEN_FAIL: '1' });
+  assert.match(half.error!, /could not read aws_iam_role.exporter \(`raw-exports-writer`\): check the ID and that the project's credentials may read it/);
+  assert.match(half.output!, /Conflicting configuration/);
 });
 
 test('with AI: the tidy version, with notes; it sees the first plan\'s error and the project files', async () => {

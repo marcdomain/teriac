@@ -247,6 +247,10 @@ export const adopt = async (r: AdoptRun): Promise<AdoptResult> => {
     rmSync(abs(GENERATED), { force: true });
     rmSync(abs(IMPORTS), { force: true });
     if (!generated.trim()) return fail('Terraform could not read the resources: check the IDs and the project\'s credentials', { output: lastLines(gen.output) });
+    // A resource Terraform couldn't read (wrong ID, no permission) has no block: say which.
+    const got = new Set([...generated.matchAll(/^resource\s+"([^"]+)"\s+"([^"]+)"/gm)].map(m => `${m[1]}.${m[2]}`));
+    const unread = resources.filter(x => !got.has(x.address)).map(x => `${x.address} (\`${x.id}\`)`);
+    if (unread.length) return fail(`Terraform could not read ${unread.join(', ')}: check the ID and that the project's credentials may read it`, { output: lastLines(gen.output) });
     const sensitive = gen.sensitive ?? (gen.plan ? sensitiveValues(gen.plan) : []);
 
     let ai = r.settings && r.ai ? r.ai : null;
