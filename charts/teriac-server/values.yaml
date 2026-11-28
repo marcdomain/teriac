@@ -63,7 +63,7 @@ ai:
   provider: ""                  # anthropic, bedrock, vertex or foundry; empty: off
   model: ""                     # default claude-opus-5-5 (anthropic.claude-opus-5-5 on Bedrock)
   effort: medium                # low, medium, high, xhigh, max: deeper reviews cost more
-  features: []                  # default all: review, code, fix, drift, policy, ask
+  features: []                  # default all: review, code, fix, drift, policy, ask, import
   existingSecret: ""            # anthropic: Secret with key `api-key` (ANTHROPIC_API_KEY)
   bedrock:
     region: ""                  # e.g. eu-west-1; credentials from the pod's role (serviceAccount.annotations)

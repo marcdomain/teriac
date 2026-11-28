@@ -466,6 +466,31 @@
         ${a.canChange ? '<button type="button" class="small" data-resume-applies>Resume applies</button>' : ''}</div>`
     : '');
 
+  // Bring resources made by hand under Terraform: teriac opens a PR with import blocks and code.
+  const adoptJobs = (jobs) => jobs.length ? `<ul class="adopt-jobs">${jobs.slice(0, 8).map(j => `<li>
+      <span class="pill ${j.status === 'failed' ? 'bad' : j.status === 'running' ? 'warn' : ''}">${j.status === 'running' ? 'working…' : esc(j.status)}</span>
+      <span class="mono">${esc(j.project)}</span> <span class="muted small">${esc(repoName(j.repo))} · ${j.resources.length} resource${j.resources.length === 1 ? '' : 's'} · ${esc(j.by)} · ${ago(j.at)}</span>
+      ${j.url ? ` · ${ext(j.url, 'open the PR', 'plain')}` : ''}${j.status === 'failed' && j.message ? `<div class="small muted">${esc(j.message.replace(/^❌\s*/, ''))}</div>` : ''}
+    </li>`).join('')}</ul>` : '';
+  const adoptCard = (rows, adopt) => {
+    const seen = new Set();
+    const options = rows.filter(p => { const k = `${p.repo}|${p.project}|${p.workspace}`; if (seen.has(k)) return false; seen.add(k); return true; })
+      .sort((a, b) => `${a.repo}${a.project}`.localeCompare(`${b.repo}${b.project}`))
+      .map(p => `<option value="${esc(`${p.repo}|${p.project}|${p.workspace}`)}">${esc(p.project)}${p.workspace !== 'default' ? ` @${esc(p.workspace)}` : ''} · ${esc(repoName(p.repo))}</option>`).join('');
+    return `<div class="card ai"><div class="card-head"><h2>Bring existing resources under Terraform</h2><span class="muted small">${adopt.ai ? 'Terraform reads them, AI writes the code' : 'Terraform reads them and writes the code'} · planned before the PR opens · nothing is imported until the PR is applied</span></div>
+      <form class="adopt pad" autocomplete="off">
+        <div class="adopt-row">
+          <label class="f"><span>Project</span><select name="target" required>${options}</select></label>
+          <label class="f"><span>Base branch</span><input name="base" placeholder="default branch" maxlength="200"></label>
+        </div>
+        <label class="f"><span>Resources · <code>type id</code> per line, or <code>type.name id</code></span>
+          <textarea name="resources" rows="3" required placeholder="aws_s3_bucket acme-logs
+aws_iam_role.deploy deploy-bot"></textarea></label>
+        <button type="submit">Open PR</button>
+      </form>
+      <div class="adopt-list">${adoptJobs(adopt.jobs)}</div></div>`;
+  };
+
   const views = {
     async overview() {
       const [runs, locks, drift, schedules, safety, applies] = await Promise.all([
@@ -536,7 +561,7 @@
     },
 
     async projects(_arg, params) {
-      const rows = await api('/api/projects');
+      const [rows, adopt] = await Promise.all([api('/api/projects'), api('/api/adopt').catch(() => null)]);
       const q = (params.get('q') || '').toLowerCase();
       const sort = params.get('sort') || 'recent';
       const list = rows.filter(p => !q || `${p.project} ${p.repo} ${p.lastRun.user} ${p.lastApply?.user ?? ''}`.toLowerCase().includes(q))
@@ -559,7 +584,8 @@
             <td>${p.lock ? `<span class="inline">${ext(p.lock.links?.pr, `#${p.lock.pr}`, 'plain')} ${who(p.lock.user, p.lock.links?.user, null, p.lock.links?.userAvatar)}</span>` : '<span class="muted">free</span>'}</td>
             <td class="num"><a class="plain" href="${esc(listLink('runs', { project: p.project }))}">${p.runs}</a></td>
           </tr>`;
-        }), q ? 'No project matches your search.' : 'No projects yet.')}${list.length ? pager(list.length, params) : ''}</div>`;
+        }), q ? 'No project matches your search.' : 'No projects yet.')}${list.length ? pager(list.length, params) : ''}</div>
+        ${adopt && isAdmin() && rows.length ? adoptCard(rows, adopt) : ''}`;
     },
 
     async run(arg) {
@@ -1215,6 +1241,7 @@
     if (name === 'runs' && arg) return;
     timer = setTimeout(async () => {
       // An AI box with a question typed, a request running or an answer showing is never wiped.
+      if ([...document.querySelectorAll('form.adopt')].some(f => f.resources.value.trim() || f.base.value.trim()) || document.querySelector('.adopt-jobs .pill.warn')) return schedule();
       if ([...document.querySelectorAll('form.ai-ask')].some(f => f.q.value.trim() || f.querySelector('button').disabled || !f.parentElement.querySelector('.ai-answer').hidden)) return schedule();
       const c = current();
       const list = listName(c.name, c.params);
@@ -1278,6 +1305,36 @@
       return;
     }
     if (e.target.closest('form.filters')) e.preventDefault();
+  });
+
+  // Adopt: start it, then follow the job until the PR is open (or it failed).
+  view.addEventListener('submit', async (e) => {
+    const form = e.target.closest('form.adopt');
+    if (!form) return;
+    e.preventDefault();
+    const [repo, project, workspace] = form.target.value.split('|');
+    const button = form.querySelector('button');
+    button.disabled = true;
+    try {
+      const job = await api('/api/adopt', { method: 'POST', body: JSON.stringify({ repo, project, workspace, base: form.base.value.trim(), resources: form.resources.value }) });
+      toast(`Reading the resources in ${project}; the PR opens when the plan is clean.`);
+      form.resources.value = '';
+      const list = form.parentElement.querySelector('.adopt-list');
+      const follow = async () => {
+        const r = await api('/api/adopt').catch(() => null);
+        if (!r || !document.body.contains(list)) return;
+        list.innerHTML = adoptJobs(r.jobs);
+        const j = r.jobs.find(x => x.id === job.id);
+        if (j?.status === 'running') setTimeout(follow, 4000);
+        else if (j?.status === 'opened') toast(`Opened the PR for ${j.project}.`);
+        else if (j) toast(`Could not adopt into ${j.project}: ${(j.message || '').replace(/^❌\s*/, '').slice(0, 200)}`, true);
+      };
+      follow();
+    } catch (err) {
+      toast(`Could not start: ${err.message}`, true);
+    } finally {
+      button.disabled = false;
+    }
   });
 
   // AI forms: a question about a run, or a policy draft.

@@ -30,7 +30,7 @@ test('config: off by default; provider, effort and features are checked', () => 
   assert.equal(loadAiConfig({}), undefined);
   assert.equal(loadAiConfig({ TERIAC_AI_PROVIDER: 'off' }), undefined);
   const c = loadAiConfig({ TERIAC_AI_PROVIDER: 'anthropic' })!;
-  assert.deepEqual([c.model, c.effort, c.features.length], ['claude-opus-5-5', 'medium', 6]);
+  assert.deepEqual([c.model, c.effort, c.features.length], ['claude-opus-5-5', 'medium', 7]);
   assert.equal(loadAiConfig({ TERIAC_AI_PROVIDER: 'bedrock', AWS_REGION: 'eu-west-1' })!.model, 'anthropic.claude-opus-5-5');
   assert.deepEqual(loadAiConfig({ TERIAC_AI_PROVIDER: 'anthropic', TERIAC_AI_FEATURES: 'review, ask' })!.features, ['review', 'ask']);
   assert.throws(() => loadAiConfig({ TERIAC_AI_PROVIDER: 'openai' }), /must be one of anthropic, bedrock, vertex, foundry/);
