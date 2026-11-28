@@ -64,6 +64,7 @@ Set up the GitHub App like this:
 | `teriac cancel` | Stop this PR's running plans and drop its queued work. The PR author, or anyone with write access or more |
 | `teriac review` | AI review of the latest plans and code, when [AI help](#ai-help) is on (`-p <project>` for one). Reuses the saved plan; plan review first, then inline code review. Needs `plan` on the project |
 | `teriac ask: <question>` | An AI answer about this PR's plans and code, when [AI help](#ai-help) is on. Needs `plan` on a project |
+| `teriac adopt -p <project> <type> <id>...` | Open a PR that brings resources made by hand under Terraform: `import` blocks plus their code, planned against the real resources first. See [Bringing existing resources under Terraform](#bringing-existing-resources-under-terraform). Needs `adopt` |
 
 `-p` and `-d` take a name or a glob: `teriac plan -p 'live/prod/*'`. A repo that applies one
 project at a time refuses an apply whose glob matches more than one.
@@ -174,7 +175,7 @@ Defaults when no rule applies:
 | `apply_destroy` | applies that delete or replace | maintain | |
 | `unlock` | releasing another PR's lock from the dashboard (`teriac unlock` in a PR only releases that PR's own locks: its author or anyone who may plan) | maintain | |
 | `state_read` | `state show`, `show`, `output` | write | `plan` |
-| `state_write` | `import`, `taint`, `untaint` | write | `apply` |
+| `state_write` | `import`, `taint`, `untaint`, `adopt` | write | `apply` |
 | `state_remove` | `state rm`, `state mv`, `force-unlock` | maintain | `apply_destroy` |
 
 The last three cover the Terraform commands. When a project doesn't set them, they use the
@@ -183,7 +184,7 @@ admin-only too. Commands that edit the state directly (outside a plan and apply)
 project's approvals, like an apply.
 
 Each command also has its own key, for exceptions: `state_list`, `state_show`, `show`, `output`,
-`validate`, `providers`, `fmt`, `import`, `taint`, `untaint`, `state_rm`, `state_mv`,
+`validate`, `providers`, `fmt`, `import`, `adopt` (uses `import` when not set), `taint`, `untaint`, `state_rm`, `state_mv`,
 `force_unlock`. A command that isn't set uses its group; `[]` means nobody.
 
 ```yaml
@@ -458,6 +459,7 @@ labelled with the model's name.
 | `drift` | On drift-fix PRs (`fix_pr: true`), for what the mechanical fixer can't edit: **adopt** (the code is updated to match), **revert** (left alone, so applying puts it back) or **unsure** (left to a person) |
 | `ask` | `teriac ask: <question>` on a PR, and **Ask about this run** on the dashboard. The AI can read the PR's code and saved plans, nothing else |
 | `policy` | **Draft a policy with AI** on the dashboard's Guardrails page (admins): plain English in, `policies.rules` YAML out, checked against test cases it writes. You paste it into `repos.yaml` yourself |
+| `import` | [`teriac adopt`](#bringing-existing-resources-under-terraform): turns Terraform's generated configuration for resources made by hand into code a person would write, and fixes it until the plan imports them cleanly |
 
 ```yaml
 # Helm values (or the TERIAC_AI_* variables)
@@ -465,7 +467,7 @@ ai:
   provider: anthropic           # anthropic, bedrock, vertex or foundry
   existingSecret: claude-api    # Secret with key api-key (provider anthropic)
   effort: medium                # low … max: deeper reviews take longer and cost more
-  features: [review, code, fix, drift, ask, policy]   # default: all
+  features: [review, code, fix, drift, ask, policy, import]   # default: all
 ```
 
 | Variable | |
@@ -473,7 +475,7 @@ ai:
 | `TERIAC_AI_PROVIDER` | `anthropic`, `bedrock`, `vertex` or `foundry`. Empty or `off`: no AI |
 | `TERIAC_AI_MODEL` | Default `claude-opus-5-5` (`anthropic.claude-opus-5-5` on Bedrock) |
 | `TERIAC_AI_EFFORT` | `low`, `medium` (default), `high`, `xhigh`, `max` |
-| `TERIAC_AI_FEATURES` | Comma list; default `review,code,fix,drift,policy,ask` |
+| `TERIAC_AI_FEATURES` | Comma list; default `review,code,fix,drift,policy,ask,import` |
 | `TERIAC_AI_TIMEOUT_SECONDS` | Per request, default 180 |
 
 **Per repo and per project.** `ai:` in `repos.yaml` turns AI on or off and changes the features,
@@ -530,6 +532,42 @@ the same call. Dashboard requests are limited to 20 per person per 15 minutes. E
 suggestion and draft is in the audit log (`ai_ask`, `ai_suggestion`, `ai_policy_draft`).
 
 Cost is per request, at your provider's prices: a typical review sends 5–30k tokens.
+
+## Bringing existing resources under Terraform
+
+Teams that adopt Terraform late have resources made in the console. `teriac adopt` writes their
+code and opens a PR:
+
+```
+teriac adopt -p live/prod aws_s3_bucket acme-logs aws_iam_role.deploy deploy-bot
+```
+
+Give pairs of resource type and import ID (the ID `terraform import` takes), up to 20 at a time.
+`type.name` picks the name; otherwise it comes from the ID (`deploy-bot` → `deploy_bot`). Admins can
+do the same from the dashboard's **Projects** page, for any branch, without a PR.
+
+1. teriac checks out the base branch, adds `import` blocks, and asks Terraform to read each resource
+   and write its configuration (`plan -generate-config-out`).
+2. With the AI `import` feature on, Claude turns that into code a person would write: no computed or
+   default arguments, references instead of copied IDs, the project's naming and tags. Without AI,
+   Terraform's output is used as it is.
+3. teriac plans the result against the real resources. If the plan fails, or shows a change, the
+   AI gets the plan's output and tries again (up to three tries).
+4. Only a plan that imports every resource and deletes or replaces nothing becomes a PR, against the
+   same base branch: one new `.tf` file with the `import` blocks and the resources. If applying would
+   also change something in place, the PR says what. The new PR is planned like any other, and
+   nothing is imported until someone applies it, with its approvals.
+
+**Limits that keep it safe.** The plans only read (`-lock=false`, nothing is applied or written to
+the state). The PR's file may hold only `import` blocks for exactly the resources asked for, and one
+`resource` block for each: no `data`, `module`, `provider`, `variable` or `locals` blocks, no `count`
+or `for_each`, no provisioners, file functions or local file paths. Values Terraform marks sensitive
+are never written: such arguments are left out and the PR says so. If the file would contain
+anything that looks like a secret, no PR is opened. Every request is in the audit log (`adopt`).
+
+Needs Terraform 1.5+ or OpenTofu 1.6+, and the GitHub App's **Contents: Read & write** (as for
+drift-fix PRs). Terragrunt projects aren't supported yet. To import into a resource that is
+already in the code, use `teriac import <address> <id>` instead.
 
 ## Change freezes and protected resources
 
@@ -800,6 +838,8 @@ Open the server's URL in a browser. It shows:
 - **Guardrails**: change freezes (and whether one is on now), protected resources, risk,
   policy and secret-scan settings, each repo entry's approval settings, and database
   backups with a **Back up now** button (see [Backups](#backups));
+- **Projects**: every project with its last run, apply and lock, and for admins **Bring existing
+  resources under Terraform** (see [above](#bringing-existing-resources-under-terraform));
 - **Access**: emergency access grants (see [Emergency access](#emergency-access));
 - **Metrics**: runs, timings, resource use, and delivery: PR to applied, failed applies, time to
   fix, applies per week.
@@ -838,6 +878,7 @@ These need a dashboard session or `Authorization: Bearer $TERIAC_API_TOKEN`:
 - `POST /api/backups/run` (admin)
 - `GET /api/applies`, `POST /api/applies/pause` and `/resume` (admin)
 - `POST /api/commands`: run a PR command from outside GitHub (below)
+- `POST /api/adopt` (admin): `{"repo": "github.com/acme/infra", "project": "live/prod", "resources": "aws_s3_bucket acme-logs", "base": "main"}` starts a [`teriac adopt`](#bringing-existing-resources-under-terraform); `GET /api/adopt` lists recent ones with their PR links
 
 ```bash
 curl -X POST https://teriac.acme.com/api/commands \

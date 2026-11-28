@@ -5,6 +5,7 @@
 //   teriac help
 //   teriac ask: <question>    (AI answer, when TERIAC_AI_PROVIDER is set; the colon marks where the question starts)
 //   teriac review [-p project] (AI review of the latest plans)
+//   teriac adopt -p project <type>[.<name>] <id>... (a PR that brings existing resources under Terraform)
 // Terraform commands on one project (-p is required):
 //   teriac state list [address]... | state show <address> | state rm <address>... | state mv <from> <to>
 //   teriac output [name] | show | validate | providers | fmt
@@ -12,10 +13,11 @@
 // Comments start with "teriac" (or "@teriac").
 
 import type { CommandAction } from './config.ts';
+import { parseAdoptArgs, type AdoptTarget } from './adopt.ts';
 
-export type Verb = 'plan' | 'apply' | 'unlock' | 'help' | 'cancel' | 'ask' | 'review'
+export type Verb = 'plan' | 'apply' | 'unlock' | 'help' | 'cancel' | 'ask' | 'review' | 'adopt'
   | 'state' | 'output' | 'show' | 'validate' | 'providers' | 'fmt' | 'import' | 'taint' | 'untaint' | 'force-unlock';
-const VERBS: Verb[] = ['plan', 'apply', 'unlock', 'help', 'cancel', 'ask', 'review', 'state', 'output', 'show', 'validate', 'providers', 'fmt', 'import', 'taint', 'untaint', 'force-unlock'];
+const VERBS: Verb[] = ['plan', 'apply', 'unlock', 'help', 'cancel', 'ask', 'review', 'adopt', 'state', 'output', 'show', 'validate', 'providers', 'fmt', 'import', 'taint', 'untaint', 'force-unlock'];
 
 // Terraform commands teriac runs for a single project. Nothing else is passed through:
 // commands like `console` or flags like `-chdir` could reach beyond the project.
@@ -48,6 +50,7 @@ export interface Command {
   tool?: ToolCommand;         // a Terraform command such as "state list"
   args?: string[];            // its positional arguments, checked below
   question?: string;          // `ask`: everything after the verb, every line
+  adopt?: AdoptTarget[];      // `adopt`: the resources to bring under Terraform
 }
 
 // Resource addresses only: no leading "-", no spaces, so a target can never
@@ -99,7 +102,7 @@ export const parseCommand = (body: string, names: string[]): ParseResult => {
     if (!STATE_SUBS.includes(sub)) return { ok: false, error: `\`${name} state\` needs one of: ${STATE_SUBS.join(', ')}` };
     command.tool = `state ${sub}` as ToolCommand;
     first = 3;
-  } else if (!['plan', 'apply', 'unlock', 'help', 'cancel', 'review'].includes(verb)) {
+  } else if (!['plan', 'apply', 'unlock', 'help', 'cancel', 'review', 'adopt'].includes(verb)) {
     command.tool = verb as ToolCommand;
   }
   const positional: string[] = [];
@@ -114,7 +117,7 @@ export const parseCommand = (body: string, names: string[]): ParseResult => {
       const t = tokens[i];
       if (t === '--') { command.extraArgs = tokens.slice(i + 1); break; }
       if (!t.startsWith('-')) {
-        if (!command.tool) throw new Error(`Unexpected \`${t}\``);
+        if (!command.tool && verb !== 'adopt') throw new Error(`Unexpected \`${t}\``);
         positional.push(t);
         continue;
       }
@@ -146,6 +149,14 @@ export const parseCommand = (body: string, names: string[]): ParseResult => {
     return { ok: false, error: (err as Error).message };
   }
 
+  if (verb === 'adopt') {
+    const usage = `\`${name} adopt -p <project> <type> <id>\`, e.g. \`${name} adopt -p envs/prod aws_s3_bucket my-logs-bucket\``;
+    if (!command.project && !command.dir) return { ok: false, error: `\`${name} adopt\` writes code for one project: ${usage}` };
+    if (command.targets.length || command.destroy || command.override || command.extraArgs.length || command.refreshOnly || command.replace?.length) return { ok: false, error: `Only \`-p\`, \`-d\` and \`-w\` work with \`${name} adopt\`` };
+    const r = parseAdoptArgs(positional);
+    if (!r.ok) return { ok: false, error: `${r.error[0].toUpperCase()}${r.error.slice(1)}. Usage: ${usage}` };
+    return { ok: true, command: { ...command, adopt: r.targets } };
+  }
   if (command.tool) {
     const error = checkTool(name, command, positional);
     if (error) return { ok: false, error };
@@ -246,7 +257,7 @@ export const toolArgs = (c: Command): string[] => {
 
 // Lists only what this server allows: a bare `apply` is left out when
 // projects must be applied one at a time.
-export const helpText = (name = 'teriac', oneProjectPerApply = false, ask = false): string => [
+export const helpText = (name = 'teriac', oneProjectPerApply = false, ask = false, adoptAi = false): string => [
   '### teriac commands',
   '| Command | What it does |',
   '|---|---|',
@@ -268,7 +279,8 @@ export const helpText = (name = 'teriac', oneProjectPerApply = false, ask = fals
   `| \`${name} validate -p <project>\` | Check the configuration |`,
   `| \`${name} providers -p <project>\` | The providers the project uses |`,
   `| \`${name} fmt -p <project>\` | Check formatting |`,
-  `| \`${name} import -p <project> <address> <id>\` | Bring an existing resource under Terraform (\`state_write\`) |`,
+  `| \`${name} adopt -p <project> <type> <id>...\` | Open a PR with the code and \`import\` blocks for resources made by hand${adoptAi ? ', written by AI' : ''} (\`adopt\`) |`,
+  `| \`${name} import -p <project> <address> <id>\` | Import into a resource already in the code, editing the state now (\`state_write\`) |`,
   `| \`${name} taint -p <project> <address>\` | Replace a resource on the next apply (\`state_write\`); \`untaint\` undoes it |`,
   `| \`${name} state rm -p <project> <address>...\` | Stop managing resources without deleting them (\`state_remove\`) |`,
   `| \`${name} state mv -p <project> <from> <to>\` | Rename or move a resource in the state (\`state_remove\`) |`,

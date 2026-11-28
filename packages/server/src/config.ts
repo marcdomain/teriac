@@ -22,9 +22,9 @@ export const REQUIREMENTS: Requirement[] = ['approved', 'mergeable', 'undiverged
 
 // One key per Terraform command, so a project can single out a command ("everything but force-unlock").
 export type CommandAction = 'state_list' | 'state_show' | 'show' | 'output' | 'validate' | 'providers' | 'fmt'
-  | 'import' | 'taint' | 'untaint' | 'state_rm' | 'state_mv' | 'force_unlock';
+  | 'import' | 'adopt' | 'taint' | 'untaint' | 'state_rm' | 'state_mv' | 'force_unlock';
 export const COMMAND_ACTIONS: CommandAction[] = ['state_list', 'state_show', 'show', 'output', 'validate', 'providers', 'fmt',
-  'import', 'taint', 'untaint', 'state_rm', 'state_mv', 'force_unlock'];
+  'import', 'adopt', 'taint', 'untaint', 'state_rm', 'state_mv', 'force_unlock'];
 export type Action = 'plan' | 'apply' | 'apply_destroy' | 'unlock' | 'state_read' | 'state_write' | 'state_remove' | CommandAction;
 export const ACTIONS: Action[] = ['plan', 'apply', 'apply_destroy', 'unlock', 'state_read', 'state_write', 'state_remove', ...COMMAND_ACTIONS];
 

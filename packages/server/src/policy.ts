@@ -24,7 +24,7 @@ export const DEFAULT_PERMISSIONS: Record<Action, Principal[]> = {
   state_remove: ['maintain'],  // state rm, state mv, force-unlock (plus the project's approvals)
   // Single commands default to their group (see INHERITS).
   state_list: [], validate: [], providers: [], fmt: [], state_show: [], show: [], output: [],
-  import: [], taint: [], untaint: [], state_rm: [], state_mv: [], force_unlock: [],
+  import: [], adopt: [], taint: [], untaint: [], state_rm: [], state_mv: [], force_unlock: [],
 };
 
 // A Terraform-command permission that isn't set for a project uses the rule it
@@ -34,7 +34,7 @@ export const INHERITS: Partial<Record<Action, Action>> = {
   state_read: 'plan', state_write: 'apply', state_remove: 'apply_destroy',
   state_list: 'plan', validate: 'plan', providers: 'plan', fmt: 'plan',
   state_show: 'state_read', show: 'state_read', output: 'state_read',
-  import: 'state_write', taint: 'state_write', untaint: 'state_write',
+  import: 'state_write', adopt: 'import', taint: 'state_write', untaint: 'state_write',
   state_rm: 'state_remove', state_mv: 'state_remove', force_unlock: 'state_remove',
 };
 const chain = (action: Action): Action[] => {

@@ -35,7 +35,7 @@ Everything lives in `~/.teriac/`; upgrading `teriac` itself never touches your i
 
 ## teriac server
 
-![teriac server: install with Helm or Docker, the PR comment with risk and approvals, apply, sign in with GitHub, and the dashboard with live output, runs, the emergency stop, metrics and unlocking, then AI help: the plan review, inline code review, teriac ask, AI on the dashboard, per-project settings and policy drafts](https://raw.githubusercontent.com/marcdomain/teriac/main/charts/teriac-server/docs/flow.gif)
+![teriac server: install with Helm or Docker, the PR comment with risk and approvals, apply, sign in with GitHub, and the dashboard with live output, runs, the emergency stop, metrics and unlocking, then AI help: the plan review, inline code review, teriac ask, AI on the dashboard, per-project settings and policy drafts, and teriac adopt bringing resources made by hand under Terraform as a PR, from a comment or the dashboard](https://raw.githubusercontent.com/marcdomain/teriac/main/charts/teriac-server/docs/flow.gif)
 
 A self-hosted service for pull requests. It plans every project a pull request changes, posts
 one clear comment, and applies when someone comments `teriac apply`:
@@ -47,6 +47,7 @@ one clear comment, and applies when someone comments `teriac apply`:
 - **Drift:** scheduled checks that name who changed what, alerts in Slack, Teams, Discord or Google Chat, and optional fix PRs.
 - **Dashboard:** runs, locks, drift, the audit log, guardrails, and delivery metrics (PR to applied, failure rate, time to fix), plus a weekly summary in chat.
 - **AI help (optional):** a plain-English review of every plan, inline code review with one-click suggestions, one-click fixes for failed runs, drift decisions, `teriac ask` and policy drafts, from Claude on Anthropic's API, Bedrock, Vertex AI or Foundry. Advisory only.
+- **Adopt what was made by hand:** `teriac adopt` reads resources created in the console and opens a PR with their code and `import` blocks, planned first so applying imports them and changes nothing (tidied by AI when it's on).
 - **Easy to run:** a Helm chart or one Docker image (signed, amd64 and arm64), with scheduled database backups to S3, GCS or Azure.
 
 ```sh

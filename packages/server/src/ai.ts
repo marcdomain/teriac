@@ -344,6 +344,45 @@ export class Ai {
     }));
   }
 
+  // ---- 3b. bringing existing resources under Terraform (teriac adopt) ----
+
+  // Turns Terraform's generated configuration into the file a person would write. teriac checks
+  // the result (checkAdoptCode) and plans it; on a later round `draft` and `problems` say what
+  // the last plan disliked.
+  async adoptCode(input: {
+    project: string; engine: string; resources: { address: string; id: string; named: boolean }[];
+    generated: string; draft: string | null; problems: string; files: { path: string; text: string }[];
+    sensitive?: string[]; patterns?: SecretPattern[];
+  }, s: AiSettings = this.defaults): Promise<{ file: string; content: string; notes: string[] } | null> {
+    const c = (t: string) => clean(t, input.sensitive, input.patterns);
+    const user = [
+      `Write the Terraform file that brings existing resources under project \`${input.project}\` (${input.engine}). Terraform read each resource and generated its configuration below: it has the real values, plus noise.`,
+      'Rules for the file:',
+      '- Only `import` blocks and `resource` blocks. One import block per resource, with exactly `to` and a quoted `id`, IDs exactly as given. No variable, locals, output, data, module, provider or terraform blocks, no count or for_each, no provisioners, no functions that read files.',
+      '- The plan must import every resource and change nothing: keep every argument whose real value matters or differs from the provider default, with the exact real value.',
+      '- Make it read like hand-written code: drop arguments that are null, empty, computed or equal to the provider default; drop `tags_all` and `id`; drop arguments that conflict with each other (keep the one that is set); prefer the standalone resources the provider recommends only when they are among those imported.',
+      '- Where a value is the ID, ARN or name of another resource in this file or already in the project, reference it (`aws_iam_role.deploy.arn`) instead of copying it. You may reference variables and locals the project already defines when the value is the same; never add new ones.',
+      '- Leave out any argument whose value is hidden ("(sensitive value)", "‹redacted…›", `null # sensitive`) and say so in the notes, with what a person must do (for example, add `lifecycle { ignore_changes = [password] }` or set it from a secret manager).',
+      '- Addresses marked `keep` must stay as they are. For the others, pick a short snake_case name that says what the resource is, unique in the project (not the type again, not "this" unless it is the only one of its type).',
+      '- Match the project\'s style: argument order and alignment like `terraform fmt`, its tag conventions, comments only where they help a reviewer.',
+      '`file`: a short lowercase name for the new file, like `imported-buckets.tf` or `iam-deploy.tf`. `notes`: at most 3 short sentences a reviewer needs (things left out and why, anything to do after apply); empty when nothing needs saying.',
+      untrusted('resources to import', input.resources.map(r => `${r.address} id=${JSON.stringify(r.id)}${r.named ? ' keep' : ''}`).join('\n')),
+      untrusted('generated configuration', c(cut(input.generated, 120_000))),
+      ...(input.draft ? [untrusted('your last attempt', c(cut(input.draft, 120_000)))] : []),
+      ...(input.problems ? [untrusted(input.draft ? 'what the plan said about your last attempt' : 'what the first plan said', c(tailOf(input.problems, 12_000)))] : []),
+      ...input.files.map(f => untrusted(`project file ${f.path}`, c(f.text))),
+    ].join('\n\n');
+    const r = await this.json<{ file: string; content: string; notes: string[] }>('adopt', user, obj({
+      file: str, content: { type: 'string', description: 'the whole .tf file' }, notes: { type: 'array', items: str },
+    }), s);
+    if (!r || typeof r.content !== 'string' || !r.content.trim()) return null;
+    return {
+      file: String(r.file ?? ''),
+      content: r.content.replace(/\r/g, ''),
+      notes: (Array.isArray(r.notes) ? r.notes : []).slice(0, 3).map(n => sentence(String(n), 300, 2)).filter(Boolean),
+    };
+  }
+
   // ---- 4. policies from plain English ----
 
   async draftPolicy(request: string, s: AiSettings = this.defaults): Promise<PolicyDraft | null> {

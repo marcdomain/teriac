@@ -14,6 +14,8 @@ import { isGrantor, parseGrantRequest, announce, grantText, type NotifyDeps } fr
 import { windowUntil } from './freeze.ts';
 import { matchGlob } from './glob.ts';
 import { parseCommand } from './commands.ts';
+import { parseAdoptArgs } from './adopt.ts';
+import { repoPolicyFor } from './policy.ts';
 import { destination, type BackupScheduler } from './backup.ts';
 import type { ServerConfig } from './config.ts';
 import { Avatars, roundAvatarSvg } from './avatars.ts';
@@ -470,6 +472,35 @@ export const createHttpServer = (deps: HttpDeps): Server => {
         if (!draft) return send(res, 502, { error: 'No AI draft this time (the request failed or was declined).' });
         deps.store.audit({ repo: '*', pr: 0, user: who.name, action: 'ai_policy_draft', project: '*', allowed: true, reason: `${draft.rules.length} rules for: ${request.slice(0, 300)}` });
         return send(res, 200, { ...draft, model: label(top), yaml: YAML.stringify({ policies: { rules: draft.rules } }) });
+      }
+
+      // ---- adopt: bring resources made by hand under Terraform, as a PR (admins) ----
+      if (url.pathname === '/api/adopt' && req.method === 'GET') {
+        return send(res, 200, { ai: !!deps.ai?.has('import'), jobs: deps.app.adoptions.filter(j => inScope(j.repo)) });
+      }
+      if (url.pathname === '/api/adopt' && req.method === 'POST') {
+        if (!need('admin')) return send(res, 403, { error: 'Only admins can open adopt PRs from the dashboard. Others: comment `teriac adopt` on a PR.' });
+        if (deps.ai?.has('import') && !(deps.aiLimiter ?? aiLimiter).allow(`${who.via}:${who.name}`)) return send(res, 429, { error: 'Too many AI requests; try again in a few minutes.' });
+        const body = JSON.parse((await readBody(req)).toString('utf-8') || '{}') as Record<string, unknown>;
+        const repoKey = String(body.repo ?? '').replace(/^https?:\/\//, '').replace(/\/+$/, '');
+        const project = String(body.project ?? '').trim();
+        const workspace = typeof body.workspace === 'string' && body.workspace ? body.workspace : undefined;
+        if (!/^[^/]+\/[^/]+\/[^/]+$/.test(repoKey) || !project) return send(res, 400, { error: 'Give "repo" as host/owner/name and a "project".' });
+        if (!inScope(repoKey)) return send(res, 404, { error: 'no such repo' });
+        const args = String(body.resources ?? '').split(/[\s,]+/).filter(Boolean);
+        const parsed = parseAdoptArgs(args);
+        if (!parsed.ok) return send(res, 400, { error: `Resources: ${parsed.error}` });
+        const [host, owner, name] = repoKey.split('/');
+        const adapter = deps.adapters[platformForHost(host, deps.platforms ?? {})];
+        if (!adapter) return send(res, 404, { error: 'no such repo' });
+        const repo = { platform: adapter.platform, host, owner, name, fullName: `${owner}/${name}`, cloneUrl: '' };
+        const policy = deps.config ? repoPolicyFor(deps.config.repos, repo) : null;
+        if (!policy) return send(res, 404, { error: 'this repo is not served here' });
+        const branch = typeof body.base === 'string' && /^[\w./-]{1,200}$/.test(body.base) && !body.base.includes('..') ? body.base
+          : (await adapter.listRepos().catch(() => [])).find(r => r.fullName === repo.fullName)?.defaultBranch ?? 'main';
+        const job = deps.app.startAdopt({ adapter, repo: { ...repo, defaultBranch: branch }, policy, base: branch, project, workspace, targets: parsed.targets, by: who.name });
+        log.info('adopt requested', { repo: repoKey, project, resources: parsed.targets.length, by: who.sub });
+        return send(res, 202, job);
       }
 
       // ---- emergency access ----

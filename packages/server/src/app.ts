@@ -17,7 +17,8 @@ import { renderComment, renderCheck, renderApplyReport, aiLines, parseApplyResul
 import { repoLinks, platformForHost } from './links.ts';
 import { avatarSource, roundAvatarPath } from './avatars.ts';
 import { plan as runPlan, apply as runApply, runTool, engineLabel, toolEnv, gitAuthEnv, type ToolResolver, type ToolSet } from './runner.ts';
-import { checkout as gitCheckout } from './git.ts';
+import { checkout as gitCheckout, checkoutBranch as gitCheckoutBranch } from './git.ts';
+import { adopt, adoptBody, adoptBranch, type AdoptTarget, type AdoptResult } from './adopt.ts';
 import { log } from './log.ts';
 import { evaluateRules, runCommands, stricter, type PolicyConfig, type PolicyResult } from './policies.ts';
 import { matchGlob } from './glob.ts';
@@ -174,6 +175,7 @@ export interface AppDeps {
   store: Store;
   resolver: ToolResolver;
   checkout?: typeof gitCheckout;
+  checkoutBranch?: typeof gitCheckoutBranch;   // a branch's tip (teriac adopt)
   env?: NodeJS.ProcessEnv;
   live?: LiveLogs;                // live output for the dashboard
   ai?: Ai;                        // AI reviews and help (TERIAC_AI_PROVIDER)
@@ -931,7 +933,7 @@ export class App {
     const name = this.deps.config.commandNames[0];
     if (cmd.verb === 'help') {
       const oneAtATime = this.deps.config.requireApplyProject || policy.require_apply_project === true;
-      return reply.say(helpText(name, oneAtATime, !!this.deps.ai?.has('ask')));
+      return reply.say(helpText(name, oneAtATime, !!this.deps.ai?.has('ask'), !!this.deps.ai?.has('import')));
     }
     // Checked before anything is checked out: a fork's code must not run here.
     const fork = await this.forkRefusal(adapter, policy, repo, number);
@@ -952,6 +954,7 @@ export class App {
     if (cmd.verb === 'unlock') return this.unlock(ctx, user, cmd, reply);
     if (cmd.verb === 'ask') return this.ask(ctx, user, cmd.question ?? '', reply);
     if (cmd.verb === 'review') return this.reviewCommand(ctx, user, cmd, reply);
+    if (cmd.verb === 'adopt') return this.adoptCommand(ctx, user, cmd, reply);
     if (cmd.tool) return this.toolCommand(ctx, user, cmd, reply);
 
     if (cmd.verb === 'plan') {
@@ -1328,6 +1331,96 @@ export class App {
     const answer = await ai.ask(question, { summary, tools: [...runTools(runs), ...checkoutTools(ctx.root, on.map(x => x.p.dir))] }, this.safety(ctx).secretPatterns, settings);
     this.deps.store.audit({ repo: ctx.repoKey, pr: ctx.pr.number, user, action: 'ai_ask', project: '*', allowed: true, reason: question.slice(0, 300) });
     reply.say(answer ? `🤖 **AI answer** <sub>${label(settings)} · advisory, check it yourself</sub>\n\n${answer}` : '🤖 No AI answer this time (the request failed or was declined). Try rephrasing, or ask again later.');
+  }
+
+  // ---- adopt: a PR that brings resources made by hand under Terraform ----
+
+  // `teriac adopt -p <project> <type> <id>...`: the PR is opened against this PR's base branch.
+  private async adoptCommand(ctx: PrContext, user: string, cmd: Command, reply: Reply) {
+    // One reply, with the result: the 👀 reaction already says it was picked up.
+    const r = await this.adoptResources({
+      adapter: ctx.adapter, repo: ctx.repo, policy: ctx.policy, base: ctx.pr.baseRef,
+      select: { project: cmd.project, dir: cmd.dir, workspace: cmd.workspace }, targets: cmd.adopt!, user, from: `#${ctx.pr.number}`,
+    });
+    reply.say(r.message);
+  }
+
+  // Dashboard requests: started in the background, polled for the result (newest first, last 30).
+  private adoptJobs: { id: number; repo: string; project: string; base: string; resources: string[]; by: string; at: string; status: 'running' | 'opened' | 'failed'; message?: string; url?: string; model?: string }[] = [];
+  private adoptSeq = 0;
+  get adoptions() { return this.adoptJobs; }
+  startAdopt(a: { adapter: VcsAdapter; repo: Repo; policy: RepoPolicy; base: string; project: string; workspace?: string; targets: AdoptTarget[]; by: string }) {
+    const job: (typeof this.adoptJobs)[number] = {
+      id: ++this.adoptSeq, repo: this.repoKey(a.repo), project: a.project, base: a.base, by: a.by, at: new Date().toISOString(), status: 'running',
+      resources: a.targets.map(t => `${t.type}${t.name ? `.${t.name}` : ''} ${t.id}`),
+    };
+    this.adoptJobs = [job, ...this.adoptJobs].slice(0, 30);
+    void this.adoptResources({ ...a, select: { project: a.project, workspace: a.workspace }, user: null, by: a.by, from: 'the teriac dashboard' })
+      .then(r => Object.assign(job, { status: r.ok ? 'opened' : 'failed', message: r.message.replace(/<details>[\s\S]*$/, '').trim(), url: r.url, model: r.result?.model }))
+      .catch(err => Object.assign(job, { status: 'failed', message: `❌ ${(err as Error).message.slice(0, 300)}` }));
+    return job;
+  }
+
+  // Shared by the PR command and the dashboard. `user` null: a dashboard admin (no repo permission check).
+  async adoptResources(a: {
+    adapter: VcsAdapter; repo: Repo; policy: RepoPolicy; base: string;
+    select: { project?: string; dir?: string; workspace?: string }; targets: AdoptTarget[]; user: string | null; from?: string; by?: string;
+  }): Promise<{ ok: boolean; message: string; url?: string; result?: AdoptResult }> {
+    const { config, store } = this.deps;
+    const repoKey = this.repoKey(a.repo);
+    const who = a.user ?? a.by ?? 'admin';
+    const audit = (allowed: boolean, project: string, reason: string) => store.audit({ repo: repoKey, pr: 0, user: who, action: 'adopt', project, allowed, reason });
+    if (!a.adapter.openPullRequest) return { ok: false, message: '❌ Opening PRs is not supported on this platform.' };
+    return this.queue.run(`adopt:${repoKey}@${a.base}`, async () => {
+      const root = join(config.dataDir, 'adopt', a.repo.host, a.repo.owner, a.repo.name, slug(a.base));
+      const auth = await a.adapter.cloneAuth(a.repo);
+      await (this.deps.checkoutBranch ?? gitCheckoutBranch)(root, auth, a.base);
+      const repoConfig = a.policy.allow_repo_config === false ? emptyRepoConfig() : loadRepoConfig(root);
+      const projects = discoverProjects(root, repoConfig).filter(p =>
+        (a.select.project ? p.name === a.select.project : p.dir === a.select.dir) && (!a.select.workspace || p.workspace === a.select.workspace));
+      const named = a.select.project ?? a.select.dir ?? '';
+      if (projects.length !== 1) return { ok: false, message: projects.length ? `❌ \`${named}\` has ${projects.length} workspaces on \`${a.base}\`; add \`-w <workspace>\`.` : `❌ No project \`${named}\` on \`${a.base}\` (adopt writes code for a project that is already merged).` };
+      const project = projects[0];
+      if (a.user) {
+        const lookup: Lookup = {
+          permission: u => a.adapter.userPermission(a.repo, u),
+          inTeam: (t, u) => a.adapter.inTeam(a.repo, t, u),
+          codeowners: () => a.adapter.codeowners(a.repo, a.base),
+        };
+        const d = await checkPermission('adopt', a.user, project, rulesFor(project, a.policy, repoConfig), lookup);
+        if (!d.allowed) { audit(false, project.name, d.reason); return { ok: false, message: `🚫 \`adopt\` on \`${project.name}\`: ${d.reason}` }; }
+      }
+      const moduleAuth = await this.moduleAuth(a.adapter, a.repo);
+      const base = this.deps.env ?? process.env;
+      const env = toolEnv(base, {
+        ...gitAuthEnv(base, moduleAuth),
+        TF_PLUGIN_CACHE_DIR: join(config.dataDir, 'plugin-cache'),
+        TERIAC_PROJECT: project.name, TERIAC_WORKSPACE: project.workspace, TERIAC_REPO: a.repo.fullName, TERIAC_BRANCH: a.base, TERIAC_USER: who,
+      });
+      const s = this.deps.ai ? this.aiSettings(a.policy, repoConfig, project) : null;
+      const settings = s?.features.includes('import') ? s : null;
+      const patterns = [...(config.secretScan?.patterns ?? []), ...(a.policy.secret_patterns ?? [])];
+      const result = await this.limited(async () => adopt({
+        root, ctx: { root, project, tools: await this.deps.resolver.resolve(root, project), env, timeoutMs: config.runTimeoutMs },
+        planDir: join(config.dataDir, 'adopt-plans', a.repo.host, a.repo.owner, a.repo.name), targets: a.targets,
+        ai: this.deps.ai, settings, patterns,
+      }), `adopt:${repoKey}`);
+      if (!result.ok) {
+        audit(true, project.name, `failed: ${result.error}`);
+        const out = result.output ? `\n\n<details><summary>Last plan output</summary>\n\n${fence(tail(scanSecrets(result.output, patterns).text, 12_000))}\n</details>` : '';
+        return { ok: false, result, message: `❌ Could not adopt into \`${project.name}\`: ${result.error!.replace(/\.$/, '')}.${out}` };
+      }
+      const branch = adoptBranch(project.name, result.resources);
+      const n = result.resources.length;
+      const url = await a.adapter.openPullRequest!(a.repo, {
+        base: a.base, branch, title: `Bring ${n === 1 ? result.resources[0].address : `${n} resources`} under Terraform in ${project.name}`,
+        body: adoptBody(project.name, a.base, result, { user: who, from: a.from }), files: [result.file!],
+      });
+      audit(true, project.name, url ? `opened ${url} (${result.resources.map(r => r.address).join(', ')}${result.model ? `, by ${result.model}` : ''})` : `skipped: branch ${branch} exists`);
+      if (!url) return { ok: false, result, message: `ℹ️ A PR for these resources is already open (branch \`${branch}\`). Merge or close it first.` };
+      const changes = result.changes.length ? ` ⚠️ Applying it also changes ${result.changes.map(c => `\`${c.address}\``).join(', ')}; see the PR.` : ' Applying it imports them and changes nothing.';
+      return { ok: true, url, result, message: `✅ Opened ${url}: \`${result.file!.path}\` brings ${result.resources.map(r => `\`${r.address}\``).join(', ')} under Terraform${result.model ? ` (written by AI, ${result.model})` : ''}.${changes}` };
+    });
   }
 
   // AI settings for a run's project, from repos.yaml and the teriac.yaml on the repo's default branch.
