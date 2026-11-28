@@ -259,7 +259,7 @@ const planCell = (v: ProjectView): string => {
   if (p.status === 'failed') return p.mocks?.length ? `⏳ waiting for ${p.mocks.map(m => `\`${m}\``).join(', ')}` : '❌ failed';
   const s = parse(p);
   if (!s || s.noChanges) return '✅ no changes';
-  const parts = [s.add && `+${s.add}`, s.change && `~${s.change}`, s.replace && `±${s.replace}`, s.destroy && `−${s.destroy}`].filter(Boolean);
+  const parts = [s.add && `+${s.add}`, s.change && `~${s.change}`, s.replace && `±${s.replace}`, s.destroy && `−${s.destroy}`, s.imports && `${s.imports} to import`].filter(Boolean);
   const targeted = p.targets?.length ? ' 🎯 targeted' : '';
   return `${s.destroy || s.replace ? '⚠️' : '📝'} **${parts.join(' ') || 'outputs'}**${targeted}`;
 };

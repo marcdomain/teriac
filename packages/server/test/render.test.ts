@@ -226,3 +226,14 @@ test('output changes are listed only when the full output does not fit', () => {
   assert.match(cut, /\*\*Outputs:\*\* `/);
   assert.match(cut, /Output too long for a comment/);
 });
+
+test('an import-only plan says what it imports, not "outputs"', () => {
+  const plan = { resource_changes: [{ address: 'aws_s3_bucket.raw_exports', mode: 'managed', type: 'aws_s3_bucket', change: { actions: ['no-op'], importing: { id: 'acme-raw-exports' }, before: {}, after: {} } }] };
+  const s = summarizePlan(plan);
+  assert.equal(s.imports, 1);
+  assert.equal(s.noChanges, false);
+  const body = renderComment({ marker: 'M', headSha: 'abc1234', command: 'teriac', limit: 65000,
+    projects: [{ name: 'infra/adopt', plan: run({ project: 'infra/adopt', summary: JSON.stringify(s), destroys: 0, output: 'Plan: 1 to import, 0 to add, 0 to change, 0 to destroy.' }) }] });
+  assert.match(body, /📝 \*\*1 to import\*\*/);
+  assert.doesNotMatch(body, /\*\*outputs\*\*/);
+});
