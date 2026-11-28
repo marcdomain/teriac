@@ -348,3 +348,16 @@ test('server: permission, a PR against the base branch, audit; a second request 
   assert.ok(audit.some(a => a.action === 'adopt' && a.user === 'bob' && !a.allowed));
   store.close();
 });
+
+test('with AI: a failed AI request falls back to Terraform\'s own code, and says so', async () => {
+  const call: AiCall = async () => { throw Object.assign(new Error('Access to Bedrock models is not allowed for this account'), { status: 400 }); };
+  const ai = new Ai({ provider: 'bedrock', model: 'claude-opus-5-5', effort: 'medium', features: ['import'], timeoutMs: 1000 }, { call });
+  const r = await run(repoDir(), targets('aws_s3_bucket', 'acme-logs'), {}, { ai, settings: { features: ['import'], model: 'claude-opus-5-5', effort: 'medium', review: 'push' } });
+  assert.ok(r.ok, r.error ?? '');
+  assert.equal(r.aiFailed, true);
+  assert.equal(r.model, undefined);
+  assert.equal(r.rounds, 1);
+  assert.match(r.file!.content, /resource "aws_s3_bucket" "acme_logs"/);
+  assert.match(adoptBody('envs/prod', 'main', r, { user: 'bob' }), /The AI request failed, so this is what Terraform generated/);
+  assert.ok(ai.lastError, 'the failure shows on the dashboard');
+});

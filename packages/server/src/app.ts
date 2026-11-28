@@ -1419,7 +1419,7 @@ export class App {
       audit(true, project.name, url ? `opened ${url} (${result.resources.map(r => r.address).join(', ')}${result.model ? `, by ${result.model}` : ''})` : `skipped: branch ${branch} exists`);
       if (!url) return { ok: false, result, message: `ℹ️ A PR for these resources is already open (branch \`${branch}\`). Merge or close it first.` };
       const changes = result.changes.length ? ` ⚠️ Applying it also changes ${result.changes.map(c => `\`${c.address}\``).join(', ')}; see the PR.` : ' Applying it imports them and changes nothing.';
-      return { ok: true, url, result, message: `✅ Opened ${url}: \`${result.file!.path}\` brings ${result.resources.map(r => `\`${r.address}\``).join(', ')} under Terraform${result.model ? ` (written by AI, ${result.model})` : ''}.${changes}` };
+      return { ok: true, url, result, message: `✅ Opened ${url}: \`${result.file!.path}\` brings ${result.resources.map(r => `\`${r.address}\``).join(', ')} under Terraform${result.model ? ` (written by AI, ${result.model})` : result.aiFailed ? ' (Terraform\'s generated code: the AI request failed)' : ''}.${changes}` };
     });
   }
 
